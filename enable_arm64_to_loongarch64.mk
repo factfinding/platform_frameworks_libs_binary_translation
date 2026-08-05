@@ -22,7 +22,10 @@ PRODUCT_PACKAGES += $(BERBERIS_PRODUCT_PACKAGES_ARM64_TO_X86_64)
 PRODUCT_SYSTEM_PROPERTIES += \
     ro.dalvik.vm.native.bridge=libberberis_arm64.so \
     ro.dalvik.vm.isa.arm64=loongarch64 \
-    ro.enable.native.bridge.exec=1
+    ro.enable.native.bridge.exec=1 \
+    ro.product.cpu.abilist=loongarch64,lp64d,arm64-v8a \
+    ro.product.cpu.abilist32= \
+    ro.product.cpu.abilist64=loongarch64,lp64d,arm64-v8a
 
 PRODUCT_SOONG_NAMESPACES += frameworks/libs/native_bridge_support/android_api/libc
 
