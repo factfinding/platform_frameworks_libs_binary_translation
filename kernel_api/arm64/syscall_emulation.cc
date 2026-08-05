@@ -180,6 +180,23 @@ long RunGuestSyscallImpl(long guest_nr,
   // wrappers that do more than renumbering; all other calls can be forwarded
   // directly because the syscall numbers and scalar argument ABI agree.
   switch (guest_nr) {
+    case __NR_clone:
+      // clone cannot be forwarded directly.  In particular, CLONE_VM children
+      // need a native host stack while retaining their independent guest CPU
+      // state.  CloneGuestThread provides both and also resets Berberis state
+      // correctly after a process-style fork.
+      return RunGuestSyscall___NR_clone(arg_1, arg_2, arg_3, arg_4, arg_5);
+    case __NR_clone3:
+      // Keep the common Berberis behavior (currently ENOSYS) rather than
+      // creating a child that resumes translated execution on a guest stack.
+      return RunGuestSyscall___NR_clone3(arg_1, arg_2);
+    case __NR_execve:
+      // Strip guest-only environment variables before entering a native host
+      // executable such as /system/bin/sh.
+      return RunGuestSyscall___NR_execve(arg_1, arg_2, arg_3);
+    case __NR_exit:
+      // A thread exit must first detach and destroy its Berberis GuestThread.
+      return RunGuestSyscall___NR_exit(arg_1);
     case kGuestNrRtSigaction:
       // A guest handler is an AArch64 code address.  Never install it directly
       // in the LoongArch64 kernel even though both architectures assign the
