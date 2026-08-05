@@ -56,6 +56,9 @@ namespace {
 // below read by name (mirrors kGuestO* in open_emulation.cc).
 constexpr long kGuestNrFutex = 98;           // asm-generic __NR_futex
 constexpr long kGuestNrClockGettime = 113;   // asm-generic __NR_clock_gettime
+#if defined(__loongarch__)
+constexpr long kGuestNrRtSigaction = 134;    // asm-generic __NR_rt_sigaction
+#endif
 constexpr long kGuestNrUname = 160;          // asm-generic __NR_uname
 constexpr long kGuestNrGettimeofday = 169;   // asm-generic __NR_gettimeofday
 constexpr long kGuestNrSeccomp = 277;        // asm-generic __NR_seccomp
@@ -177,6 +180,13 @@ long RunGuestSyscallImpl(long guest_nr,
   // wrappers that do more than renumbering; all other calls can be forwarded
   // directly because the syscall numbers and scalar argument ABI agree.
   switch (guest_nr) {
+    case kGuestNrRtSigaction:
+      // A guest handler is an AArch64 code address.  Never install it directly
+      // in the LoongArch64 kernel even though both architectures assign the
+      // same syscall number to rt_sigaction: the kernel would later branch to
+      // that address as native LoongArch64 code.  Keep the host trampoline and
+      // guest action table maintained by the common Berberis signal bridge.
+      return RunGuestSyscall___NR_rt_sigaction(arg_1, arg_2, arg_3, arg_4);
     case __NR_execveat:
       return RunGuestSyscall___NR_execveat(arg_1, arg_2, arg_3, arg_4, arg_5);
     case __NR_ioctl:
