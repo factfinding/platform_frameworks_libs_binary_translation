@@ -106,7 +106,17 @@ void InitCrashReporter() {
   sigaction(SIGSEGV, &action, &g_orig_action[SIGSEGV]);
   sigaction(SIGILL, &action, &g_orig_action[SIGILL]);
   sigaction(SIGFPE, &action, &g_orig_action[SIGFPE]);
+#if defined(__loongarch__)
+  // Android's debuggerd SIGABRT handler may abort again after it has consumed
+  // the crash request.  Calling it manually from HandleFatalSignal then makes
+  // bionic diagnose a recursive signal-handler invocation, hiding the original
+  // abort message and backtrace.  SIGABRT does not need guest-state recovery:
+  // unlike SIGSEGV/SIGILL/SIGFPE it is an explicit process termination.  Leave
+  // it with debuggerd so host-side CHECK/LOG_ALWAYS_FATAL failures retain their
+  // actionable diagnostics.
+#else
   sigaction(SIGABRT, &action, &g_orig_action[SIGABRT]);
+#endif
 }
 
 }  // namespace berberis
