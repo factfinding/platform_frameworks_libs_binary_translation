@@ -45,9 +45,9 @@ prebuilt_etc {
 // region digitalis
 prebuilt_etc {
     name: "berberis.ld.config.arm64.txt",
-    // Keep the disabled Digitalis prebuilt distinct from ndk_translation.
-    // A product enabling this bridge must select the canonical config.
-    filename: "ld.config.berberis.arm64.txt",
+    // Keep the module name distinct from ndk_translation while installing the
+    // canonical filename expected by the ARM64 guest linker.
+    filename: "ld.config.arm64.txt",
     src: "system/etc/ld.config.arm64.txt",
 }
 
