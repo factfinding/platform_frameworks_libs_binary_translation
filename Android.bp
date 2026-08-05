@@ -693,6 +693,7 @@ cc_library_shared {
                 "libberberis_interpreter_arm64",
                 "libberberis_intrinsics_arm64",
                 "libberberis_runtime_primitives_arm64",
+                "libffi",
             ],
             whole_static_libs: [
                 "libberberis_guest_loader_arm64",

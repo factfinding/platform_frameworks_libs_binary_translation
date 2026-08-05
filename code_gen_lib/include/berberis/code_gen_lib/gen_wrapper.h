@@ -37,6 +37,14 @@ void GenWrapGuestFunction(MachineCode* mc,
                           HostCode guest_runner,
                           const char* name);
 
+#if defined(__loongarch__)
+// Creates a native LoongArch closure that marshals into GuestArgumentBuffer.
+HostCode CreateGuestFunctionWrapper(GuestAddr pc,
+                                    const char* signature,
+                                    HostCode guest_runner,
+                                    const char* name);
+#endif
+
 }  // namespace berberis
 
 #endif  // BERBERIS_CODE_GEN_LIB_GEN_WRAPPER_H_

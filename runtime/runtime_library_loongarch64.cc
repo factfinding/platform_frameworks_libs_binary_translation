@@ -18,6 +18,7 @@
 
 #include "berberis/base/logging.h"
 #include "berberis/guest_state/guest_state_opaque.h"
+#include "berberis/runtime_primitives/host_function_wrapper_impl.h"
 
 namespace berberis {
 
@@ -28,9 +29,9 @@ extern "C" {
 
 // Interpreter-only LoongArch64 dispatch does not enter generated code. These
 // functions are distinct address tokens stored in TranslationCache.
-#define DEFINE_ENTRY_TOKEN(name)              \
-  [[gnu::noinline]] void name() {             \
-    asm volatile("" ::: "memory");           \
+#define DEFINE_ENTRY_TOKEN(name)   \
+  [[gnu::noinline]] void name() {  \
+    asm volatile("" ::: "memory"); \
   }
 
 DEFINE_ENTRY_TOKEN(berberis_entry_Interpret)
@@ -42,6 +43,7 @@ DEFINE_ENTRY_TOKEN(berberis_entry_Translating)
 DEFINE_ENTRY_TOKEN(berberis_entry_Invalidating)
 DEFINE_ENTRY_TOKEN(berberis_entry_Wrapping)
 DEFINE_ENTRY_TOKEN(berberis_entry_HandleLiteCounterThresholdReached)
+DEFINE_ENTRY_TOKEN(berberis_entry_WrappedHostCall)
 
 #undef DEFINE_ENTRY_TOKEN
 
@@ -60,6 +62,8 @@ void berberis_RunGeneratedCode(ThreadState* state, HostCode code) {
     return;
   } else if (entry == kEntryWrapping) {
     LOG_ALWAYS_FATAL("LoongArch64 host trampoline dispatch is not implemented");
+  } else if (entry == AsHostCodeAddr(AsHostCode(berberis_entry_WrappedHostCall))) {
+    RunHostCallFromGuest(state);
   } else {
     LOG_ALWAYS_FATAL("LoongArch64 JIT code dispatch is disabled in interpreter-only mode");
   }

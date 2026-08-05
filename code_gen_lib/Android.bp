@@ -139,6 +139,7 @@ cc_library_static {
     arch: {
         loongarch64: {
             srcs: [":berberis_code_gen_lib_arm64_to_loongarch64_files"],
+            static_libs: ["libffi"],
         },
         x86_64: {
             header_libs: ["berberis_code_gen_lib_arm64_to_all_headers"],

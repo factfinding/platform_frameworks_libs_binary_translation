@@ -16,6 +16,9 @@
 
 #include "berberis/runtime_primitives/host_function_wrapper_impl.h"
 
+#include <map>
+#include <mutex>
+
 #include "berberis/assembler/machine_code.h"
 #include "berberis/base/tracing.h"
 #include "berberis/code_gen_lib/gen_adaptor.h"
@@ -26,6 +29,22 @@
 #include "berberis/runtime_primitives/translation_cache.h"
 
 namespace berberis {
+
+#if defined(__loongarch__)
+extern "C" void berberis_entry_WrappedHostCall();
+
+namespace {
+
+struct HostCallData {
+  TrampolineFunc trampoline;
+  HostCode func;
+};
+
+std::mutex g_host_calls_mutex;
+std::map<GuestAddr, HostCallData> g_host_calls;
+
+}  // namespace
+#endif
 
 void MakeTrampolineCallable(GuestAddr pc,
                             bool is_host_func,
@@ -46,6 +65,14 @@ void MakeTrampolineCallable(GuestAddr pc,
   TranslationCache* cache = TranslationCache::GetInstance();
   GuestCodeEntry* entry = cache->AddAndLockForWrapping(pc);
   if (entry) {
+#if defined(__loongarch__)
+    {
+      std::lock_guard<std::mutex> lock(g_host_calls_mutex);
+      g_host_calls.insert_or_assign(pc, HostCallData{func, arg});
+    }
+    cache->SetWrappedAndUnlock(
+        pc, entry, is_host_func, {AsHostCodeAddr(AsHostCode(berberis_entry_WrappedHostCall)), 0});
+#else
     MachineCode mc;
     GenTrampolineAdaptor(&mc, pc, AsHostCode(func), arg, name);
     cache->SetWrappedAndUnlock(pc,
@@ -53,7 +80,26 @@ void MakeTrampolineCallable(GuestAddr pc,
                                is_host_func,
                                // TODO(b/232598137): Maybe use ColdCodePool?
                                {GetDefaultCodePoolInstance()->Add(&mc), mc.install_size()});
+#endif
   }
+}
+
+void RunHostCallFromGuest(ThreadState* state) {
+#if defined(__loongarch__)
+  CPUState& cpu = GetCPUState(*state);
+  const GuestAddr pc = GetInsnAddr(cpu);
+  HostCallData call;
+  {
+    std::lock_guard<std::mutex> lock(g_host_calls_mutex);
+    auto it = g_host_calls.find(pc);
+    CHECK(it != g_host_calls.end());
+    call = it->second;
+  }
+  call.trampoline(call.func, state);
+  SetInsnAddr(cpu, GetLinkRegister(cpu));
+#else
+  UNUSED(state);
+#endif
 }
 
 void* UnwrapHostFunction(GuestAddr pc) {

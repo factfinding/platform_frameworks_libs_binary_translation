@@ -42,6 +42,9 @@ void MakeTrampolineCallable(GuestAddr pc,
                             HostCode func,
                             const char* name);
 
+// Interpreter-only hosts dispatch wrapped functions without generated code.
+void RunHostCallFromGuest(ThreadState* state);
+
 inline void WrapHostFunctionImpl(HostCode func, TrampolineFunc trampoline_func, const char* name) {
   MakeTrampolineCallable(ToGuestAddr(func), true, trampoline_func, func, name);
 }

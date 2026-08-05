@@ -72,12 +72,12 @@ class WrapperCache {
 
   // Another thread might have already inserted a wrapper for this key.
   // In this case, discard the new wrapper and return the existing one.
-  HostCode Insert(GuestAddr pc, const char* signature, HostCode guest_runner, MachineCode* mc) {
+  HostCode Insert(GuestAddr pc, const char* signature, HostCode guest_runner, HostCode wrapper) {
     std::lock_guard<std::mutex> lock(mutex_);
     std::pair<WrapperMap::iterator, bool> res = map_.insert(
         std::make_pair(std::make_tuple(pc, std::string(signature), guest_runner), nullptr));
     if (res.second) {
-      res.first->second = AsHostCode(GetFunctionWrapperCodePoolInstance()->Add(mc));
+      res.first->second = wrapper;
     }
     return res.first->second;
   }
@@ -135,8 +135,13 @@ HostCode WrapGuestFunctionImpl(GuestAddr pc,
       LOG_ALWAYS_FATAL("Trying to wrap non-executable guest address 0x%zx", pc);
     }
     MachineCode mc;
+#if defined(__loongarch__)
+    HostCode generated_wrapper = CreateGuestFunctionWrapper(pc, signature, guest_runner, name);
+#else
     GenWrapGuestFunction(&mc, pc, signature, guest_runner, name);
-    wrapper = wrapper_cache->Insert(pc, signature, guest_runner, &mc);
+    HostCode generated_wrapper = AsHostCode(GetFunctionWrapperCodePoolInstance()->Add(&mc));
+#endif
+    wrapper = wrapper_cache->Insert(pc, signature, guest_runner, generated_wrapper);
   }
   return wrapper;
 }
