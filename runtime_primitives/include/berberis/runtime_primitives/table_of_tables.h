@@ -183,10 +183,16 @@ class TableOfTables {
     }
   }
 
-#if defined(__LP64__) && defined(BERBERIS_GUEST_LP64)
-  // On 64-bit architectures the effective pointer bits are limited to 48
-  // which makes it possible to split tables into 2^24 + 2^24.
-  static constexpr size_t kTableBits = 24;
+#if defined(__LP64__)
+  // Select the layout from the key itself instead of relying on a guest-width
+  // build macro. Guest-specific headers define GuestAddr with the authoritative
+  // width, while common runtime translation units intentionally do not carry a
+  // guest architecture macro.
+  static_assert(sizeof(Key) == 4 || sizeof(Key) == 8);
+  static constexpr bool kGuestIsLp64 = sizeof(Key) == 8;
+  // On 64-bit guests the effective pointer bits are limited to 48, which makes
+  // it possible to split tables into 2^24 + 2^24. A 32-bit guest uses 16 + 16.
+  static constexpr size_t kTableBits = kGuestIsLp64 ? 24 : 16;
   // Use a 16Mb memfd region to fill the main/default table.
   // Linux has a limited number of maps (sysctl vm.max_map_count).
   // A larger region size allows us to stay within the limit.
@@ -202,18 +208,12 @@ class TableOfTables {
   // headroom. Reserved address space is unchanged, so this does not help
   // against an RLIMIT_AS ceiling.
   // static constexpr size_t kMemfdRegionSize = 1 << 24;
-  static constexpr size_t kMemfdRegionSize = 1 << 26;
+  static constexpr size_t kMemfdRegionSize = kGuestIsLp64 ? 1 << 26 : 1 << 16;
   // endregion
-  static_assert(sizeof(Key) == 8);
-#elif !defined(BERBERIS_GUEST_LP64)
-  static constexpr size_t kTableBits = 16;
-  // Use a 64k memfd region to fill the main/default table.
-  // Linux has a limited number of maps (sysctl vm.max_map_count).
-  // A larger region size allows us to stay within the limit.
-  static constexpr size_t kMemfdRegionSize = 1 << 16;
-  static_assert(sizeof(Key) == 4);
 #else
-#error "Unsupported combination of a 32-bit host with a 64-bit guest"
+  static_assert(sizeof(Key) == 4);
+  static constexpr size_t kTableBits = 16;
+  static constexpr size_t kMemfdRegionSize = 1 << 16;
 #endif
   static constexpr size_t kTableSize = 1 << kTableBits;
   static constexpr size_t kChildTableBytes = kTableSize * sizeof(T);

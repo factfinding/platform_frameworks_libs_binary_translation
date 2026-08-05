@@ -45,9 +45,19 @@ filegroup {
     ],
 }
 
+filegroup {
+    name: "berberis_runtime_library_loongarch64_srcs",
+    srcs: [
+        "runtime_library_loongarch64.cc",
+    ],
+}
+
 cc_defaults {
     name: "berberis_runtime_library_defaults",
     arch: {
+        loongarch64: {
+            srcs: [":berberis_runtime_library_loongarch64_srcs"],
+        },
         arm64: {
             srcs: [":berberis_runtime_library_arm64_srcs"],
         },

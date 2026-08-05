@@ -25,6 +25,11 @@ cc_library_static {
     ],
     host_supported: true,
     arch: {
+        loongarch64: {
+            srcs: [
+                "translator_loongarch64.cc",
+            ],
+        },
         x86_64: {
             srcs: [
                 "translator_x86_64.cc",
