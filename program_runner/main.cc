@@ -24,7 +24,7 @@
 
 #include "berberis/base/checks.h"
 
-#if defined(__i386__) || defined(__x86_64__)
+#if defined(__i386__) || defined(__x86_64__) || defined(__riscv) || defined(__loongarch__)
 #include "berberis/program_runner/program_runner.h"
 #elif defined(__aarch64__)
 #include "berberis/guest_state/guest_state.h"
@@ -121,7 +121,7 @@ int main(int argc, char* argv[], [[maybe_unused]] char* envp[]) {
   }
 
   std::string error_msg;
-#if defined(__i386__) || defined(__x86_64__) || defined(__riscv)
+#if defined(__i386__) || defined(__x86_64__) || defined(__riscv) || defined(__loongarch__)
   if (!berberis::Run(
           // TODO(b/276787135): Make vdso and loader configurable via command line arguments.
           /* vdso_path */ nullptr,
