@@ -19,6 +19,9 @@
 
 #include <ffi.h>
 
+#include <sys/mman.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
@@ -38,6 +41,38 @@
 namespace berberis {
 
 namespace {
+
+// The compiler-rt shipped by the current Android LLVM prebuilt predates
+// LoongArch support in __clear_cache and aborts in its fallback path.  Keep
+// this definition local to the bridge; upstream compiler-rt implements the
+// same operation with ibar 0.
+extern "C" __attribute__((visibility("hidden"))) void __clear_cache(void*, void*) {
+  __asm__ volatile("ibar 0" ::: "memory");
+}
+
+ffi_closure* AllocateExecutableClosure(void** code) {
+  const size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+  int fd = memfd_create("berberis-ffi-closure", MFD_CLOEXEC);
+  if (fd == -1 || ftruncate(fd, page_size) == -1) {
+    if (fd != -1) close(fd);
+    return nullptr;
+  }
+
+  void* writable = mmap(nullptr, page_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  if (writable == MAP_FAILED) {
+    close(fd);
+    return nullptr;
+  }
+  void* executable = mmap(nullptr, page_size, PROT_READ | PROT_EXEC, MAP_SHARED, fd, 0);
+  close(fd);
+  if (executable == MAP_FAILED) {
+    munmap(writable, page_size);
+    return nullptr;
+  }
+
+  *code = executable;
+  return static_cast<ffi_closure*>(writable);
+}
 
 struct ClosureData {
   ffi_cif cif;
@@ -239,7 +274,7 @@ HostCode CreateGuestFunctionWrapper(GuestAddr pc,
                                    ToFfiType(data->signature[0]),
                                    data->arg_types.data());
   CHECK_EQ(status, FFI_OK);
-  data->closure = static_cast<ffi_closure*>(ffi_closure_alloc(sizeof(ffi_closure), &data->code));
+  data->closure = AllocateExecutableClosure(&data->code);
   CHECK(data->closure);
   status =
       ffi_prep_closure_loc(data->closure, &data->cif, InvokeGuestClosure, data.get(), data->code);
