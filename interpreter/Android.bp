@@ -103,6 +103,11 @@ cc_library_static {
         "arm64/interpreter-main.cc",
     ],
     arch: {
+        loongarch64: {
+            srcs: [
+                "arm64/faulty_memory_accesses_loongarch64.cc",
+            ],
+        },
         x86_64: {
             srcs: [
                 "arm64/faulty_memory_accesses_x86_64.cc",

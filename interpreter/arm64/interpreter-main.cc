@@ -14,6 +14,12 @@
  * limitations under the License.
  */
 
+// This translation unit always interprets an LP64 guest, independently of
+// the host architecture selected by Soong.
+#ifndef BERBERIS_GUEST_LP64
+#define BERBERIS_GUEST_LP64 1
+#endif
+
 #include "berberis/interpreter/arm64/interpreter.h"
 
 #include "berberis/decoder/arm64/decoder.h"

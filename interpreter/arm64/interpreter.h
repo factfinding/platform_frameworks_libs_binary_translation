@@ -23,6 +23,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <random>
 #include <type_traits>
 
@@ -8106,9 +8107,7 @@ class Interpreter {
           for (uint8_t i = 0; i < 4; i++) {
             uint16_t h;
             memcpy(&h, reinterpret_cast<const uint8_t*>(&src) + src_off + i * 2, 2);
-            _Float16 hf;
-            memcpy(&hf, &h, 2);
-            float f = static_cast<float>(hf);
+            float f = FpHalfToSingle(h);
             memcpy(reinterpret_cast<uint8_t*>(&result) + i * 4, &f, 4);
           }
         } else {
@@ -8137,9 +8136,7 @@ class Interpreter {
           for (uint8_t i = 0; i < 4; i++) {
             float f;
             memcpy(&f, reinterpret_cast<const uint8_t*>(&src) + i * 4, 4);
-            _Float16 hf = static_cast<_Float16>(f);
-            uint16_t h;
-            memcpy(&h, &hf, 2);
+            uint16_t h = FpSingleToHalf(f);
             memcpy(reinterpret_cast<uint8_t*>(&result) + dst_off + i * 2, &h, 2);
           }
         } else {
@@ -10053,6 +10050,7 @@ class Interpreter {
   // libcall without -mcx16).  The Digitalis host is x86_64; the upstream ARM64
   // build does not link this file (interpreter.h is host-only).
   __uint128_t AtomicCASVal128(void* addr, __uint128_t expected, __uint128_t desired) {
+#if defined(__x86_64__)
     uint64_t exp_lo = static_cast<uint64_t>(expected);
     uint64_t exp_hi = static_cast<uint64_t>(expected >> 64);
     uint64_t new_lo = static_cast<uint64_t>(desired);
@@ -10067,6 +10065,19 @@ class Interpreter {
         : "b"(new_lo), "c"(new_hi)
         : "cc", "memory");
     return (static_cast<__uint128_t>(exp_hi) << 64) | exp_lo;
+#else
+    // Hosts without a lock-free 128-bit compare-and-swap still need correct
+    // ARM64 CASP semantics in interpreter-only mode. Serialize the operation
+    // until the host backend provides an architecture-specific implementation.
+    static std::mutex casp_mutex;
+    std::lock_guard<std::mutex> lock(casp_mutex);
+    __uint128_t old_value;
+    memcpy(&old_value, addr, sizeof(old_value));
+    if (old_value == expected) {
+      memcpy(addr, &desired, sizeof(desired));
+    }
+    return old_value;
+#endif
   }
 
   template <typename T>
