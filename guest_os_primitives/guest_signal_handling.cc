@@ -567,7 +567,14 @@ bool SetGuestSignalHandler(int signal,
     return false;
   }
 
-  if (act && IsReservedSignal(signal)) {
+  // bionic abort() restores SIGABRT to SIG_DFL before raising it a second
+  // time.  Swallowing that reset makes both raises return through debuggerd
+  // and leaves abort() to fall through to _exit(127), losing the tombstone.
+  // Continue rejecting guest handlers for reserved signals, but preserve the
+  // standard reset-to-default termination path.
+  const bool is_sigabrt_default =
+      signal == SIGABRT && act && act->guest_sa_sigaction == Guest_SIG_DFL;
+  if (act && IsReservedSignal(signal) && !is_sigabrt_default) {
     TRACE("sigaction for reserved signal %d not set", signal);
     act = nullptr;
   }
