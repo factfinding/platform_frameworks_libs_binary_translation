@@ -34,6 +34,14 @@ genrule {
     cmd: "$(location gen_vulkan) --xml $(out) --input $(in) --guest_arch arm64 --host_arch x86_64",
 }
 
+genrule {
+    name: "libberberis_android_api_libvulkan_vulkan_xml_headers_arm64_to_loongarch64",
+    out: ["vulkan_xml-inl.h"],
+    srcs: [":vulkan_headers_registry"],
+    tools: ["gen_vulkan"],
+    cmd: "$(location gen_vulkan) --xml $(out) --input $(in) --guest_arch arm64 --host_arch loongarch64",
+}
+
 soong_config_module_type_import {
     from: "frameworks/libs/binary_translation/Android.bp",
     module_types: ["berberis_cc_defaults"],
@@ -48,6 +56,9 @@ berberis_cc_defaults {
             },
             arm64_to_x86_64: {
                 generated_headers: ["libberberis_android_api_libvulkan_vulkan_xml_headers_arm64_to_x86_64"],
+            },
+            arm64_to_loongarch64: {
+                generated_headers: ["libberberis_android_api_libvulkan_vulkan_xml_headers_arm64_to_loongarch64"],
             },
         },
     },

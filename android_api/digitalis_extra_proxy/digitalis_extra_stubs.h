@@ -27,7 +27,7 @@
 // the host unit test can exercise them with no device-library link. They are
 // arm64-guest ABI code (guest CPUState / AAPCS64 return conventions), compiled
 // only in the arm64-translation flavor (berberis_arm64_defaults, which defines
-// NATIVE_BRIDGE_GUEST_ARCH_ARM64 and __x86_64__ on the host).
+// NATIVE_BRIDGE_GUEST_ARCH_ARM64 on a supported 64-bit host).
 
 #include <cstdint>
 

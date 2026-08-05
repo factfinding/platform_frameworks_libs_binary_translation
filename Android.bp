@@ -593,6 +593,7 @@ soong_config_string_variable {
         "riscv64_to_x86_64", // BUILD_BERBERIS_RISCV64_TO_X86_64
         // region digitalis
         "arm64_to_x86_64", // BUILD_BERBERIS_ARM64_TO_X86_64 (Digitalis)
+        "arm64_to_loongarch64",
         // endregion
     ],
 }
@@ -610,6 +611,13 @@ berberis_phony_rule {
             },
             // region digitalis
             arm64_to_x86_64: {
+                defaults: [
+                    "berberis_all_deps_defaults",
+                    "berberis_all_arm64_to_x86_64_defaults",
+                ],
+                enabled: true,
+            },
+            arm64_to_loongarch64: {
                 defaults: [
                     "berberis_all_deps_defaults",
                     "berberis_all_arm64_to_x86_64_defaults",
