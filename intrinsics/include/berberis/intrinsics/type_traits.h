@@ -113,7 +113,11 @@ struct TypeTraits<intrinsics::Float8> {
 template <>
 struct TypeTraits<intrinsics::Float16> {
   using Int = int16_t;
+#if defined(__loongarch__)
+  using Raw = uint16_t;
+#else
   using Raw = _Float16;
+#endif
   using Narrow = intrinsics::Float8;
   using Wide = intrinsics::Float32;
   static constexpr int kBits = 16;
@@ -143,6 +147,7 @@ struct TypeTraits<intrinsics::Float64> {
   static constexpr char kName[] = "Float64";
 };
 
+#if !defined(__loongarch__)
 template <>
 struct TypeTraits<_Float16> {
   using Int = int16_t;
@@ -151,13 +156,18 @@ struct TypeTraits<_Float16> {
   static constexpr int kBits = 16;
   static constexpr char kName[] = "_Float16";
 };
+#endif
 
 template <>
 struct TypeTraits<float> {
   using Int = int32_t;
   using Wrapped = intrinsics::Float32;
   using Wide = double;
+#if defined(__loongarch__)
+  using Narrow = uint16_t;
+#else
   using Narrow = _Float16;
+#endif
   static constexpr int kBits = 32;
   static constexpr char kName[] = "float";
 };

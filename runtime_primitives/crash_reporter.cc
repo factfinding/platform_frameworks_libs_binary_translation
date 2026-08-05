@@ -52,18 +52,28 @@ void HandleFatalSignal(int sig, siginfo_t* info, void* context) {
 #if defined(__ANDROID__)
   {
     auto* uc = static_cast<ucontext_t*>(context);
-    unsigned long host_rip =
+#if defined(__loongarch__)
+    unsigned long host_pc = uc ? static_cast<unsigned long>(uc->uc_mcontext.sc_pc) : 0;
+    unsigned long host_sp = uc ? static_cast<unsigned long>(uc->uc_mcontext.sc_regs[3]) : 0;
+    unsigned long host_fp = uc ? static_cast<unsigned long>(uc->uc_mcontext.sc_regs[22]) : 0;
+#elif defined(__x86_64__)
+    unsigned long host_pc =
         uc ? static_cast<unsigned long>(uc->uc_mcontext.gregs[REG_RIP]) : 0;
-    unsigned long host_rsp =
+    unsigned long host_sp =
         uc ? static_cast<unsigned long>(uc->uc_mcontext.gregs[REG_RSP]) : 0;
-    unsigned long host_rbp =
+    unsigned long host_fp =
         uc ? static_cast<unsigned long>(uc->uc_mcontext.gregs[REG_RBP]) : 0;
+#else
+    unsigned long host_pc = 0;
+    unsigned long host_sp = 0;
+    unsigned long host_fp = 0;
+#endif
     __android_log_print(
         ANDROID_LOG_ERROR, "berberis",
-        "HandleFatalSignal: sig=%d si_addr=%p si_code=%d host_rip=0x%lx "
-        "host_rsp=0x%lx host_rbp=0x%lx",
+        "HandleFatalSignal: sig=%d si_addr=%p si_code=%d host_pc=0x%lx "
+        "host_sp=0x%lx host_fp=0x%lx",
         sig, info ? info->si_addr : nullptr, info ? info->si_code : 0,
-        host_rip, host_rsp, host_rbp);
+        host_pc, host_sp, host_fp);
   }
 #endif
   // endregion

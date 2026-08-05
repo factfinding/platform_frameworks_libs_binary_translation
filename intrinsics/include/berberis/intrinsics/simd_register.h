@@ -275,7 +275,11 @@ class SIMD128Register {
 #endif
     // Note: we couldn't use Float32/Float64 here because [[gnu::vector]] only works with
     // raw integer or FP-types.
+#if defined(__loongarch__)
+    [[gnu::vector_size(16), gnu::may_alias]] uint16_t float16;
+#else
     [[gnu::vector_size(16), gnu::may_alias]] _Float16 float16;
+#endif
     [[gnu::vector_size(16), gnu::may_alias]] float float32;
     [[gnu::vector_size(16), gnu::may_alias]] double float64;
 #else
@@ -416,7 +420,11 @@ SIMD_128_FULL_REGISTER_GETTER_SETTER(Float64x2, float64);
 SIMD_128_FULL_REGISTER_GETTER_SETTER(Int64x2, int64);
 SIMD_128_FULL_REGISTER_GETTER_SETTER(Float32x4, float32);
 #endif
+#if defined(__loongarch__)
+SIMD_128_FLOAT_REGISTER_GETTER_SETTER(intrinsics::Float16, uint16_t, float16);
+#else
 SIMD_128_FLOAT_REGISTER_GETTER_SETTER(intrinsics::Float16, _Float16, float16);
+#endif
 SIMD_128_FLOAT_REGISTER_GETTER_SETTER(intrinsics::Float32, float, float32);
 SIMD_128_FLOAT_REGISTER_GETTER_SETTER(intrinsics::Float64, double, float64);
 #undef SIMD_128_FULL_REGISTER_GETTER_SETTER

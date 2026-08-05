@@ -74,9 +74,11 @@ class WrappedFloatType {
   explicit constexpr operator uint32_t() const { return value_; }
   explicit constexpr operator int64_t() const { return value_; }
   explicit constexpr operator uint64_t() const { return value_; }
+#if !defined(__loongarch__)
   explicit constexpr operator WrappedFloatType<_Float16>() const {
     return WrappedFloatType<_Float16>(value_);
   }
+#endif
   explicit constexpr operator WrappedFloatType<float>() const {
     return WrappedFloatType<float>(value_);
   }
@@ -118,8 +120,13 @@ class WrappedFloatType {
   friend inline WrappedFloatType Min(WrappedFloatType op1, WrappedFloatType op2);
 
  private:
+#if defined(__loongarch__)
+  static_assert(!std::numeric_limits<BaseType>::is_exact || std::is_same_v<BaseType, uint16_t>,
+                "WrappedFloatType should only be used with float types!");
+#else
   static_assert(!std::numeric_limits<BaseType>::is_exact,
                 "WrappedFloatType should only be used with float types!");
+#endif
   BaseType value_;
 };
 
@@ -130,7 +137,14 @@ class WrappedFloatType {
 // valid and allowed (if CPU supports Float16).
 class Float8PhonyType;  // This class doesn't exist but we may use it in template arguments.
 using Float8 = WrappedFloatType<Float8PhonyType>;  // Ditto.
+#if defined(__loongarch__)
+// Clang does not expose _Float16 for the LoongArch Android target yet. ARM64
+// interpreter intrinsics carry FP16 values as IEEE-754 binary16 bits and use
+// explicit conversion helpers, so a 16-bit storage type is sufficient here.
+using Float16 = WrappedFloatType<uint16_t>;
+#else
 using Float16 = WrappedFloatType<_Float16>;
+#endif
 using Float32 = WrappedFloatType<float>;
 using Float64 = WrappedFloatType<double>;
 
