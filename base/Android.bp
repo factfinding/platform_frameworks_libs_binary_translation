@@ -61,6 +61,9 @@ cc_library_static {
         "tracing.cc",
     ],
     arch: {
+        loongarch64: {
+            srcs: ["raw_syscall_loongarch64.S"],
+        },
         arm64: {
             srcs: ["raw_syscall_arm64.S"],
         },

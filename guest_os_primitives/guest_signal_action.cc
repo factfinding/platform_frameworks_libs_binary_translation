@@ -100,6 +100,8 @@ void ConvertHostSigactionToGuest(const HostStructSigaction* host_sa, Guest_sigac
       LOG_ALWAYS_FATAL("Unimplemented for riscv64");
 #elif defined(__aarch64__)
       LOG_ALWAYS_FATAL("Unimplemented for arm64");
+#elif defined(__loongarch__)
+      // The host restorer is stripped below and never exposed to the guest.
 #else
 #error "Unknown host arch"
 #endif

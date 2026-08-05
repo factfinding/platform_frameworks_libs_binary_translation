@@ -47,6 +47,11 @@ const uint32_t kHostArch = NATIVE_BRIDGE_ARCH_X86_64;
 const uint32_t kGuestArch = NATIVE_BRIDGE_ARCH_ARM64;
 const uint32_t kHostArch = NATIVE_BRIDGE_ARCH_RISCV64;
 
+#elif defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64) && defined(__loongarch__)
+
+const uint32_t kGuestArch = NATIVE_BRIDGE_ARCH_ARM64;
+const uint32_t kHostArch = NATIVE_BRIDGE_ARCH_LOONGARCH64;
+
 #elif defined(NATIVE_BRIDGE_GUEST_ARCH_RISCV64) && defined(__x86_64__)
 
 const uint32_t kGuestArch = NATIVE_BRIDGE_ARCH_RISCV64;

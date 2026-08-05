@@ -91,6 +91,11 @@ filegroup {
     srcs: ["unmap_and_exit_riscv64.cc"],
 }
 
+filegroup {
+    name: "libberberis_guest_os_primitives_common_loongarch64_srcs",
+    srcs: ["unmap_and_exit_loongarch64.S"],
+}
+
 // Common sources to be shared across arch-specific libraries.
 cc_defaults {
     name: "libberberis_guest_os_primitives_common_defaults",
@@ -98,6 +103,9 @@ cc_defaults {
     host_supported: true,
     srcs: [":libberberis_guest_os_primitives_common_srcs"],
     arch: {
+        loongarch64: {
+            srcs: [":libberberis_guest_os_primitives_common_loongarch64_srcs"],
+        },
         arm64: {
             srcs: [":libberberis_guest_os_primitives_common_arm64_srcs"],
         },
@@ -222,6 +230,11 @@ cc_library_static {
     ],
     host_supported: true,
     arch: {
+        loongarch64: {
+            srcs: [
+                "arm64/gen_syscall_numbers_loongarch64.cc",
+            ],
+        },
         x86_64: {
             srcs: [
                 "arm64/gen_syscall_numbers_x86_64.cc",

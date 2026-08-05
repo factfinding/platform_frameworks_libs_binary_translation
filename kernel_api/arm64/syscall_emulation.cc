@@ -165,6 +165,27 @@ long RunGuestSyscall___NR_newfstatat(long arg_1, long arg_2, long arg_3, long ar
 // The syscall numbers are identical, so we reuse the same translation table.
 #if defined(__x86_64__)
 #include "gen_syscall_emulation_arm64_to_x86_64-inl.h"
+#elif defined(__loongarch__)
+long RunGuestSyscallImpl(long guest_nr,
+                         long arg_1,
+                         long arg_2,
+                         long arg_3,
+                         long arg_4,
+                         long arg_5,
+                         long arg_6) {
+  // Both ABIs use asm-generic syscall numbers and are LP64. Keep the semantic
+  // wrappers that do more than renumbering; all other calls can be forwarded
+  // directly because the syscall numbers and scalar argument ABI agree.
+  switch (guest_nr) {
+    case __NR_execveat:
+      return RunGuestSyscall___NR_execveat(arg_1, arg_2, arg_3, arg_4, arg_5);
+    case __NR_ioctl:
+      return RunGuestSyscall___NR_ioctl(arg_1, arg_2, arg_3);
+    case __NR_newfstatat:
+      return RunGuestSyscall___NR_newfstatat(arg_1, arg_2, arg_3, arg_4);
+  }
+  return syscall(guest_nr, arg_1, arg_2, arg_3, arg_4, arg_5, arg_6);
+}
 #else
 #error "Unsupported host arch"
 #endif

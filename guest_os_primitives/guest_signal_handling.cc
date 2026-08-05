@@ -116,6 +116,8 @@ uintptr_t GetHostRegIP(const ucontext_t* ucontext) {
   return ucontext->uc_mcontext.__gregs[REG_PC];
 #elif defined(__aarch64__)
   return ucontext->uc_mcontext.pc;
+#elif defined(__loongarch__)
+  return ucontext->uc_mcontext.sc_pc;
 #else
 #error "Unknown host arch"
 #endif
@@ -130,6 +132,8 @@ void SetHostRegIP(ucontext* ucontext, uintptr_t addr) {
   ucontext->uc_mcontext.__gregs[REG_PC] = addr;
 #elif defined(__aarch64__)
   ucontext->uc_mcontext.pc = addr;
+#elif defined(__loongarch__)
+  ucontext->uc_mcontext.sc_pc = addr;
 #else
 #error "Unknown host arch"
 #endif

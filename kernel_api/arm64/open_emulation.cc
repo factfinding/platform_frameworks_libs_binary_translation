@@ -27,8 +27,8 @@
 
 namespace berberis {
 
-#if !defined(__x86_64__)
-#error Currently open flags conversion is only supported on x86_64
+#if !defined(__x86_64__) && !defined(__loongarch__)
+#error Currently open flags conversion is only supported on x86_64 and LoongArch64
 #endif
 
 #if (O_LARGEFILE == 0)
@@ -71,7 +71,7 @@ namespace {
 // ARM64 (arch/arm64/include/uapi/asm/fcntl.h) overrides a handful of the
 // asm-generic flag bits to the legacy ARM/Alpha layout, swapping O_DIRECTORY
 // with O_DIRECT and O_NOFOLLOW with O_LARGEFILE relative to the asm-generic
-// (x86_64) values. Translating these is mandatory: passing a guest
+// (x86_64 and LoongArch64) values. Translating these is mandatory: passing a guest
 // O_DIRECTORY (0o40000) to the host kernel verbatim looks like O_DIRECT,
 // which the host rejects with EINVAL when applied to a directory --
 // silently breaking opendir / QDirListing / any directory-iteration code.

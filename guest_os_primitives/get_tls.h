@@ -47,6 +47,13 @@ namespace berberis {
     __asm__("mrs %0, tpidr_el0" : "=r"(__val)); \
     __val;                                      \
   })
+#elif defined(__loongarch__)
+#define GetTls()                         \
+  ({                                     \
+    void** __val;                        \
+    __asm__("move %0, $tp" : "=r"(__val)); \
+    __val;                               \
+  })
 #else
 #error unsupported architecture
 #endif
