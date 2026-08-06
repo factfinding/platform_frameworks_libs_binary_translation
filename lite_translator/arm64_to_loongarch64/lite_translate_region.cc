@@ -63,6 +63,12 @@ class LiteTranslator {
     if ((insn & 0x3b00'0000u) == 0x3900'0000u) {
       return TranslateLoadStoreUnsignedImmediate(insn, pc);
     }
+    if ((insn & 0x3b20'0000u) == 0x3800'0000u) {
+      return TranslateLoadStoreIndexed(insn, pc);
+    }
+    if ((insn & 0x3e00'0000u) == 0x2800'0000u) {
+      return TranslateLoadStorePair(insn, pc);
+    }
     if ((insn & 0x7c00'0000u) == 0x1400'0000u) {
       TranslateBranchImmediate(insn, pc);
       region_end_reached_ = true;
@@ -335,6 +341,120 @@ class LiteTranslator {
     Exit(pc);
     as_.Bind(done);
     return true;
+  }
+
+  bool TranslateLoadStoreIndexed(uint32_t insn, GuestAddr pc) {
+    uint32_t size = insn >> 30;
+    uint32_t opc = (insn >> 22) & 3;
+    int64_t offset = SignExtend((insn >> 12) & 0x1ff, 9);
+    uint32_t mode = (insn >> 10) & 3;
+    uint32_t rn = (insn >> 5) & 31;
+    uint32_t rt = insn & 31;
+    bool writeback = mode == 1 || mode == 3;
+    if ((size != 2 && size != 3) || opc > 1 || mode == 2 || (writeback && rn != 31 && rn == rt)) {
+      return false;
+    }
+
+    LoadXOrSp(rn, Assembler::t0);
+    if (mode == 0 || mode == 3) {
+      as_.Li(Assembler::t1, offset);
+      as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
+    }
+    EmitLoadStore(size, opc == 1, rt, pc);
+    if (writeback) {
+      LoadXOrSp(rn, Assembler::t0);
+      as_.Li(Assembler::t1, offset);
+      as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
+      StoreXOrSp(rn, Assembler::t0);
+    }
+    return true;
+  }
+
+  bool TranslateLoadStorePair(uint32_t insn, GuestAddr pc) {
+    uint32_t opc = insn >> 30;
+    uint32_t mode = (insn >> 23) & 3;
+    bool load = ((insn >> 22) & 1) != 0;
+    int64_t imm7 = SignExtend((insn >> 15) & 0x7f, 7);
+    uint32_t rt2 = (insn >> 10) & 31;
+    uint32_t rn = (insn >> 5) & 31;
+    uint32_t rt = insn & 31;
+    if ((opc != 0 && opc != 2) || mode == 0 || (mode != 2 && rn != 31 && (rn == rt || rn == rt2))) {
+      return false;
+    }
+    uint32_t size = opc == 2 ? 3 : 2;
+    int64_t offset = imm7 * (int64_t{1} << size);
+
+    LoadXOrSp(rn, Assembler::t0);
+    if (mode != 1) {
+      as_.Li(Assembler::t1, offset);
+      as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
+    }
+    Assembler::Label* recovery = as_.MakeLabel();
+    Assembler::Label* done = as_.MakeLabel();
+    if (load) {
+      as_.SetRecoveryPoint(recovery);
+      if (size == 3) {
+        as_.LdD(Assembler::t1, Assembler::t0, 0);
+        as_.SetRecoveryPoint(recovery);
+        as_.LdD(Assembler::t2, Assembler::t0, 8);
+      } else {
+        as_.LdWU(Assembler::t1, Assembler::t0, 0);
+        as_.SetRecoveryPoint(recovery);
+        as_.LdWU(Assembler::t2, Assembler::t0, 4);
+      }
+      StoreXOrDiscard(rt, Assembler::t1);
+      StoreXOrDiscard(rt2, Assembler::t2);
+    } else {
+      LoadXOrZero(rt, Assembler::t1);
+      LoadXOrZero(rt2, Assembler::t2);
+      as_.SetRecoveryPoint(recovery);
+      if (size == 3) {
+        as_.StD(Assembler::t1, Assembler::t0, 0);
+        as_.SetRecoveryPoint(recovery);
+        as_.StD(Assembler::t2, Assembler::t0, 8);
+      } else {
+        as_.StW(Assembler::t1, Assembler::t0, 0);
+        as_.SetRecoveryPoint(recovery);
+        as_.StW(Assembler::t2, Assembler::t0, 4);
+      }
+    }
+    as_.B(*done);
+    as_.Bind(recovery);
+    Exit(pc);
+    as_.Bind(done);
+    if (mode == 1 || mode == 3) {
+      LoadXOrSp(rn, Assembler::t0);
+      as_.Li(Assembler::t1, offset);
+      as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
+      StoreXOrSp(rn, Assembler::t0);
+    }
+    return true;
+  }
+
+  void EmitLoadStore(uint32_t size, bool load, uint32_t rt, GuestAddr pc) {
+    Assembler::Label* recovery = as_.MakeLabel();
+    Assembler::Label* done = as_.MakeLabel();
+    if (load) {
+      as_.SetRecoveryPoint(recovery);
+      if (size == 3) {
+        as_.LdD(Assembler::t1, Assembler::t0, 0);
+      } else {
+        as_.LdWU(Assembler::t1, Assembler::t0, 0);
+      }
+      StoreXOrDiscard(rt, Assembler::t1);
+    } else {
+      LoadXOrZero(rt, Assembler::t1);
+      as_.SetRecoveryPoint(recovery);
+      if (size == 3) {
+        as_.StD(Assembler::t1, Assembler::t0, 0);
+      } else {
+        as_.StW(Assembler::t1, Assembler::t0, 0);
+      }
+    }
+    as_.B(*done);
+    as_.Bind(recovery);
+    Exit(pc);
+    as_.Bind(done);
   }
 
   void TranslateBranchImmediate(uint32_t insn, GuestAddr pc) {

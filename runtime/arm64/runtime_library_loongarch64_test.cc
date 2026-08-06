@@ -176,5 +176,34 @@ TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesUnsignedImmediateLoadsAndStore
   EXPECT_EQ(memory[2], 0xaabb'ccdd'eeff'0011u);
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesPreAndPostIndexedMemory) {
+  // str x1, [x0, #-8]!; ldr x2, [x0], #8
+  constexpr std::array<uint32_t, 2> kGuestCode = {0xf81f'8c01, 0xf840'8402};
+  std::array<uint64_t, 2> memory{};
+
+  ThreadState state{};
+  state.cpu.x[0] = ToGuestAddr(memory.data() + 1);
+  state.cpu.x[1] = 0x1234'5678'9abc'def0;
+  TranslateAndRun(kGuestCode, &state);
+  EXPECT_EQ(memory[0], state.cpu.x[1]);
+  EXPECT_EQ(state.cpu.x[2], state.cpu.x[1]);
+  EXPECT_EQ(state.cpu.x[0], ToGuestAddr(memory.data() + 1));
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesStackRegisterPairs) {
+  // stp x29, x30, [sp, #-16]!; ldp x29, x30, [sp], #16
+  constexpr std::array<uint32_t, 2> kGuestCode = {0xa9bf'7bfd, 0xa8c1'7bfd};
+  std::array<uint64_t, 4> stack{};
+
+  ThreadState state{};
+  state.cpu.sp = ToGuestAddr(stack.data() + 2);
+  state.cpu.x[29] = 0x1122'3344'5566'7788;
+  state.cpu.x[30] = 0x8877'6655'4433'2211;
+  TranslateAndRun(kGuestCode, &state);
+  EXPECT_EQ(stack[0], state.cpu.x[29]);
+  EXPECT_EQ(stack[1], state.cpu.x[30]);
+  EXPECT_EQ(state.cpu.sp, ToGuestAddr(stack.data() + 2));
+}
+
 }  // namespace
 }  // namespace berberis
