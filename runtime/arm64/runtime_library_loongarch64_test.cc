@@ -176,6 +176,21 @@ TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesUnsignedImmediateLoadsAndStore
   EXPECT_EQ(memory[2], 0xaabb'ccdd'eeff'0011u);
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteMemoryIgnoresPointerTopByte) {
+  // ldr x2, [x0, #8]; str x2, [x0, #16]
+  constexpr std::array<uint32_t, 2> kGuestCode = {0xf940'0402, 0xf900'0802};
+  std::array<uint64_t, 3> memory = {0, 0x1122'3344'5566'7788, 0};
+
+  ThreadState state{};
+  state.cpu.x[0] = ToGuestAddr(memory.data()) | 0xab00'0000'0000'0000ULL;
+  TranslateAndRun(kGuestCode, &state);
+
+  EXPECT_EQ(state.cpu.x[2], memory[1]);
+  EXPECT_EQ(memory[2], memory[1]);
+  // TBI affects the memory access, not the architectural register value.
+  EXPECT_EQ(state.cpu.x[0], ToGuestAddr(memory.data()) | 0xab00'0000'0000'0000ULL);
+}
+
 TEST(LoongArch64RuntimeLibraryTest, GuestMemoryCanBeKeptInInterpreter) {
   // ldr x1, [x0]
   constexpr std::array<uint32_t, 1> kGuestCode = {0xf940'0001};
@@ -211,6 +226,22 @@ TEST(LoongArch64RuntimeLibraryTest, LiteRejectsSimdLoadsAndStores) {
   }
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteRejectsConstrainedUnpredictableLoadPair) {
+  // ldp x1, x1, [x0] has overlapping destination registers and is
+  // CONSTRAINED UNPREDICTABLE.  Do not assign an arbitrary JIT meaning to it.
+  constexpr uint32_t kInsn = 0xa940'0401;
+  GuestAddr start_pc = ToGuestAddr(&kInsn);
+  MachineCode code;
+  LiteTranslateParams params;
+  params.end_pc = start_pc + sizeof(kInsn);
+  params.allow_dispatch = false;
+
+  auto [success, stop_pc] = TryLiteTranslateRegion(start_pc, &code, params);
+
+  EXPECT_FALSE(success);
+  EXPECT_EQ(stop_pc, start_pc);
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesPreAndPostIndexedMemory) {
   // str x1, [x0, #-8]!; ldr x2, [x0], #8
   constexpr std::array<uint32_t, 2> kGuestCode = {0xf81f'8c01, 0xf840'8402};
@@ -223,6 +254,22 @@ TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesPreAndPostIndexedMemory) {
   EXPECT_EQ(memory[0], state.cpu.x[1]);
   EXPECT_EQ(state.cpu.x[2], state.cpu.x[1]);
   EXPECT_EQ(state.cpu.x[0], ToGuestAddr(memory.data() + 1));
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteIndexedMemoryPreservesPointerTagOnWriteback) {
+  // str x1, [x0, #-8]!; ldr x2, [x0], #8
+  constexpr std::array<uint32_t, 2> kGuestCode = {0xf81f'8c01, 0xf840'8402};
+  std::array<uint64_t, 2> memory{};
+  constexpr uint64_t kTag = 0xcd00'0000'0000'0000ULL;
+
+  ThreadState state{};
+  state.cpu.x[0] = ToGuestAddr(memory.data() + 1) | kTag;
+  state.cpu.x[1] = 0x1234'5678'9abc'def0;
+  TranslateAndRun(kGuestCode, &state);
+
+  EXPECT_EQ(memory[0], state.cpu.x[1]);
+  EXPECT_EQ(state.cpu.x[2], state.cpu.x[1]);
+  EXPECT_EQ(state.cpu.x[0], ToGuestAddr(memory.data() + 1) | kTag);
 }
 
 TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesStackRegisterPairs) {
@@ -238,6 +285,23 @@ TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesStackRegisterPairs) {
   EXPECT_EQ(stack[0], state.cpu.x[29]);
   EXPECT_EQ(stack[1], state.cpu.x[30]);
   EXPECT_EQ(state.cpu.sp, ToGuestAddr(stack.data() + 2));
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LitePairMemoryIgnoresPointerTopByte) {
+  // stp x1, x2, [x0]; ldp x3, x4, [x0]
+  constexpr std::array<uint32_t, 2> kGuestCode = {0xa900'0801, 0xa940'1003};
+  std::array<uint64_t, 2> memory{};
+
+  ThreadState state{};
+  state.cpu.x[0] = ToGuestAddr(memory.data()) | 0xef00'0000'0000'0000ULL;
+  state.cpu.x[1] = 0x0123'4567'89ab'cdef;
+  state.cpu.x[2] = 0xfedc'ba98'7654'3210;
+  TranslateAndRun(kGuestCode, &state);
+
+  EXPECT_EQ(memory[0], state.cpu.x[1]);
+  EXPECT_EQ(memory[1], state.cpu.x[2]);
+  EXPECT_EQ(state.cpu.x[3], state.cpu.x[1]);
+  EXPECT_EQ(state.cpu.x[4], state.cpu.x[2]);
 }
 
 TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesCmpAndConditionalBranch) {

@@ -156,6 +156,16 @@ class LiteTranslator {
     as_.SraiD(reg, reg, 32);
   }
 
+  // Android enables top-byte-ignore for userspace pointers.  Guest pointers
+  // may therefore carry an allocation tag in bits 63:56, while the host
+  // address used by generated memory instructions must not.  Keep the tagged
+  // value in guest registers (including writeback results) and strip it only
+  // from the temporary effective address used for the actual access.
+  void ApplyTbi(Register reg) {
+    as_.SlliD(reg, reg, 8);
+    as_.SrliD(reg, reg, 8);
+  }
+
   bool ShiftOperand(Register reg, uint32_t shift_kind, uint32_t amount, bool is_64_bit) {
     if (shift_kind == 3 || (!is_64_bit && amount >= 32)) {
       return false;
@@ -436,6 +446,7 @@ class LiteTranslator {
     LoadXOrSp(rn, Assembler::t0);
     as_.Li(Assembler::t1, static_cast<uint64_t>(imm12) << size);
     as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
+    ApplyTbi(Assembler::t0);
 
     Assembler::Label* recovery = as_.MakeLabel();
     Assembler::Label* done = as_.MakeLabel();
@@ -483,6 +494,7 @@ class LiteTranslator {
       as_.Li(Assembler::t1, offset);
       as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
     }
+    ApplyTbi(Assembler::t0);
     EmitLoadStore(size, opc == 1, rt, pc);
     if (writeback) {
       LoadXOrSp(rn, Assembler::t0);
@@ -501,7 +513,8 @@ class LiteTranslator {
     uint32_t rt2 = (insn >> 10) & 31;
     uint32_t rn = (insn >> 5) & 31;
     uint32_t rt = insn & 31;
-    if ((opc != 0 && opc != 2) || mode == 0 || (mode != 2 && rn != 31 && (rn == rt || rn == rt2))) {
+    if ((opc != 0 && opc != 2) || mode == 0 || (load && rt == rt2) ||
+        (mode != 2 && rn != 31 && (rn == rt || rn == rt2))) {
       return false;
     }
     uint32_t size = opc == 2 ? 3 : 2;
@@ -512,6 +525,7 @@ class LiteTranslator {
       as_.Li(Assembler::t1, offset);
       as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
     }
+    ApplyTbi(Assembler::t0);
     Assembler::Label* recovery = as_.MakeLabel();
     Assembler::Label* done = as_.MakeLabel();
     if (load) {
