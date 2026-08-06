@@ -25,8 +25,10 @@
 #include "berberis/assembler/loongarch64.h"
 #include "berberis/assembler/machine_code.h"
 #include "berberis/guest_state/guest_state.h"
+#include "berberis/runtime_primitives/code_pool.h"
 #include "berberis/runtime_primitives/host_code.h"
 #include "berberis/runtime_primitives/runtime_library.h"
+#include "berberis/runtime_primitives/translation_cache.h"
 #include "berberis/test_utils/scoped_exec_region.h"
 
 namespace berberis {
@@ -112,6 +114,117 @@ TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesBranchWithLink) {
   TranslateAndRun(kGuestCode, &state);
   EXPECT_EQ(state.cpu.x[30], ToGuestAddr(kGuestCode.data() + 1));
   EXPECT_EQ(GetInsnAddr(state.cpu), ToGuestAddr(kGuestCode.data() + 2));
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteDirectDispatchLinksCachedRegion) {
+  // b +8; nop; <cached target>.  The source region must load the target's
+  // TranslationCache slot and enter the generated target without unwinding
+  // the RunGeneratedCode frame.
+  constexpr std::array<uint32_t, 3> kGuestCode = {0x1400'0002, 0xd503'201f, 0xd503'201f};
+  GuestAddr source_pc = ToGuestAddr(kGuestCode.data());
+  GuestAddr target_pc = ToGuestAddr(kGuestCode.data() + 2);
+  GuestAddr exit_pc = ToGuestAddr(kGuestCode.data() + 3);
+
+  InitHostEntries();
+  MachineCode target_code;
+  loongarch64::Assembler target_as(&target_code);
+  target_as.Li(loongarch64::Assembler::t0, 0x1234'5678'9abc'def0);
+  target_as.StD(loongarch64::Assembler::t0,
+                loongarch64::Assembler::s8,
+                offsetof(ThreadState, cpu) + offsetof(CPUState, x[0]));
+  target_as.Li(loongarch64::Assembler::s7, exit_pc);
+  target_as.Li(loongarch64::Assembler::t0, kEntryExitGeneratedCode);
+  target_as.Jirl(loongarch64::Assembler::zero, loongarch64::Assembler::t0, 0);
+  target_as.Finalize();
+
+  TranslationCache* cache = TranslationCache::GetInstance();
+  GuestCodeEntry* target_entry = cache->AddAndLockForTranslation(target_pc, 0);
+  ASSERT_NE(target_entry, nullptr);
+  HostCodeAddr target_host_code = GetDefaultCodePoolInstance()->Add(&target_code);
+  cache->SetTranslatedAndUnlock(target_pc,
+                                target_entry,
+                                sizeof(uint32_t),
+                                GuestCodeEntry::Kind::kLiteTranslated,
+                                {target_host_code, target_code.install_size()});
+
+  MachineCode source_code;
+  LiteTranslateParams params;
+  params.end_pc = source_pc + sizeof(uint32_t);
+  params.allow_dispatch = true;
+  auto [success, stop_pc] = TryLiteTranslateRegion(source_pc, &source_code, params);
+  ASSERT_TRUE(success);
+  EXPECT_EQ(stop_pc, params.end_pc);
+  ScopedExecRegion source_exec(&source_code);
+
+  ThreadState state{};
+  SetInsnAddr(state.cpu, source_pc);
+  SetResidence(state, kOutsideGeneratedCode);
+  berberis_RunGeneratedCode(&state, AsHostCode(source_exec.GetHostCodeAddr()));
+  EXPECT_EQ(state.cpu.x[0], 0x1234'5678'9abc'def0u);
+  EXPECT_EQ(GetInsnAddr(state.cpu), exit_pc);
+
+  // A pending signal must force a normal generated-code exit at the branch
+  // target instead of entering the cached region.
+  ThreadState pending_state{};
+  pending_state.pending_signals_status.store(kPendingSignalsPresent);
+  SetInsnAddr(pending_state.cpu, source_pc);
+  SetResidence(pending_state, kOutsideGeneratedCode);
+  berberis_RunGeneratedCode(&pending_state, AsHostCode(source_exec.GetHostCodeAddr()));
+  EXPECT_EQ(pending_state.cpu.x[0], 0u);
+  EXPECT_EQ(GetInsnAddr(pending_state.cpu), target_pc);
+
+  cache->InvalidateGuestRange(target_pc, target_pc + sizeof(uint32_t));
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteIndirectDispatchLinksCachedRegion) {
+  // br x5; the target address is resolved through TranslationCache's two-level
+  // table and must enter the cached generated region without a dispatcher
+  // round trip.
+  constexpr std::array<uint32_t, 2> kGuestCode = {0xd61f'00a0, 0xd503'201f};
+  GuestAddr source_pc = ToGuestAddr(kGuestCode.data());
+  GuestAddr target_pc = ToGuestAddr(kGuestCode.data() + 1);
+  GuestAddr exit_pc = target_pc + sizeof(uint32_t);
+
+  InitHostEntries();
+  MachineCode target_code;
+  loongarch64::Assembler target_as(&target_code);
+  target_as.Li(loongarch64::Assembler::t0, 0xfedc'ba98'7654'3210);
+  target_as.StD(loongarch64::Assembler::t0,
+                loongarch64::Assembler::s8,
+                offsetof(ThreadState, cpu) + offsetof(CPUState, x[0]));
+  target_as.Li(loongarch64::Assembler::s7, exit_pc);
+  target_as.Li(loongarch64::Assembler::t0, kEntryExitGeneratedCode);
+  target_as.Jirl(loongarch64::Assembler::zero, loongarch64::Assembler::t0, 0);
+  target_as.Finalize();
+
+  TranslationCache* cache = TranslationCache::GetInstance();
+  GuestCodeEntry* target_entry = cache->AddAndLockForTranslation(target_pc, 0);
+  ASSERT_NE(target_entry, nullptr);
+  HostCodeAddr target_host_code = GetDefaultCodePoolInstance()->Add(&target_code);
+  cache->SetTranslatedAndUnlock(target_pc,
+                                target_entry,
+                                sizeof(uint32_t),
+                                GuestCodeEntry::Kind::kLiteTranslated,
+                                {target_host_code, target_code.install_size()});
+
+  MachineCode source_code;
+  LiteTranslateParams params;
+  params.end_pc = source_pc + sizeof(uint32_t);
+  params.allow_dispatch = true;
+  auto [success, stop_pc] = TryLiteTranslateRegion(source_pc, &source_code, params);
+  ASSERT_TRUE(success);
+  EXPECT_EQ(stop_pc, params.end_pc);
+  ScopedExecRegion source_exec(&source_code);
+
+  ThreadState state{};
+  state.cpu.x[5] = target_pc;
+  SetInsnAddr(state.cpu, source_pc);
+  SetResidence(state, kOutsideGeneratedCode);
+  berberis_RunGeneratedCode(&state, AsHostCode(source_exec.GetHostCodeAddr()));
+  EXPECT_EQ(state.cpu.x[0], 0xfedc'ba98'7654'3210u);
+  EXPECT_EQ(GetInsnAddr(state.cpu), exit_pc);
+
+  cache->InvalidateGuestRange(target_pc, target_pc + sizeof(uint32_t));
 }
 
 TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesShiftedIntegerOperations) {

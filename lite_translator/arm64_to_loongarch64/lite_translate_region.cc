@@ -22,9 +22,11 @@
 
 #include "berberis/assembler/loongarch64.h"
 #include "berberis/base/checks.h"
+#include "berberis/base/config.h"
 #include "berberis/guest_state/guest_addr.h"
 #include "berberis/guest_state/guest_state.h"
 #include "berberis/runtime_primitives/runtime_library.h"
+#include "berberis/runtime_primitives/translation_cache.h"
 
 namespace berberis {
 namespace {
@@ -43,8 +45,10 @@ constexpr int64_t SignExtend(uint64_t value, uint32_t width) {
 
 class LiteTranslator {
  public:
-  explicit LiteTranslator(MachineCode* machine_code, bool enable_guest_memory)
-      : as_(machine_code), enable_guest_memory_(enable_guest_memory) {}
+  explicit LiteTranslator(MachineCode* machine_code, bool enable_guest_memory, bool allow_dispatch)
+      : as_(machine_code),
+        enable_guest_memory_(enable_guest_memory),
+        allow_dispatch_(allow_dispatch) {}
 
   bool Translate(uint32_t insn, GuestAddr pc) {
     if ((insn & 0x1f80'0000u) == 0x1280'0000u) {
@@ -112,8 +116,72 @@ class LiteTranslator {
 
   void Exit(GuestAddr pc) {
     as_.Li(Assembler::s7, pc);
+    if (allow_dispatch_ && config::kLinkJumpsBetweenRegions) {
+      Assembler::Label* pending_signal = as_.MakeLabel();
+      as_.LdBU(Assembler::t0,
+               Assembler::s8,
+               static_cast<int32_t>(offsetof(ThreadState, pending_signals_status)));
+      as_.AddiD(Assembler::t1, Assembler::zero, kPendingSignalsPresent);
+      as_.Beq(Assembler::t0, Assembler::t1, *pending_signal);
+
+      as_.Li(Assembler::t0,
+             reinterpret_cast<uint64_t>(TranslationCache::GetInstance()->GetHostCodePtr(pc)));
+      as_.LdD(Assembler::t0, Assembler::t0, 0);
+      as_.Jirl(Assembler::zero, Assembler::t0, 0);
+
+      as_.Bind(pending_signal);
+    }
+    ExitGeneratedCode();
+  }
+
+  void ExitGeneratedCode(GuestAddr pc) {
+    as_.Li(Assembler::s7, pc);
+    ExitGeneratedCode();
+  }
+
+  void ExitGeneratedCode() {
     as_.Li(Assembler::t0, kEntryExitGeneratedCode);
     as_.Jirl(Assembler::zero, Assembler::t0, 0);
+  }
+
+  void ExitIndirect(Register target) {
+    if (target != Assembler::s7) {
+      as_.Move(Assembler::s7, target);
+    }
+    if (!allow_dispatch_ || !config::kLinkJumpsBetweenRegions) {
+      ExitGeneratedCode();
+      return;
+    }
+
+    Assembler::Label* pending_signal = as_.MakeLabel();
+    as_.LdBU(Assembler::t0,
+             Assembler::s8,
+             static_cast<int32_t>(offsetof(ThreadState, pending_signals_status)));
+    as_.AddiD(Assembler::t1, Assembler::zero, kPendingSignalsPresent);
+    as_.Beq(Assembler::t0, Assembler::t1, *pending_signal);
+
+    // TranslationCache is a two-level table indexed by the low 48 bits of
+    // the guest PC: bits 47:24 select a child table and bits 23:0 select its
+    // HostCodeAddr slot.  Masking both halves matches TableOfTables::SplitKey
+    // and also ignores PAC/TBI bits carried by an indirect branch target.
+    constexpr uint64_t kTableIndexMask = (uint64_t{1} << 24) - 1;
+    as_.Li(Assembler::t1, kTableIndexMask);
+    as_.SrliD(Assembler::t2, Assembler::s7, 24);
+    as_.And(Assembler::t2, Assembler::t2, Assembler::t1);
+    as_.SlliD(Assembler::t2, Assembler::t2, 3);
+    as_.Li(Assembler::t3,
+           reinterpret_cast<uint64_t>(TranslationCache::GetInstance()->main_table_ptr()));
+    as_.AddD(Assembler::t2, Assembler::t2, Assembler::t3);
+    as_.LdD(Assembler::t2, Assembler::t2, 0);
+
+    as_.And(Assembler::t1, Assembler::s7, Assembler::t1);
+    as_.SlliD(Assembler::t1, Assembler::t1, 3);
+    as_.AddD(Assembler::t1, Assembler::t1, Assembler::t2);
+    as_.LdD(Assembler::t0, Assembler::t1, 0);
+    as_.Jirl(Assembler::zero, Assembler::t0, 0);
+
+    as_.Bind(pending_signal);
+    ExitGeneratedCode();
   }
 
   void Finalize() { as_.Finalize(); }
@@ -469,7 +537,7 @@ class LiteTranslator {
     }
     as_.B(*done);
     as_.Bind(recovery);
-    Exit(pc);
+    ExitGeneratedCode(pc);
     as_.Bind(done);
     return true;
   }
@@ -557,7 +625,7 @@ class LiteTranslator {
     }
     as_.B(*done);
     as_.Bind(recovery);
-    Exit(pc);
+    ExitGeneratedCode(pc);
     as_.Bind(done);
     if (mode == 1 || mode == 3) {
       LoadXOrSp(rn, Assembler::t0);
@@ -590,7 +658,7 @@ class LiteTranslator {
     }
     as_.B(*done);
     as_.Bind(recovery);
-    Exit(pc);
+    ExitGeneratedCode(pc);
     as_.Bind(done);
   }
 
@@ -726,13 +794,12 @@ class LiteTranslator {
       as_.Li(Assembler::t0, pc + 4);
       as_.StD(Assembler::t0, Assembler::s8, XOffset(30));
     }
-    as_.Move(Assembler::s7, Assembler::t1);
-    as_.Li(Assembler::t0, kEntryExitGeneratedCode);
-    as_.Jirl(Assembler::zero, Assembler::t0, 0);
+    ExitIndirect(Assembler::t1);
   }
 
   Assembler as_;
   bool enable_guest_memory_;
+  bool allow_dispatch_;
   bool region_end_reached_ = false;
 };
 
@@ -749,7 +816,7 @@ std::tuple<bool, GuestAddr> TryLiteTranslateRegion(GuestAddr start_pc,
     return {false, start_pc};
   }
 
-  LiteTranslator translator(machine_code, params.enable_guest_memory);
+  LiteTranslator translator(machine_code, params.enable_guest_memory, params.allow_dispatch);
   GuestAddr pc = start_pc;
   while (pc < params.end_pc && !translator.region_end_reached()) {
     uint32_t insn = *ToHostAddr<const uint32_t>(pc);
