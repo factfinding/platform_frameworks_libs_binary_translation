@@ -314,14 +314,14 @@ class LiteTranslator {
     if (!is_64_bit) {
       ZeroExtend32(Assembler::t1);
     }
-    Assembler::Label taken;
+    Assembler::Label* taken = as_.MakeLabel();
     if (nonzero) {
-      as_.Bnez(Assembler::t1, taken);
+      as_.Bnez(Assembler::t1, *taken);
     } else {
-      as_.Beqz(Assembler::t1, taken);
+      as_.Beqz(Assembler::t1, *taken);
     }
     Exit(pc + 4);
-    as_.Bind(&taken);
+    as_.Bind(taken);
     Exit(pc + displacement);
   }
 
