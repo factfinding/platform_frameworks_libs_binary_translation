@@ -507,7 +507,7 @@ class LiteTranslator {
     uint32_t imm12 = (insn >> 10) & 0xfff;
     uint32_t rn = (insn >> 5) & 31;
     uint32_t rt = insn & 31;
-    if ((size != 2 && size != 3) || opc > 1) {
+    if (opc > 1) {
       return false;
     }
 
@@ -515,30 +515,7 @@ class LiteTranslator {
     as_.Li(Assembler::t1, static_cast<uint64_t>(imm12) << size);
     as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
     ApplyTbi(Assembler::t0);
-
-    Assembler::Label* recovery = as_.MakeLabel();
-    Assembler::Label* done = as_.MakeLabel();
-    if (opc == 0) {  // STR
-      LoadXOrZero(rt, Assembler::t1);
-      as_.SetRecoveryPoint(recovery);
-      if (size == 3) {
-        as_.StD(Assembler::t1, Assembler::t0, 0);
-      } else {
-        as_.StW(Assembler::t1, Assembler::t0, 0);
-      }
-    } else {  // LDR
-      as_.SetRecoveryPoint(recovery);
-      if (size == 3) {
-        as_.LdD(Assembler::t1, Assembler::t0, 0);
-      } else {
-        as_.LdWU(Assembler::t1, Assembler::t0, 0);
-      }
-      StoreXOrDiscard(rt, Assembler::t1);
-    }
-    as_.B(*done);
-    as_.Bind(recovery);
-    ExitGeneratedCode(pc);
-    as_.Bind(done);
+    EmitLoadStore(size, opc == 1, rt, pc);
     return true;
   }
 
@@ -553,7 +530,7 @@ class LiteTranslator {
     uint32_t rn = (insn >> 5) & 31;
     uint32_t rt = insn & 31;
     bool writeback = mode == 1 || mode == 3;
-    if ((size != 2 && size != 3) || opc > 1 || mode == 2 || (writeback && rn != 31 && rn == rt)) {
+    if (opc > 1 || mode == 2 || (writeback && rn != 31 && rn == rt)) {
       return false;
     }
 
@@ -641,19 +618,37 @@ class LiteTranslator {
     Assembler::Label* done = as_.MakeLabel();
     if (load) {
       as_.SetRecoveryPoint(recovery);
-      if (size == 3) {
-        as_.LdD(Assembler::t1, Assembler::t0, 0);
-      } else {
-        as_.LdWU(Assembler::t1, Assembler::t0, 0);
+      switch (size) {
+        case 0:
+          as_.LdBU(Assembler::t1, Assembler::t0, 0);
+          break;
+        case 1:
+          as_.LdHU(Assembler::t1, Assembler::t0, 0);
+          break;
+        case 2:
+          as_.LdWU(Assembler::t1, Assembler::t0, 0);
+          break;
+        case 3:
+          as_.LdD(Assembler::t1, Assembler::t0, 0);
+          break;
       }
       StoreXOrDiscard(rt, Assembler::t1);
     } else {
       LoadXOrZero(rt, Assembler::t1);
       as_.SetRecoveryPoint(recovery);
-      if (size == 3) {
-        as_.StD(Assembler::t1, Assembler::t0, 0);
-      } else {
-        as_.StW(Assembler::t1, Assembler::t0, 0);
+      switch (size) {
+        case 0:
+          as_.StB(Assembler::t1, Assembler::t0, 0);
+          break;
+        case 1:
+          as_.StH(Assembler::t1, Assembler::t0, 0);
+          break;
+        case 2:
+          as_.StW(Assembler::t1, Assembler::t0, 0);
+          break;
+        case 3:
+          as_.StD(Assembler::t1, Assembler::t0, 0);
+          break;
       }
     }
     as_.B(*done);

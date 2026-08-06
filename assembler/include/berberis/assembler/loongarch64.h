@@ -153,11 +153,20 @@ class Assembler : public AssemblerBase {
   void LdBU(Register rd, Register rj, int32_t imm12) {
     Emit2RI12(0x2a00'0000, rd, rj, EncodeSigned(imm12, 12));
   }
+  void LdHU(Register rd, Register rj, int32_t imm12) {
+    Emit2RI12(0x2a40'0000, rd, rj, EncodeSigned(imm12, 12));
+  }
   void StD(Register rd, Register rj, int32_t imm12) {
     Emit2RI12(0x29c0'0000, rd, rj, EncodeSigned(imm12, 12));
   }
   void StW(Register rd, Register rj, int32_t imm12) {
     Emit2RI12(0x2980'0000, rd, rj, EncodeSigned(imm12, 12));
+  }
+  void StH(Register rd, Register rj, int32_t imm12) {
+    Emit2RI12(0x2940'0000, rd, rj, EncodeSigned(imm12, 12));
+  }
+  void StB(Register rd, Register rj, int32_t imm12) {
+    Emit2RI12(0x2900'0000, rd, rj, EncodeSigned(imm12, 12));
   }
 
   void SlliD(Register rd, Register rj, uint32_t shift) { Emit2RI6(0x0041'0000, rd, rj, shift); }
