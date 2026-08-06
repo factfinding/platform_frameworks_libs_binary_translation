@@ -208,6 +208,17 @@ long RunGuestSyscallImpl(long guest_nr,
       return RunGuestSyscall___NR_execveat(arg_1, arg_2, arg_3, arg_4, arg_5);
     case __NR_ioctl:
       return RunGuestSyscall___NR_ioctl(arg_1, arg_2, arg_3);
+    case __NR_mmap:
+      // mmap/mprotect/munmap/mremap must update GuestMapShadow. Forwarding
+      // these directly leaves newly generated JIT code marked non-executable
+      // inside Berberis even though /proc/maps already shows an RX mapping.
+      return RunGuestSyscall___NR_mmap(arg_1, arg_2, arg_3, arg_4, arg_5, arg_6);
+    case __NR_mprotect:
+      return RunGuestSyscall___NR_mprotect(arg_1, arg_2, arg_3);
+    case __NR_munmap:
+      return RunGuestSyscall___NR_munmap(arg_1, arg_2);
+    case __NR_mremap:
+      return RunGuestSyscall___NR_mremap(arg_1, arg_2, arg_3, arg_4, arg_5);
     case __NR_newfstatat:
       return RunGuestSyscall___NR_newfstatat(arg_1, arg_2, arg_3, arg_4);
   }
