@@ -16,6 +16,7 @@
 
 #include "translator.h"
 
+#include <array>
 #include <cstring>
 #include <tuple>
 
@@ -46,6 +47,33 @@ enum class TranslationMode {
 TranslationMode g_translation_mode = TranslationMode::kInterpretOnly;
 uint64_t g_jit_successes;
 uint64_t g_jit_fallbacks;
+
+// InterpretBatch amortizes dispatch overhead over as many as 500 guest
+// instructions.  Sampling its entry instruction is therefore cheap while
+// still making persistently hot interpreted code stand out.  Keep counters
+// thread-local so profiling never adds atomic contention to guest execution.
+constexpr size_t kInterpreterOpcodeBucketBits = 11;
+constexpr size_t kInterpreterOpcodeBucketCount = 1 << kInterpreterOpcodeBucketBits;
+thread_local std::array<uint32_t, kInterpreterOpcodeBucketCount> g_interpreter_opcode_counts{};
+
+void RecordInterpreterEntry(ThreadState* state) {
+  GuestAddr pc = state->cpu.insn_addr;
+  uint32_t insn = *ToHostAddr<const uint32_t>(pc);
+  size_t bucket = insn >> (32 - kInterpreterOpcodeBucketBits);
+  uint32_t count = ++g_interpreter_opcode_counts[bucket];
+
+  // Delay logging until a bucket is demonstrably hot, then use exponential
+  // sampling to keep long-running applications quiet.
+  if (count >= 128 && (count & (count - 1)) == 0) {
+    TRACE_AND_ALOGD(
+        "berberis-la64: hot-interpreter bucket=0x%03lx count=%u pc=0x%lx "
+        "insn=0x%08x",
+        static_cast<unsigned long>(bucket),
+        count,
+        static_cast<unsigned long>(pc),
+        insn);
+  }
+}
 
 void UpdateTranslationMode() {
   const char* mode = GetTranslationModeConfig();
@@ -153,6 +181,9 @@ extern "C" __attribute__((used, __visibility__("hidden"))) void berberis_HandleN
 
 extern "C" __attribute__((used, __visibility__("hidden"))) void berberis_HandleInterpret(
     ThreadState* state) {
+  if (g_translation_mode == TranslationMode::kLiteTranslateOrInterpret) {
+    RecordInterpreterEntry(state);
+  }
   InterpreterCacheLookupMode lookup_mode =
       g_translation_mode == TranslationMode::kLiteTranslateOrInterpret
           ? InterpreterCacheLookupMode::kAll
