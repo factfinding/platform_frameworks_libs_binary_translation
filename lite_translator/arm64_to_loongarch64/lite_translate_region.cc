@@ -51,6 +51,15 @@ class LiteTranslator {
     if ((insn & 0x1f80'0000u) == 0x1100'0000u) {
       return TranslateAddSubImmediate(insn);
     }
+    if ((insn & 0x1f20'0000u) == 0x0b00'0000u) {
+      return TranslateAddSubShiftedRegister(insn);
+    }
+    if ((insn & 0x1f00'0000u) == 0x0a00'0000u) {
+      return TranslateLogicalShiftedRegister(insn);
+    }
+    if ((insn & 0x1f00'0000u) == 0x1000'0000u) {
+      return TranslatePcRelativeAddress(insn, pc);
+    }
     if ((insn & 0x7c00'0000u) == 0x1400'0000u) {
       TranslateBranchImmediate(insn, pc);
       region_end_reached_ = true;
@@ -59,6 +68,15 @@ class LiteTranslator {
     if ((insn & 0x7e00'0000u) == 0x3400'0000u) {
       TranslateCompareAndBranch(insn, pc);
       region_end_reached_ = true;
+      return true;
+    }
+    if ((insn & 0xffff'fc1fu) == 0xd61f'0000u || (insn & 0xffff'fc1fu) == 0xd63f'0000u ||
+        (insn & 0xffff'fc1fu) == 0xd65f'0000u) {
+      TranslateBranchRegister(insn, pc);
+      region_end_reached_ = true;
+      return true;
+    }
+    if (insn == 0xd503'201f) {  // NOP
       return true;
     }
     return false;
@@ -103,6 +121,36 @@ class LiteTranslator {
   void ZeroExtend32(Register reg) {
     as_.SlliD(reg, reg, 32);
     as_.SrliD(reg, reg, 32);
+  }
+
+  void SignExtend32(Register reg) {
+    as_.SlliD(reg, reg, 32);
+    as_.SraiD(reg, reg, 32);
+  }
+
+  bool ShiftOperand(Register reg, uint32_t shift_kind, uint32_t amount, bool is_64_bit) {
+    if (shift_kind == 3 || (!is_64_bit && amount >= 32)) {
+      return false;
+    }
+    if (!is_64_bit) {
+      if (shift_kind == 2) {
+        SignExtend32(reg);
+      } else {
+        ZeroExtend32(reg);
+      }
+    }
+    switch (shift_kind) {
+      case 0:
+        as_.SlliD(reg, reg, amount);
+        break;
+      case 1:
+        as_.SrliD(reg, reg, amount);
+        break;
+      case 2:
+        as_.SraiD(reg, reg, amount);
+        break;
+    }
+    return true;
   }
 
   bool TranslateMoveWide(uint32_t insn) {
@@ -164,6 +212,88 @@ class LiteTranslator {
     return true;
   }
 
+  bool TranslateAddSubShiftedRegister(uint32_t insn) {
+    bool is_64_bit = (insn >> 31) != 0;
+    bool is_sub = ((insn >> 30) & 1) != 0;
+    bool set_flags = ((insn >> 29) & 1) != 0;
+    uint32_t shift_kind = (insn >> 22) & 3;
+    uint32_t rm = (insn >> 16) & 31;
+    uint32_t amount = (insn >> 10) & 0x3f;
+    uint32_t rn = (insn >> 5) & 31;
+    uint32_t rd = insn & 31;
+    if (set_flags) {
+      return false;
+    }
+
+    LoadXOrZero(rn, Assembler::t0);
+    LoadXOrZero(rm, Assembler::t1);
+    if (!ShiftOperand(Assembler::t1, shift_kind, amount, is_64_bit)) {
+      return false;
+    }
+    if (is_sub) {
+      as_.SubD(Assembler::t0, Assembler::t0, Assembler::t1);
+    } else {
+      as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
+    }
+    if (!is_64_bit) {
+      ZeroExtend32(Assembler::t0);
+    }
+    StoreXOrDiscard(rd, Assembler::t0);
+    return true;
+  }
+
+  bool TranslateLogicalShiftedRegister(uint32_t insn) {
+    bool is_64_bit = (insn >> 31) != 0;
+    uint32_t opc = (insn >> 29) & 3;
+    uint32_t shift_kind = (insn >> 22) & 3;
+    bool invert = ((insn >> 21) & 1) != 0;
+    uint32_t rm = (insn >> 16) & 31;
+    uint32_t amount = (insn >> 10) & 0x3f;
+    uint32_t rn = (insn >> 5) & 31;
+    uint32_t rd = insn & 31;
+    if (opc == 3 || invert) {
+      return false;
+    }
+
+    LoadXOrZero(rn, Assembler::t0);
+    LoadXOrZero(rm, Assembler::t1);
+    if (!ShiftOperand(Assembler::t1, shift_kind, amount, is_64_bit)) {
+      return false;
+    }
+    switch (opc) {
+      case 0:
+        as_.And(Assembler::t0, Assembler::t0, Assembler::t1);
+        break;
+      case 1:
+        as_.Or(Assembler::t0, Assembler::t0, Assembler::t1);
+        break;
+      case 2:
+        as_.Xor(Assembler::t0, Assembler::t0, Assembler::t1);
+        break;
+    }
+    if (!is_64_bit) {
+      ZeroExtend32(Assembler::t0);
+    }
+    StoreXOrDiscard(rd, Assembler::t0);
+    return true;
+  }
+
+  bool TranslatePcRelativeAddress(uint32_t insn, GuestAddr pc) {
+    bool page_relative = (insn >> 31) != 0;
+    uint32_t rd = insn & 31;
+    uint64_t encoded_imm = ((insn >> 5) & 0x7ffff) << 2 | ((insn >> 29) & 3);
+    int64_t immediate = SignExtend(encoded_imm, 21);
+    GuestAddr value;
+    if (page_relative) {
+      value = (pc & ~GuestAddr{0xfff}) + immediate * 4096;
+    } else {
+      value = pc + immediate;
+    }
+    as_.Li(Assembler::t0, value);
+    StoreXOrDiscard(rd, Assembler::t0);
+    return true;
+  }
+
   void TranslateBranchImmediate(uint32_t insn, GuestAddr pc) {
     bool link = (insn >> 31) != 0;
     int64_t displacement = SignExtend(insn & 0x03ff'ffff, 26) * 4;
@@ -193,6 +323,19 @@ class LiteTranslator {
     Exit(pc + 4);
     as_.Bind(&taken);
     Exit(pc + displacement);
+  }
+
+  void TranslateBranchRegister(uint32_t insn, GuestAddr pc) {
+    uint32_t rn = (insn >> 5) & 31;
+    bool link = (insn & 0xffff'fc1fu) == 0xd63f'0000u;
+    LoadXOrZero(rn, Assembler::t1);
+    if (link) {
+      as_.Li(Assembler::t0, pc + 4);
+      as_.StD(Assembler::t0, Assembler::s8, XOffset(30));
+    }
+    as_.Move(Assembler::s7, Assembler::t1);
+    as_.Li(Assembler::t0, kEntryExitGeneratedCode);
+    as_.Jirl(Assembler::zero, Assembler::t0, 0);
   }
 
   Assembler as_;

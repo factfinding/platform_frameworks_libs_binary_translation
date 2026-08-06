@@ -113,5 +113,52 @@ TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesBranchWithLink) {
   EXPECT_EQ(GetInsnAddr(state.cpu), ToGuestAddr(kGuestCode.data() + 2));
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesShiftedIntegerOperations) {
+  // add x2, x0, x1, lsl #3; sub w3, w2, w1, lsr #1;
+  // orr x4, x2, x3; eor w5, w4, w3, lsr #4
+  constexpr std::array<uint32_t, 4> kGuestCode = {
+      0x8b01'0c02, 0x4b41'0443, 0xaa03'0044, 0x4a43'1085};
+
+  ThreadState state{};
+  state.cpu.x[0] = 5;
+  state.cpu.x[1] = 7;
+  TranslateAndRun(kGuestCode, &state);
+  EXPECT_EQ(state.cpu.x[2], 61u);
+  EXPECT_EQ(state.cpu.x[3], 58u);
+  EXPECT_EQ(state.cpu.x[4], 63u);
+  EXPECT_EQ(state.cpu.x[5], 60u);
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesPcRelativeAddressesAndNop) {
+  // adr x6, +8; adrp x7, current page; nop
+  constexpr std::array<uint32_t, 3> kGuestCode = {0x1000'0046, 0x9000'0007, 0xd503'201f};
+
+  ThreadState state{};
+  TranslateAndRun(kGuestCode, &state);
+  EXPECT_EQ(state.cpu.x[6], ToGuestAddr(kGuestCode.data() + 2));
+  EXPECT_EQ(state.cpu.x[7], ToGuestAddr(kGuestCode.data() + 1) & ~GuestAddr{0xfff});
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesRegisterBranches) {
+  constexpr std::array<uint32_t, 3> kBrCode = {0xd61f'00a0, 0xd503'201f, 0xd503'201f};
+  ThreadState br_state{};
+  br_state.cpu.x[5] = ToGuestAddr(kBrCode.data() + 2);
+  TranslateAndRun(kBrCode, &br_state);
+  EXPECT_EQ(GetInsnAddr(br_state.cpu), ToGuestAddr(kBrCode.data() + 2));
+
+  constexpr std::array<uint32_t, 3> kBlrCode = {0xd63f'00a0, 0xd503'201f, 0xd503'201f};
+  ThreadState blr_state{};
+  blr_state.cpu.x[5] = ToGuestAddr(kBlrCode.data() + 2);
+  TranslateAndRun(kBlrCode, &blr_state);
+  EXPECT_EQ(blr_state.cpu.x[30], ToGuestAddr(kBlrCode.data() + 1));
+  EXPECT_EQ(GetInsnAddr(blr_state.cpu), ToGuestAddr(kBlrCode.data() + 2));
+
+  constexpr std::array<uint32_t, 3> kRetCode = {0xd65f'03c0, 0xd503'201f, 0xd503'201f};
+  ThreadState ret_state{};
+  ret_state.cpu.x[30] = ToGuestAddr(kRetCode.data() + 2);
+  TranslateAndRun(kRetCode, &ret_state);
+  EXPECT_EQ(GetInsnAddr(ret_state.cpu), ToGuestAddr(kRetCode.data() + 2));
+}
+
 }  // namespace
 }  // namespace berberis
