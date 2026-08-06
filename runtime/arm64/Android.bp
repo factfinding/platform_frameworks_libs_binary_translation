@@ -29,6 +29,9 @@ cc_library_static {
             srcs: [
                 "translator_loongarch64.cc",
             ],
+            header_libs: [
+                "libberberis_lite_translator_headers",
+            ],
         },
         x86_64: {
             srcs: [
@@ -120,6 +123,7 @@ cc_test {
         "libberberis_intrinsics",
         "libberberis_intrinsics_arm64",
         "libberberis_kernel_api_arm64",
+        "libberberis_lite_translator_arm64_to_loongarch64",
         "libberberis_runtime_arm64",
         "libberberis_runtime_primitives",
         "libberberis_runtime_primitives_arm64",

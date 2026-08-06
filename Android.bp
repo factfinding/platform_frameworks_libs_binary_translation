@@ -700,6 +700,7 @@ cc_library_shared {
                 "libberberis_guest_abi_arm64",
                 "libberberis_interpreter_arm64",
                 "libberberis_intrinsics_arm64",
+                "libberberis_lite_translator_arm64_to_loongarch64",
                 "libberberis_runtime_primitives_arm64",
                 "libffi",
             ],

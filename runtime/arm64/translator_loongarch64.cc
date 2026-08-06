@@ -16,41 +16,128 @@
 
 #include "translator.h"
 
+#include <cstring>
+#include <tuple>
+
 #include "berberis/base/checks.h"
+#include "berberis/base/config.h"
+#include "berberis/base/config_globals.h"
 #include "berberis/base/logging.h"
 #include "berberis/guest_os_primitives/guest_map_shadow.h"
 #include "berberis/guest_os_primitives/guest_signal.h"
 #include "berberis/guest_state/guest_state.h"
 #include "berberis/interpreter/arm64/interpreter.h"
+#include "berberis/lite_translator/lite_translate_region.h"
 #include "berberis/runtime_primitives/runtime_library.h"
 #include "berberis/runtime_primitives/translation_cache.h"
 
 namespace berberis {
+namespace {
 
-void InitTranslatorArch() {
-  ClaimHostFaultSignals();
+enum class TranslationMode {
+  kInterpretOnly,
+  kLiteTranslateOrInterpret,
+};
+
+// Keep the new backend opt-in until its instruction coverage is broad enough
+// for arbitrary APK startup code.  Set berberis.mode to
+// lite-translate-or-interpret to exercise translated regions.
+TranslationMode g_translation_mode = TranslationMode::kInterpretOnly;
+
+void UpdateTranslationMode() {
+  const char* mode = GetTranslationModeConfig();
+  if (!mode || strcmp(mode, "interpret-only") == 0) {
+    return;
+  }
+  if (strcmp(mode, "lite-translate-or-interpret") == 0 || strcmp(mode, "two-gear") == 0) {
+    g_translation_mode = TranslationMode::kLiteTranslateOrInterpret;
+    return;
+  }
+  LOG_ALWAYS_FATAL("Unsupported LoongArch64 translation mode '%s'", mode);
 }
 
-extern "C" __attribute__((used, __visibility__("hidden"))) void berberis_HandleNotTranslated(
-    ThreadState* state) {
+size_t GetExecutableRegionSize(GuestAddr pc) {
+  auto [is_executable, size] =
+      GuestMapShadow::GetInstance()->GetExecutableRegionSize(pc, config::kGuestPageSize);
+  CHECK(is_executable);
+  return size;
+}
+
+std::tuple<bool, HostCodePiece, size_t> TryLiteTranslateAndInstallRegion(GuestAddr pc) {
+  LiteTranslateParams params;
+  constexpr size_t kMaxGuestInstructionsPerRegion = 64;
+  size_t executable_size = GetExecutableRegionSize(pc);
+  size_t max_size = kMaxGuestInstructionsPerRegion * sizeof(uint32_t);
+  params.end_pc = pc + (executable_size < max_size ? executable_size : max_size);
+  params.allow_dispatch = false;
+  params.enable_reg_mapping = false;
+
+  MachineCode machine_code;
+  auto [success, stop_pc] = TryLiteTranslateRegion(pc, &machine_code, params);
+  size_t size = stop_pc - pc;
+  if (success) {
+    HostCodePiece piece = InstallTranslated(&machine_code, pc, size, "lite_la64");
+    return {piece.code != kNullHostCodeAddr, piece, size};
+  }
+  if (size == 0) {
+    return {false, {}, 0};
+  }
+
+  // Preserve a useful supported prefix when the next instruction is not yet
+  // implemented.  Re-emitting with a clamped end adds a normal dispatcher
+  // exit at the exact unsupported instruction.
+  MachineCode prefix_code;
+  params.end_pc = stop_pc;
+  std::tie(success, stop_pc) = TryLiteTranslateRegion(pc, &prefix_code, params);
+  CHECK(success);
+  HostCodePiece piece = InstallTranslated(&prefix_code, pc, size, "lite_la64_prefix");
+  return {piece.code != kNullHostCodeAddr, piece, size};
+}
+
+void TranslateRegion(GuestAddr pc) {
   TranslationCache* cache = TranslationCache::GetInstance();
-  GuestAddr pc = state->cpu.insn_addr;
   GuestCodeEntry* entry = cache->AddAndLockForTranslation(pc, 0);
   if (!entry) {
     return;
   }
 
   auto [is_executable, insn_size] = IsPcExecutable(pc, GuestMapShadow::GetInstance());
-  HostCodePiece target{is_executable ? kEntryInterpret : kEntryNoExec, 0};
-  GuestCodeEntry::Kind kind = is_executable ? GuestCodeEntry::Kind::kInterpreted
-                                            : GuestCodeEntry::Kind::kSpecialHandler;
-  cache->SetTranslatedAndUnlock(pc, entry, insn_size, kind, target);
+  if (!is_executable) {
+    cache->SetTranslatedAndUnlock(
+        pc, entry, insn_size, GuestCodeEntry::Kind::kSpecialHandler, {kEntryNoExec, 0});
+    return;
+  }
+
+  if (g_translation_mode == TranslationMode::kLiteTranslateOrInterpret) {
+    auto [success, piece, size] = TryLiteTranslateAndInstallRegion(pc);
+    if (success) {
+      cache->SetTranslatedAndUnlock(pc, entry, size, GuestCodeEntry::Kind::kLiteTranslated, piece);
+      return;
+    }
+  }
+  cache->SetTranslatedAndUnlock(
+      pc, entry, insn_size, GuestCodeEntry::Kind::kInterpreted, {kEntryInterpret, 0});
+}
+
+}  // namespace
+
+void InitTranslatorArch() {
+  ClaimHostFaultSignals();
+  UpdateTranslationMode();
+}
+
+extern "C" __attribute__((used, __visibility__("hidden"))) void berberis_HandleNotTranslated(
+    ThreadState* state) {
+  TranslateRegion(state->cpu.insn_addr);
 }
 
 extern "C" __attribute__((used, __visibility__("hidden"))) void berberis_HandleInterpret(
     ThreadState* state) {
-  InterpretBatch(
-      state, 500, TranslationCache::GetInstance(), InterpreterCacheLookupMode::kNonSequentialOnly);
+  InterpreterCacheLookupMode lookup_mode =
+      g_translation_mode == TranslationMode::kLiteTranslateOrInterpret
+          ? InterpreterCacheLookupMode::kAll
+          : InterpreterCacheLookupMode::kNonSequentialOnly;
+  InterpretBatch(state, 500, TranslationCache::GetInstance(), lookup_mode);
 }
 
 extern "C" __attribute__((used, __visibility__("hidden"))) const void* berberis_GetDispatchAddress(
@@ -64,7 +151,7 @@ extern "C" __attribute__((used, __visibility__("hidden"))) const void* berberis_
 
 extern "C" __attribute__((used, __visibility__("hidden"))) void
 berberis_HandleLiteCounterThresholdReached(ThreadState*) {
-  LOG_ALWAYS_FATAL("LoongArch64 JIT is disabled in interpreter-only mode");
+  LOG_ALWAYS_FATAL("LoongArch64 bootstrap JIT does not use tiering");
 }
 
 }  // namespace berberis

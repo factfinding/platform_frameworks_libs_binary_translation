@@ -16,9 +16,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <tuple>
 
 #include "gtest/gtest.h"
 
+#include "../../lite_translator/include/berberis/lite_translator/lite_translate_region.h"
 #include "berberis/assembler/loongarch64.h"
 #include "berberis/assembler/machine_code.h"
 #include "berberis/guest_state/guest_state.h"
@@ -52,6 +54,63 @@ TEST(LoongArch64RuntimeLibraryTest, RunsGeneratedCodeAndSynchronizesGuestPc) {
 
   EXPECT_EQ(GetInsnAddr(state.cpu), kInitialPc + 4);
   EXPECT_EQ(GetResidence(state), kOutsideGeneratedCode);
+}
+
+template <size_t kSize>
+void TranslateAndRun(const std::array<uint32_t, kSize>& guest_code, ThreadState* state) {
+  InitHostEntries();
+  GuestAddr start_pc = ToGuestAddr(guest_code.data());
+  MachineCode code;
+  LiteTranslateParams params;
+  params.end_pc = start_pc + sizeof(guest_code);
+  params.allow_dispatch = false;
+  auto [success, stop_pc] = TryLiteTranslateRegion(start_pc, &code, params);
+  EXPECT_TRUE(success);
+  EXPECT_GE(stop_pc, start_pc + sizeof(uint32_t));
+
+  ScopedExecRegion exec(&code);
+  SetInsnAddr(state->cpu, start_pc);
+  SetResidence(*state, kOutsideGeneratedCode);
+  berberis_RunGeneratedCode(state, AsHostCode(exec.GetHostCodeAddr()));
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesMoveWideAndAddSubImmediate) {
+  // movz x0, #0x1234; add x1, x0, #5; movk x1, #0xabcd, lsl #16;
+  // sub w2, w1, #1
+  constexpr std::array<uint32_t, 4> kGuestCode = {
+      0xd282'4680, 0x9100'1401, 0xf2b5'79a1, 0x5100'0422};
+
+  ThreadState state{};
+  TranslateAndRun(kGuestCode, &state);
+  EXPECT_EQ(state.cpu.x[0], 0x1234u);
+  EXPECT_EQ(state.cpu.x[1], 0xabcd'1239u);
+  EXPECT_EQ(state.cpu.x[2], 0xabcd'1238u);
+  EXPECT_EQ(GetInsnAddr(state.cpu), ToGuestAddr(kGuestCode.data() + kGuestCode.size()));
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesCompareAndBranch) {
+  // cbz x0, +8.  The following words only provide valid branch destinations;
+  // the translated region ends at the conditional branch.
+  constexpr std::array<uint32_t, 3> kGuestCode = {0xb400'0040, 0xd280'0021, 0xd280'0041};
+
+  ThreadState zero_state{};
+  TranslateAndRun(kGuestCode, &zero_state);
+  EXPECT_EQ(GetInsnAddr(zero_state.cpu), ToGuestAddr(kGuestCode.data() + 2));
+
+  ThreadState nonzero_state{};
+  nonzero_state.cpu.x[0] = 1;
+  TranslateAndRun(kGuestCode, &nonzero_state);
+  EXPECT_EQ(GetInsnAddr(nonzero_state.cpu), ToGuestAddr(kGuestCode.data() + 1));
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesBranchWithLink) {
+  // bl +8; the link register receives the address after BL.
+  constexpr std::array<uint32_t, 3> kGuestCode = {0x9400'0002, 0xd280'0020, 0xd280'0040};
+
+  ThreadState state{};
+  TranslateAndRun(kGuestCode, &state);
+  EXPECT_EQ(state.cpu.x[30], ToGuestAddr(kGuestCode.data() + 1));
+  EXPECT_EQ(GetInsnAddr(state.cpu), ToGuestAddr(kGuestCode.data() + 2));
 }
 
 }  // namespace
