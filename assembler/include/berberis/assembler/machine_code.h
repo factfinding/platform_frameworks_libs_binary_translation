@@ -106,6 +106,9 @@ class MachineCode {
     exec->Write(code, AddrAs<uint8_t>(0), code_.size());
 #if defined(__riscv)
     __riscv_flush_icache((void*)code, (void*)(code + code_.size()), 0);
+#elif defined(__loongarch__)
+    __builtin___clear_cache(reinterpret_cast<char*>(const_cast<uint8_t*>(code)),
+                            reinterpret_cast<char*>(const_cast<uint8_t*>(code + code_.size())));
 #endif
   }
 
