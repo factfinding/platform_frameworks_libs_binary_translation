@@ -216,7 +216,10 @@ bool GuestThread::AllocStack(void* stack, size_t stack_size, size_t guard_size) 
 
   if (stack) {
     // User-provided stack.
-    stack_ = nullptr;  // Do not unmap in Destroy!
+    // Keep the address so pthread_getattr_np can report the guest stack through
+    // GetAttr().  mmap_size_ == 0 records that the mapping is caller-owned and
+    // must not be unmapped in Destroy().
+    stack_ = stack;
     mmap_size_ = 0;
     guard_size_ = guard_size;
     stack_size_ = stack_size;

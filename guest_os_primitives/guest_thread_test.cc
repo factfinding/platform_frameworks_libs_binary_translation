@@ -17,6 +17,11 @@
 #include "gtest/gtest.h"
 
 #include <pthread.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+#include "berberis/guest_os_primitives/guest_thread.h"
+#include "berberis/guest_state/guest_addr.h"
 
 namespace {
 
@@ -52,6 +57,35 @@ TEST(GuestThreadTest, PthreadExitRunsLocalDtors) {
   // accordingly (see other TODOs for this bug).
   // ASSERT_EQ(0, g_count);
   ASSERT_EQ(1, g_count);
+}
+
+TEST(GuestThreadTest, ReportsCallerOwnedStack) {
+  const size_t stack_size = 4 * static_cast<size_t>(getpagesize());
+  void* stack = mmap(nullptr,
+                     stack_size,
+                     PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS,
+                     -1,
+                     0);
+  ASSERT_NE(MAP_FAILED, stack);
+
+  berberis::GuestThread* thread =
+      berberis::GuestThread::CreatePthread(stack, stack_size, 0);
+  ASSERT_NE(nullptr, thread);
+
+  berberis::GuestAddr reported_stack_base;
+  size_t reported_stack_size;
+  size_t reported_guard_size;
+  thread->GetAttr(&reported_stack_base, &reported_stack_size, &reported_guard_size);
+  EXPECT_EQ(berberis::ToGuestAddr(stack), reported_stack_base);
+  EXPECT_EQ(stack_size, reported_stack_size);
+  EXPECT_EQ(0U, reported_guard_size);
+
+  berberis::GuestThread::Destroy(thread);
+
+  // Destroy must not unmap a caller-owned stack.
+  EXPECT_EQ(0, mprotect(stack, stack_size, PROT_READ | PROT_WRITE));
+  EXPECT_EQ(0, munmap(stack, stack_size));
 }
 
 }  // namespace
