@@ -418,6 +418,12 @@ class LiteTranslator {
   }
 
   bool TranslateLoadStoreUnsignedImmediate(uint32_t insn, GuestAddr pc) {
+    // Bit 26 selects the SIMD&FP register bank.  The top-level class mask is
+    // shared with integer loads/stores, but this bootstrap backend only
+    // synchronizes general-purpose registers in CPUState.
+    if ((insn & 0x0400'0000u) != 0) {
+      return false;
+    }
     uint32_t size = insn >> 30;
     uint32_t opc = (insn >> 22) & 3;
     uint32_t imm12 = (insn >> 10) & 0xfff;
@@ -458,6 +464,9 @@ class LiteTranslator {
   }
 
   bool TranslateLoadStoreIndexed(uint32_t insn, GuestAddr pc) {
+    if ((insn & 0x0400'0000u) != 0) {
+      return false;
+    }
     uint32_t size = insn >> 30;
     uint32_t opc = (insn >> 22) & 3;
     int64_t offset = SignExtend((insn >> 12) & 0x1ff, 9);

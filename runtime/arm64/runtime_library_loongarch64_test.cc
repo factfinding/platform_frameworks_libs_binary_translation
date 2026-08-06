@@ -192,6 +192,25 @@ TEST(LoongArch64RuntimeLibraryTest, GuestMemoryCanBeKeptInInterpreter) {
   EXPECT_EQ(stop_pc, start_pc);
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteRejectsSimdLoadsAndStores) {
+  // ldr d0, [x1]; str d2, [x3]; ldr d4, [x5], #8; str d6, [x7, #-8]!
+  constexpr std::array<uint32_t, 4> kGuestCode = {
+      0xfd40'0020, 0xfd00'0062, 0xfc40'84a4, 0xfc1f'8ce6};
+
+  for (const uint32_t& insn : kGuestCode) {
+    GuestAddr start_pc = ToGuestAddr(&insn);
+    MachineCode code;
+    LiteTranslateParams params;
+    params.end_pc = start_pc + sizeof(insn);
+    params.allow_dispatch = false;
+
+    auto [success, stop_pc] = TryLiteTranslateRegion(start_pc, &code, params);
+
+    EXPECT_FALSE(success) << std::hex << insn;
+    EXPECT_EQ(stop_pc, start_pc) << std::hex << insn;
+  }
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesPreAndPostIndexedMemory) {
   // str x1, [x0, #-8]!; ldr x2, [x0], #8
   constexpr std::array<uint32_t, 2> kGuestCode = {0xf81f'8c01, 0xf840'8402};
