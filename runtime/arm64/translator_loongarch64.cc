@@ -23,6 +23,7 @@
 #include "berberis/base/config.h"
 #include "berberis/base/config_globals.h"
 #include "berberis/base/logging.h"
+#include "berberis/base/tracing.h"
 #include "berberis/guest_os_primitives/guest_map_shadow.h"
 #include "berberis/guest_os_primitives/guest_signal.h"
 #include "berberis/guest_state/guest_state.h"
@@ -43,6 +44,8 @@ enum class TranslationMode {
 // for arbitrary APK startup code.  Set berberis.mode to
 // lite-translate-or-interpret to exercise translated regions.
 TranslationMode g_translation_mode = TranslationMode::kInterpretOnly;
+uint64_t g_jit_successes;
+uint64_t g_jit_fallbacks;
 
 void UpdateTranslationMode() {
   const char* mode = GetTranslationModeConfig();
@@ -111,8 +114,24 @@ void TranslateRegion(GuestAddr pc) {
   if (g_translation_mode == TranslationMode::kLiteTranslateOrInterpret) {
     auto [success, piece, size] = TryLiteTranslateAndInstallRegion(pc);
     if (success) {
+      ++g_jit_successes;
+      if (g_jit_successes <= 20 || g_jit_successes % 1000 == 0) {
+        TRACE_AND_ALOGD("berberis-la64: JIT #%lu pc=0x%lx insns=%lu",
+                        static_cast<unsigned long>(g_jit_successes),
+                        static_cast<unsigned long>(pc),
+                        static_cast<unsigned long>(size / 4));
+      }
       cache->SetTranslatedAndUnlock(pc, entry, size, GuestCodeEntry::Kind::kLiteTranslated, piece);
       return;
+    }
+  }
+  if (g_translation_mode == TranslationMode::kLiteTranslateOrInterpret) {
+    ++g_jit_fallbacks;
+    if (g_jit_fallbacks <= 20 || g_jit_fallbacks % 1000 == 0) {
+      TRACE_AND_ALOGD("berberis-la64: fallback #%lu pc=0x%lx insn=0x%08x",
+                      static_cast<unsigned long>(g_jit_fallbacks),
+                      static_cast<unsigned long>(pc),
+                      *ToHostAddr<const uint32_t>(pc));
     }
   }
   cache->SetTranslatedAndUnlock(
