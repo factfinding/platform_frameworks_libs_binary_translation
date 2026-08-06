@@ -444,6 +444,23 @@ TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesIndexedByteMemory) {
   EXPECT_EQ(state.cpu.x[0], ToGuestAddr(memory.data() + 1));
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesRegisterOffsetMemory) {
+  // strb w1, [x0, x2]; ldrb w3, [x0, x2];
+  // ldrh w4, [x0, w2, uxtw #1]
+  constexpr std::array<uint32_t, 3> kGuestCode = {0x3822'6801, 0x3862'6803, 0x7862'5804};
+  std::array<uint8_t, 8> memory = {0, 0, 0, 0, 0x34, 0x12, 0, 0};
+
+  ThreadState state{};
+  state.cpu.x[0] = ToGuestAddr(memory.data());
+  state.cpu.x[1] = 0xabu;
+  state.cpu.x[2] = 2;
+  TranslateAndRun(kGuestCode, &state);
+
+  EXPECT_EQ(memory[2], 0xabu);
+  EXPECT_EQ(state.cpu.x[3], 0xabu);
+  EXPECT_EQ(state.cpu.x[4], 0x1234u);
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteIndexedMemoryPreservesPointerTagOnWriteback) {
   // str x1, [x0, #-8]!; ldr x2, [x0], #8
   constexpr std::array<uint32_t, 2> kGuestCode = {0xf81f'8c01, 0xf840'8402};

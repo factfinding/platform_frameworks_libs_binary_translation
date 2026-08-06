@@ -78,6 +78,12 @@ class LiteTranslator {
       }
       return TranslateLoadStoreIndexed(insn, pc);
     }
+    if ((insn & 0x3b20'0c00u) == 0x3820'0800u) {
+      if (!enable_guest_memory_) {
+        return false;
+      }
+      return TranslateLoadStoreRegisterOffset(insn, pc);
+    }
     if ((insn & 0x3e00'0000u) == 0x2800'0000u) {
       if (!enable_guest_memory_) {
         return false;
@@ -547,6 +553,39 @@ class LiteTranslator {
       as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
       StoreXOrSp(rn, Assembler::t0);
     }
+    return true;
+  }
+
+  bool TranslateLoadStoreRegisterOffset(uint32_t insn, GuestAddr pc) {
+    if ((insn & 0x0400'0000u) != 0) {
+      return false;
+    }
+    uint32_t size = insn >> 30;
+    uint32_t opc = (insn >> 22) & 3;
+    uint32_t rm = (insn >> 16) & 31;
+    uint32_t option = (insn >> 13) & 7;
+    bool scaled = ((insn >> 12) & 1) != 0;
+    uint32_t rn = (insn >> 5) & 31;
+    uint32_t rt = insn & 31;
+    // The integer register-offset form accepts UXTW, UXTX/LSL, SXTW and
+    // SXTX.  Other option encodings are reserved for this instruction class.
+    if (opc > 1 || (option != 2 && option != 3 && option != 6 && option != 7)) {
+      return false;
+    }
+
+    LoadXOrSp(rn, Assembler::t0);
+    LoadXOrZero(rm, Assembler::t1);
+    if (option == 2) {
+      ZeroExtend32(Assembler::t1);
+    } else if (option == 6) {
+      SignExtend32(Assembler::t1);
+    }
+    if (scaled && size != 0) {
+      as_.SlliD(Assembler::t1, Assembler::t1, size);
+    }
+    as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
+    ApplyTbi(Assembler::t0);
+    EmitLoadStore(size, opc == 1, rt, pc);
     return true;
   }
 
