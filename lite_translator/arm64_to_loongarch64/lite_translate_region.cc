@@ -104,7 +104,9 @@ class LiteTranslator {
     if ((insn & 0x1f00'0000u) == 0x0a00'0000u) {
       return TranslateLogicalShiftedRegister(insn);
     }
-    if ((insn & 0x1f80'0000u) == 0x1200'0000u) {
+    // Keep logical immediates on the interpreter path while the experimental
+    // LoongArch64 translators are disabled for application testing.
+    if (false && (insn & 0x1f80'0000u) == 0x1200'0000u) {
       return TranslateLogicalImmediate(insn);
     }
     if ((insn & 0x1f80'0000u) == 0x1300'0000u) {
@@ -150,8 +152,8 @@ class LiteTranslator {
       region_end_reached_ = true;
       return true;
     }
-    // Keep TBZ/TBNZ interpreted: enabling this path makes WeChat fault in
-    // generated code during process initialization.
+    // Keep TBZ/TBNZ on the interpreter path: this translator has caused an
+    // application-startup fault in generated code.
     if (false && (insn & 0x7e00'0000u) == 0x3600'0000u) {
       TranslateTestAndBranch(insn, pc);
       region_end_reached_ = true;
