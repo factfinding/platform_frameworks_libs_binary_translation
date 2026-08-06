@@ -208,6 +208,15 @@ long RunGuestSyscallImpl(long guest_nr,
       return RunGuestSyscall___NR_execveat(arg_1, arg_2, arg_3, arg_4, arg_5);
     case __NR_ioctl:
       return RunGuestSyscall___NR_ioctl(arg_1, arg_2, arg_3);
+    case __NR_fcntl:
+      // AArch64 uses the legacy ARM layout for several O_* flag bits while
+      // LoongArch uses asm-generic values.  F_GETFL/F_SETFL therefore need
+      // the same flag conversion as openat.
+      return RunGuestSyscall___NR_fcntl(arg_1, arg_2, arg_3);
+    case __NR_openat:
+      // In particular, an AArch64 O_DIRECTORY bit is LoongArch O_DIRECT.
+      // Forwarding it unchanged makes directory opens fail with EINVAL.
+      return RunGuestSyscall___NR_openat(arg_1, arg_2, arg_3, arg_4);
     case __NR_mmap:
       // mmap/mprotect/munmap/mremap must update GuestMapShadow. Forwarding
       // these directly leaves newly generated JIT code marked non-executable
