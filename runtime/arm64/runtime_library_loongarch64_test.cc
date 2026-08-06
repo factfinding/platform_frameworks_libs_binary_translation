@@ -16,6 +16,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <tuple>
 
 #include "gtest/gtest.h"
@@ -189,6 +190,47 @@ TEST(LoongArch64RuntimeLibraryTest, LiteMemoryIgnoresPointerTopByte) {
   EXPECT_EQ(memory[2], memory[1]);
   // TBI affects the memory access, not the architectural register value.
   EXPECT_EQ(state.cpu.x[0], ToGuestAddr(memory.data()) | 0xab00'0000'0000'0000ULL);
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteMemorySupportsUnalignedAddresses) {
+  // ldr x1, [x0]; str x1, [x0, #8]
+  constexpr std::array<uint32_t, 2> kGuestCode = {0xf940'0001, 0xf900'0401};
+  std::array<uint8_t, 17> memory{};
+  constexpr uint64_t kValue = 0x0123'4567'89ab'cdef;
+  memcpy(memory.data() + 1, &kValue, sizeof(kValue));
+
+  ThreadState state{};
+  state.cpu.x[0] = ToGuestAddr(memory.data() + 1);
+  TranslateAndRun(kGuestCode, &state);
+
+  uint64_t stored = 0;
+  memcpy(&stored, memory.data() + 9, sizeof(stored));
+  EXPECT_EQ(state.cpu.x[1], kValue);
+  EXPECT_EQ(stored, kValue);
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteMemoryInstructionsHaveRecoveryPoints) {
+  // ldr x2, [x0]; str x2, [x0, #8]; ldp x3, x4, [x0]; stp x3, x4, [x0]
+  constexpr std::array<uint32_t, 4> kGuestCode = {
+      0xf940'0002, 0xf900'0402, 0xa940'1003, 0xa900'1003};
+  GuestAddr start_pc = ToGuestAddr(kGuestCode.data());
+  MachineCode code;
+  LiteTranslateParams params;
+  params.end_pc = start_pc + sizeof(kGuestCode);
+  params.allow_dispatch = false;
+
+  auto [success, stop_pc] = TryLiteTranslateRegion(start_pc, &code, params);
+  ASSERT_TRUE(success);
+  EXPECT_EQ(stop_pc, params.end_pc);
+
+  ScopedExecRegion exec(&code);
+  // One recovery entry for each scalar access and two for each pair.
+  EXPECT_EQ(exec.recovery_map().size(), 6u);
+  for (const auto& [fault_pc, recovery_pc] : exec.recovery_map()) {
+    EXPECT_NE(fault_pc, 0u);
+    EXPECT_NE(recovery_pc, 0u);
+    EXPECT_NE(fault_pc, recovery_pc);
+  }
 }
 
 TEST(LoongArch64RuntimeLibraryTest, GuestMemoryCanBeKeptInInterpreter) {
