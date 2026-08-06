@@ -63,6 +63,9 @@ class LiteTranslator {
     if ((insn & 0x1f00'0000u) == 0x0a00'0000u) {
       return TranslateLogicalShiftedRegister(insn);
     }
+    if ((insn & 0x1f80'0000u) == 0x1300'0000u) {
+      return TranslateBitfieldExtract(insn);
+    }
     if ((insn & 0x1f00'0000u) == 0x1000'0000u) {
       return TranslatePcRelativeAddress(insn, pc);
     }
@@ -470,6 +473,47 @@ class LiteTranslator {
     }
     if (opc == 3) {
       ComputeLogicalFlags(Assembler::t0, is_64_bit ? 64 : 32);
+    }
+    StoreXOrDiscard(rd, Assembler::t0);
+    return true;
+  }
+
+  bool TranslateBitfieldExtract(uint32_t insn) {
+    bool is_64_bit = (insn >> 31) != 0;
+    uint32_t opc = (insn >> 29) & 3;
+    bool n = ((insn >> 22) & 1) != 0;
+    uint32_t immr = (insn >> 16) & 0x3f;
+    uint32_t imms = (insn >> 10) & 0x3f;
+    uint32_t rn = (insn >> 5) & 31;
+    uint32_t rd = insn & 31;
+    uint32_t data_size = is_64_bit ? 64 : 32;
+    // BFM needs the old destination value, and immr > imms uses the wrapping
+    // insert form.  Keep both in the interpreter until those semantics are
+    // implemented; the hot sign/zero extensions and extracts are non-wrapping.
+    if (opc > 2 || opc == 1 || n != is_64_bit || immr >= data_size || imms >= data_size ||
+        immr > imms) {
+      return false;
+    }
+
+    uint32_t field_width = imms - immr + 1;
+    LoadXOrZero(rn, Assembler::t0);
+    if (!is_64_bit) {
+      ZeroExtend32(Assembler::t0);
+    }
+    if (immr != 0) {
+      as_.SrliD(Assembler::t0, Assembler::t0, immr);
+    }
+
+    if (opc == 0) {  // SBFM / SBFX / SXT[BHW]
+      as_.SlliD(Assembler::t0, Assembler::t0, 64 - field_width);
+      as_.SraiD(Assembler::t0, Assembler::t0, 64 - field_width);
+    } else {  // UBFM / UBFX / UXT[BH]
+      uint64_t mask = field_width == 64 ? UINT64_MAX : (uint64_t{1} << field_width) - 1;
+      as_.Li(Assembler::t1, mask);
+      as_.And(Assembler::t0, Assembler::t0, Assembler::t1);
+    }
+    if (!is_64_bit) {
+      ZeroExtend32(Assembler::t0);
     }
     StoreXOrDiscard(rd, Assembler::t0);
     return true;
