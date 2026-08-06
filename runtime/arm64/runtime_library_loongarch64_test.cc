@@ -106,6 +106,24 @@ TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesCompareAndBranch) {
   EXPECT_EQ(GetInsnAddr(nonzero_state.cpu), ToGuestAddr(kGuestCode.data() + 1));
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesTestAndBranch) {
+  // tbz x0, #5, +8
+  constexpr std::array<uint32_t, 3> kTbzCode = {0x3628'0040, 0xd503'201f, 0xd503'201f};
+  ThreadState clear_state{};
+  TranslateAndRun(kTbzCode, &clear_state);
+  EXPECT_EQ(GetInsnAddr(clear_state.cpu), ToGuestAddr(kTbzCode.data() + 2));
+
+  ThreadState set_state{};
+  set_state.cpu.x[0] = uint64_t{1} << 5;
+  TranslateAndRun(kTbzCode, &set_state);
+  EXPECT_EQ(GetInsnAddr(set_state.cpu), ToGuestAddr(kTbzCode.data() + 1));
+
+  // tbnz w0, #5, +8
+  constexpr std::array<uint32_t, 3> kTbnzCode = {0x3728'0040, 0xd503'201f, 0xd503'201f};
+  TranslateAndRun(kTbnzCode, &set_state);
+  EXPECT_EQ(GetInsnAddr(set_state.cpu), ToGuestAddr(kTbnzCode.data() + 2));
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesBranchWithLink) {
   // bl +8; the link register receives the address after BL.
   constexpr std::array<uint32_t, 3> kGuestCode = {0x9400'0002, 0xd280'0020, 0xd280'0040};

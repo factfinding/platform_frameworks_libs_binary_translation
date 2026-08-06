@@ -106,6 +106,11 @@ class LiteTranslator {
       region_end_reached_ = true;
       return true;
     }
+    if ((insn & 0x7e00'0000u) == 0x3600'0000u) {
+      TranslateTestAndBranch(insn, pc);
+      region_end_reached_ = true;
+      return true;
+    }
     if ((insn & 0xff00'0010u) == 0x5400'0000u) {
       TranslateConditionalBranch(insn, pc);
       region_end_reached_ = true;
@@ -760,6 +765,25 @@ class LiteTranslator {
     if (!is_64_bit) {
       ZeroExtend32(Assembler::t1);
     }
+    Assembler::Label* taken = as_.MakeLabel();
+    if (nonzero) {
+      as_.Bnez(Assembler::t1, *taken);
+    } else {
+      as_.Beqz(Assembler::t1, *taken);
+    }
+    Exit(pc + 4);
+    as_.Bind(taken);
+    Exit(pc + displacement);
+  }
+
+  void TranslateTestAndBranch(uint32_t insn, GuestAddr pc) {
+    uint32_t bit = ((insn >> 26) & 0x20) | ((insn >> 19) & 0x1f);
+    bool nonzero = ((insn >> 24) & 1) != 0;
+    int64_t displacement = SignExtend((insn >> 5) & 0x3fff, 14) * 4;
+    uint32_t rt = insn & 31;
+
+    LoadXOrZero(rt, Assembler::t1);
+    as_.SrliD(Assembler::t1, Assembler::t1, bit);
     Assembler::Label* taken = as_.MakeLabel();
     if (nonzero) {
       as_.Bnez(Assembler::t1, *taken);
