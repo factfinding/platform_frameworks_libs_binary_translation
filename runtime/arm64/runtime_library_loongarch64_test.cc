@@ -264,5 +264,21 @@ TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesFlagSettingRegisterOperations)
   EXPECT_EQ(tst_state.cpu.flags, 4u);  // Z
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesConditionalSelectFamily) {
+  // csel x2, x0, x1, eq; csinc x3, x0, x1, ne;
+  // csinv x4, x0, x1, ne; csneg x5, x0, x1, ne
+  constexpr std::array<uint32_t, 4> kGuestCode = {
+      0x9a81'0002, 0x9a81'1403, 0xda81'1004, 0xda81'1405};
+  ThreadState state{};
+  state.cpu.flags = 4;  // Z
+  state.cpu.x[0] = 10;
+  state.cpu.x[1] = 3;
+  TranslateAndRun(kGuestCode, &state);
+  EXPECT_EQ(state.cpu.x[2], 10u);
+  EXPECT_EQ(state.cpu.x[3], 4u);
+  EXPECT_EQ(state.cpu.x[4], ~uint64_t{3});
+  EXPECT_EQ(state.cpu.x[5], uint64_t{0} - 3);
+}
+
 }  // namespace
 }  // namespace berberis

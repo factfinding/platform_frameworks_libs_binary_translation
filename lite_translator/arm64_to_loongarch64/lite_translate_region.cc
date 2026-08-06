@@ -70,6 +70,9 @@ class LiteTranslator {
     if ((insn & 0x3e00'0000u) == 0x2800'0000u) {
       return TranslateLoadStorePair(insn, pc);
     }
+    if ((insn & 0x1fe0'0800u) == 0x1a80'0000u) {
+      return TranslateConditionalSelect(insn);
+    }
     if ((insn & 0x7c00'0000u) == 0x1400'0000u) {
       TranslateBranchImmediate(insn, pc);
       region_end_reached_ = true;
@@ -591,7 +594,16 @@ class LiteTranslator {
 
   void TranslateConditionalBranch(uint32_t insn, GuestAddr pc) {
     int64_t displacement = SignExtend((insn >> 5) & 0x7ffff, 19) * 4;
-    uint32_t condition = insn & 0xf;
+    EmitCondition(insn & 0xf);
+
+    Assembler::Label* taken = as_.MakeLabel();
+    as_.Bnez(Assembler::t2, *taken);
+    Exit(pc + 4);
+    as_.Bind(taken);
+    Exit(pc + displacement);
+  }
+
+  void EmitCondition(uint32_t condition) {
     as_.LdWU(Assembler::t1, Assembler::s8, kFlagsOffset);
 
     // Normalize N/Z/C/V into individual zero-or-one registers.
@@ -638,12 +650,39 @@ class LiteTranslator {
     if ((condition & 1) != 0 && condition != 0xf) {
       as_.Xor(Assembler::t2, Assembler::t2, Assembler::t5);
     }
+  }
 
-    Assembler::Label* taken = as_.MakeLabel();
-    as_.Bnez(Assembler::t2, *taken);
-    Exit(pc + 4);
-    as_.Bind(taken);
-    Exit(pc + displacement);
+  bool TranslateConditionalSelect(uint32_t insn) {
+    bool is_64_bit = (insn >> 31) != 0;
+    bool invert_or_negate = ((insn >> 30) & 1) != 0;
+    bool increment_or_negate = ((insn >> 10) & 1) != 0;
+    uint32_t rm = (insn >> 16) & 31;
+    uint32_t condition = (insn >> 12) & 0xf;
+    uint32_t rn = (insn >> 5) & 31;
+    uint32_t rd = insn & 31;
+
+    EmitCondition(condition);
+    Assembler::Label* use_false = as_.MakeLabel();
+    Assembler::Label* done = as_.MakeLabel();
+    as_.Beqz(Assembler::t2, *use_false);
+    LoadXOrZero(rn, Assembler::t0);
+    as_.B(*done);
+    as_.Bind(use_false);
+    LoadXOrZero(rm, Assembler::t0);
+    if (invert_or_negate && increment_or_negate) {  // CSNEG
+      as_.SubD(Assembler::t0, Assembler::zero, Assembler::t0);
+    } else if (invert_or_negate) {  // CSINV
+      as_.Li(Assembler::t1, UINT64_MAX);
+      as_.Xor(Assembler::t0, Assembler::t0, Assembler::t1);
+    } else if (increment_or_negate) {  // CSINC
+      as_.AddiD(Assembler::t0, Assembler::t0, 1);
+    }
+    as_.Bind(done);
+    if (!is_64_bit) {
+      ZeroExtend32(Assembler::t0);
+    }
+    StoreXOrDiscard(rd, Assembler::t0);
+    return true;
   }
 
   void TranslateBranchRegister(uint32_t insn, GuestAddr pc) {
