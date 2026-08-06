@@ -60,6 +60,9 @@ class LiteTranslator {
     if ((insn & 0x1f00'0000u) == 0x1000'0000u) {
       return TranslatePcRelativeAddress(insn, pc);
     }
+    if ((insn & 0x3b00'0000u) == 0x3900'0000u) {
+      return TranslateLoadStoreUnsignedImmediate(insn, pc);
+    }
     if ((insn & 0x7c00'0000u) == 0x1400'0000u) {
       TranslateBranchImmediate(insn, pc);
       region_end_reached_ = true;
@@ -291,6 +294,46 @@ class LiteTranslator {
     }
     as_.Li(Assembler::t0, value);
     StoreXOrDiscard(rd, Assembler::t0);
+    return true;
+  }
+
+  bool TranslateLoadStoreUnsignedImmediate(uint32_t insn, GuestAddr pc) {
+    uint32_t size = insn >> 30;
+    uint32_t opc = (insn >> 22) & 3;
+    uint32_t imm12 = (insn >> 10) & 0xfff;
+    uint32_t rn = (insn >> 5) & 31;
+    uint32_t rt = insn & 31;
+    if ((size != 2 && size != 3) || opc > 1) {
+      return false;
+    }
+
+    LoadXOrSp(rn, Assembler::t0);
+    as_.Li(Assembler::t1, static_cast<uint64_t>(imm12) << size);
+    as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
+
+    Assembler::Label* recovery = as_.MakeLabel();
+    Assembler::Label* done = as_.MakeLabel();
+    if (opc == 0) {  // STR
+      LoadXOrZero(rt, Assembler::t1);
+      as_.SetRecoveryPoint(recovery);
+      if (size == 3) {
+        as_.StD(Assembler::t1, Assembler::t0, 0);
+      } else {
+        as_.StW(Assembler::t1, Assembler::t0, 0);
+      }
+    } else {  // LDR
+      as_.SetRecoveryPoint(recovery);
+      if (size == 3) {
+        as_.LdD(Assembler::t1, Assembler::t0, 0);
+      } else {
+        as_.LdWU(Assembler::t1, Assembler::t0, 0);
+      }
+      StoreXOrDiscard(rt, Assembler::t1);
+    }
+    as_.B(*done);
+    as_.Bind(recovery);
+    Exit(pc);
+    as_.Bind(done);
     return true;
   }
 

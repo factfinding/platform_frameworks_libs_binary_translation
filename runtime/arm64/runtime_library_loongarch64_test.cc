@@ -160,5 +160,21 @@ TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesRegisterBranches) {
   EXPECT_EQ(GetInsnAddr(ret_state.cpu), ToGuestAddr(kRetCode.data() + 2));
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesUnsignedImmediateLoadsAndStores) {
+  // ldr x2, [x0, #8]; str x2, [x0, #16];
+  // ldr w3, [x0, #4]; str w3, [x0]
+  constexpr std::array<uint32_t, 4> kGuestCode = {
+      0xf940'0402, 0xf900'0802, 0xb940'0403, 0xb900'0003};
+  std::array<uint64_t, 3> memory = {0x1122'3344'5566'7788, 0xaabb'ccdd'eeff'0011, 0};
+
+  ThreadState state{};
+  state.cpu.x[0] = ToGuestAddr(memory.data());
+  TranslateAndRun(kGuestCode, &state);
+  EXPECT_EQ(state.cpu.x[2], 0xaabb'ccdd'eeff'0011u);
+  EXPECT_EQ(state.cpu.x[3], 0x1122'3344u);
+  EXPECT_EQ(memory[0], 0x1122'3344'1122'3344u);
+  EXPECT_EQ(memory[2], 0xaabb'ccdd'eeff'0011u);
+}
+
 }  // namespace
 }  // namespace berberis
