@@ -41,7 +41,9 @@ TEST(LoongArch64AssemblerTest, EncodesBootstrapInstructions) {
   assembler.Lu32iD(Assembler::a0, 0x12345);
   assembler.Lu52iD(Assembler::a0, Assembler::a0, 0x123);
   assembler.LdD(Assembler::a0, Assembler::a1, 24);
+  assembler.LdWU(Assembler::a0, Assembler::a1, 20);
   assembler.StD(Assembler::a0, Assembler::a1, -8);
+  assembler.StW(Assembler::a0, Assembler::a1, -4);
   assembler.Beq(Assembler::a0, Assembler::a1, 8);
   assembler.Bne(Assembler::a0, Assembler::a1, 8);
   assembler.Beqz(Assembler::a0, 8);
@@ -55,11 +57,11 @@ TEST(LoongArch64AssemblerTest, EncodesBootstrapInstructions) {
 
   // Values are generated independently with LLVM 21 llvm-mc for the
   // loongarch64 target. MachineCode stores words in target little endian.
-  constexpr std::array<uint32_t, 22> kExpected = {
+  constexpr std::array<uint32_t, 24> kExpected = {
       0x001098a4, 0x0011b9ac, 0x0014e717, 0x001500a4, 0x001598a4, 0x02ffc0a4,
-      0x142468a4, 0x0399e084, 0x162468a4, 0x03048c84, 0x28c060a4, 0x29ffe0a4,
-      0x58000885, 0x5c000885, 0x40000880, 0x44000880, 0x50000800, 0x54000800,
-      0x4c000081, 0x00411ca4, 0x00451ca4, 0x00491ca4,
+      0x142468a4, 0x0399e084, 0x162468a4, 0x03048c84, 0x28c060a4, 0x2a8050a4,
+      0x29ffe0a4, 0x29bff0a4, 0x58000885, 0x5c000885, 0x40000880, 0x44000880,
+      0x50000800, 0x54000800, 0x4c000081, 0x00411ca4, 0x00451ca4, 0x00491ca4,
   };
 
   ASSERT_EQ(code.install_size(), sizeof(kExpected));
@@ -107,6 +109,25 @@ TEST(LoongArch64AssemblerTest, Materializes64BitImmediate) {
   for (size_t i = 0; i < kExpected.size(); ++i) {
     EXPECT_EQ(*code.AddrAs<const uint32_t>(i * sizeof(uint32_t)), kExpected[i]) << i;
   }
+}
+
+TEST(LoongArch64AssemblerTest, RecordsMemoryRecoveryPoint) {
+  MachineCode code;
+  Assembler assembler(&code);
+  Assembler::Label* recovery = assembler.MakeLabel();
+
+  assembler.SetRecoveryPoint(recovery);
+  assembler.LdD(Assembler::a0, Assembler::a1, 0);
+  assembler.Bind(recovery);
+  assembler.Ret();
+  assembler.Finalize();
+
+  std::array<uint8_t, 64> installed{};
+  RecoveryMap recovery_map;
+  code.InstallUnsafe(installed.data(), &recovery_map);
+  uintptr_t fault_address = reinterpret_cast<uintptr_t>(installed.data());
+  uintptr_t recovery_address = fault_address + sizeof(uint32_t);
+  EXPECT_EQ(recovery_address, recovery_map[fault_address]);
 }
 
 }  // namespace

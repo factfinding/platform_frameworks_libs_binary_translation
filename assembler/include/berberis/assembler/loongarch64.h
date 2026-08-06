@@ -147,8 +147,14 @@ class Assembler : public AssemblerBase {
   void LdD(Register rd, Register rj, int32_t imm12) {
     Emit2RI12(0x28c0'0000, rd, rj, EncodeSigned(imm12, 12));
   }
+  void LdWU(Register rd, Register rj, int32_t imm12) {
+    Emit2RI12(0x2a80'0000, rd, rj, EncodeSigned(imm12, 12));
+  }
   void StD(Register rd, Register rj, int32_t imm12) {
     Emit2RI12(0x29c0'0000, rd, rj, EncodeSigned(imm12, 12));
+  }
+  void StW(Register rd, Register rj, int32_t imm12) {
+    Emit2RI12(0x2980'0000, rd, rj, EncodeSigned(imm12, 12));
   }
 
   void SlliD(Register rd, Register rj, uint32_t shift) { Emit2RI6(0x0041'0000, rd, rj, shift); }
@@ -221,6 +227,11 @@ class Assembler : public AssemblerBase {
           break;
       }
       *AddrAs<uint32_t>(fixup.pc) |= encoded;
+    }
+    for (const Jump& jump : jumps_) {
+      CHECK(jump.is_recovery);
+      CHECK(jump.label->IsBound());
+      AddRelocation(0, RelocationType::RelocRecoveryPoint, jump.pc, jump.label->position());
     }
   }
 
