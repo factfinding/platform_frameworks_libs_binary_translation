@@ -49,7 +49,10 @@ void InterpretInsn(ThreadState* state) {
   interpreter.FinalizeInsn(insn_len);
 }
 
-void InterpretBatch(ThreadState* state, int max_insns, TranslationCache* cache) {
+void InterpretBatch(ThreadState* state,
+                    int max_insns,
+                    TranslationCache* cache,
+                    bool check_sequential_cache) {
   // Create interpreter/decoder ONCE and reuse across instructions.
   // This eliminates per-instruction construction overhead (~60% of cost).
   Interpreter interpreter(state);
@@ -70,16 +73,19 @@ void InterpretBatch(ThreadState* state, int max_insns, TranslationCache* cache) 
       break;
     }
 
-    // always check cache after each instruction
-    // Previously only checked on non-sequential PCs (branches). This caused
-    // the interpreter to run over JIT'd code at consecutive PCs, executing
-    // up to 500 instructions at interpreter speed when JIT'd code was available.
     GuestAddr new_pc = state->cpu.insn_addr;
     if (new_pc == 0) break;
-    auto code = cache->GetHostCodePtr(new_pc)->load();
-    if (code != kEntryInterpret && code != kEntryNotTranslated &&
-        code != kEntryTranslating) {
-      break;
+
+    // JIT-enabled runtimes must check every instruction so that execution can
+    // enter a translation installed at the next sequential PC.  An
+    // interpreter-only runtime has no such translations, but still must check
+    // non-sequential targets for wrapped host calls and special entries.
+    if (check_sequential_cache || new_pc != pc + insn_len) {
+      auto code = cache->GetHostCodePtr(new_pc)->load();
+      if (code != kEntryInterpret && code != kEntryNotTranslated &&
+          code != kEntryTranslating) {
+        break;
+      }
     }
   }
 }

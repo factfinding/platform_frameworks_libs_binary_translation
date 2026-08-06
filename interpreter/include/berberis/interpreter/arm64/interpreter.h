@@ -27,7 +27,10 @@ void InitInterpreter();
 void InterpretInsn(ThreadState* state);
 // Batch interpreter — reuses Interpreter/Decoder objects across instructions
 // to eliminate per-instruction construction overhead (~3x faster).
-void InterpretBatch(ThreadState* state, int max_insns, TranslationCache* cache);
+void InterpretBatch(ThreadState* state,
+                    int max_insns,
+                    TranslationCache* cache,
+                    bool check_sequential_cache = true);
 
 }  // namespace berberis
 

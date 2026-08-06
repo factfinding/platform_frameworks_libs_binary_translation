@@ -49,7 +49,7 @@ extern "C" __attribute__((used, __visibility__("hidden"))) void berberis_HandleN
 
 extern "C" __attribute__((used, __visibility__("hidden"))) void berberis_HandleInterpret(
     ThreadState* state) {
-  InterpretBatch(state, 500, TranslationCache::GetInstance());
+  InterpretBatch(state, 500, TranslationCache::GetInstance(), false);
 }
 
 extern "C" __attribute__((used, __visibility__("hidden"))) const void* berberis_GetDispatchAddress(
