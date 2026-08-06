@@ -89,3 +89,43 @@ cc_test_library {
         "libberberis_runtime_primitives_headers",
     ],
 }
+
+cc_test {
+    name: "berberis_runtime_arm64_loongarch64_tests",
+    defaults: ["berberis_arm64_defaults"],
+    enabled: false,
+    arch: {
+        loongarch64: {
+            enabled: true,
+        },
+    },
+    srcs: ["runtime_library_loongarch64_test.cc"],
+    header_libs: [
+        "berberis_test_utils_headers",
+        "libberberis_assembler_headers",
+        "libberberis_guest_state_arm64_headers",
+        "libberberis_runtime_primitives_headers",
+    ],
+    static_libs: [
+        "libbase",
+        "libberberis_assembler",
+        "libberberis_base",
+        "libberberis_code_gen_lib_arm64",
+        "libberberis_elf_backed_exec_region",
+        "libberberis_guest_abi_arm64",
+        "libberberis_guest_os_primitives_arm64",
+        "libberberis_guest_state_arm64",
+        "libberberis_instrument",
+        "libberberis_interpreter_arm64",
+        "libberberis_intrinsics",
+        "libberberis_intrinsics_arm64",
+        "libberberis_kernel_api_arm64",
+        "libberberis_runtime_arm64",
+        "libberberis_runtime_primitives",
+        "libberberis_runtime_primitives_arm64",
+        "libberberis_tinyloader",
+        "libffi",
+    ],
+    shared_libs: ["liblog"],
+    test_suites: ["device-tests"],
+}

@@ -16,58 +16,159 @@
 
 #include "berberis/runtime_primitives/runtime_library.h"
 
-#include "berberis/base/logging.h"
-#include "berberis/guest_state/guest_state_opaque.h"
+#include <cstddef>
+
+#include "berberis/guest_state/guest_state.h"
 #include "berberis/runtime_primitives/host_function_wrapper_impl.h"
+
+extern "C" void berberis_HandleInterpret(berberis::ThreadState* state);
+extern "C" void berberis_HandleNotTranslated(berberis::ThreadState* state);
+extern "C" const void* berberis_GetDispatchAddress(berberis::ThreadState* state);
+extern "C" void berberis_HandleLiteCounterThresholdReached(berberis::ThreadState* state);
+
+// Inline assembly needs an unmangled entry for the C++ host-call dispatcher.
+__attribute__((used, __visibility__("hidden"))) extern "C" void berberis_RunHostCallFromGuest(
+    berberis::ThreadState* state) {
+  berberis::RunHostCallFromGuest(state);
+}
+
+// Generated-code ABI:
+//   $s8 - ThreadState pointer
+//   $s7 - current guest PC
+// All other caller-saved registers may be clobbered by a translated region.
+// The frame is 96 bytes so $sp remains 16-byte aligned at calls.
+// clang-format off
+#define END_GENERATED_CODE(EXIT_INSN)                                   \
+  asm(                                                                  \
+      "st.d $s7, $s8, %[InsnAddr]\n"                                   \
+      "addi.w $t0, $zero, %[OutsideGeneratedCode]\n"                   \
+      "st.b $t0, $s8, %[Residence]\n"                                  \
+      "move $a0, $s8\n"                                                \
+      "ld.d $ra, $sp, 80\n"                                            \
+      "ld.d $fp, $sp, 72\n"                                            \
+      "ld.d $s0, $sp, 64\n"                                            \
+      "ld.d $s1, $sp, 56\n"                                            \
+      "ld.d $s2, $sp, 48\n"                                            \
+      "ld.d $s3, $sp, 40\n"                                            \
+      "ld.d $s4, $sp, 32\n"                                            \
+      "ld.d $s5, $sp, 24\n"                                            \
+      "ld.d $s6, $sp, 16\n"                                            \
+      "ld.d $s7, $sp, 8\n"                                             \
+      "ld.d $s8, $sp, 0\n"                                             \
+      "addi.d $sp, $sp, 96\n"                                          \
+      EXIT_INSN                                                         \
+      ::[InsnAddr] "I"(offsetof(berberis::ThreadState, cpu.insn_addr)), \
+      [Residence] "I"(offsetof(berberis::ThreadState, residence)),      \
+      [OutsideGeneratedCode] "I"(berberis::kOutsideGeneratedCode))
+// clang-format on
 
 namespace berberis {
 
-extern "C" void berberis_HandleInterpret(ThreadState* state);
-extern "C" void berberis_HandleNotTranslated(ThreadState* state);
-
 extern "C" {
 
-// Interpreter-only LoongArch64 dispatch does not enter generated code. These
-// functions are distinct address tokens stored in TranslationCache.
-#define DEFINE_ENTRY_TOKEN(name)   \
-  [[gnu::noinline]] void name() {  \
-    asm volatile("" ::: "memory"); \
-  }
+[[gnu::naked]] [[gnu::noinline]] void berberis_RunGeneratedCode(ThreadState* state, HostCode code) {
+  // $a0 contains state and $a1 contains the generated-code entry.
+  // clang-format off
+  asm(
+      "addi.d $sp, $sp, -96\n"
+      "st.d $s8, $sp, 0\n"
+      "st.d $s7, $sp, 8\n"
+      "st.d $s6, $sp, 16\n"
+      "st.d $s5, $sp, 24\n"
+      "st.d $s4, $sp, 32\n"
+      "st.d $s3, $sp, 40\n"
+      "st.d $s2, $sp, 48\n"
+      "st.d $s1, $sp, 56\n"
+      "st.d $s0, $sp, 64\n"
+      "st.d $fp, $sp, 72\n"
+      "st.d $ra, $sp, 80\n"
+      "move $s8, $a0\n"
+      "ld.d $s7, $s8, %[InsnAddr]\n"
+      "addi.w $t0, $zero, %[InsideGeneratedCode]\n"
+      "st.b $t0, $s8, %[Residence]\n"
+      "jr $a1\n"
+      ::[InsnAddr] "I"(offsetof(ThreadState, cpu.insn_addr)),
+      [Residence] "I"(offsetof(ThreadState, residence)),
+      [InsideGeneratedCode] "I"(kInsideGeneratedCode));
+  // clang-format on
+}
 
-DEFINE_ENTRY_TOKEN(berberis_entry_Interpret)
-DEFINE_ENTRY_TOKEN(berberis_entry_ExitGeneratedCode)
-DEFINE_ENTRY_TOKEN(berberis_entry_Stop)
-DEFINE_ENTRY_TOKEN(berberis_entry_NoExec)
-DEFINE_ENTRY_TOKEN(berberis_entry_NotTranslated)
-DEFINE_ENTRY_TOKEN(berberis_entry_Translating)
-DEFINE_ENTRY_TOKEN(berberis_entry_Invalidating)
-DEFINE_ENTRY_TOKEN(berberis_entry_Wrapping)
-DEFINE_ENTRY_TOKEN(berberis_entry_HandleLiteCounterThresholdReached)
-DEFINE_ENTRY_TOKEN(berberis_entry_WrappedHostCall)
+[[gnu::naked]] [[gnu::noinline]] void berberis_entry_Interpret() {
+  // clang-format off
+  asm(
+      "st.d $s7, $s8, %[InsnAddr]\n"
+      "addi.w $t0, $zero, %[OutsideGeneratedCode]\n"
+      "st.b $t0, $s8, %[Residence]\n"
+      "move $a0, $s8\n"
+      "bl berberis_HandleInterpret\n"
+      "move $a0, $s8\n"
+      "bl berberis_GetDispatchAddress\n"
+      "move $t1, $a0\n"
+      "ld.d $s7, $s8, %[InsnAddr]\n"
+      "addi.w $t0, $zero, %[InsideGeneratedCode]\n"
+      "st.b $t0, $s8, %[Residence]\n"
+      "jr $t1\n"
+      ::[InsnAddr] "I"(offsetof(ThreadState, cpu.insn_addr)),
+      [Residence] "I"(offsetof(ThreadState, residence)),
+      [OutsideGeneratedCode] "I"(kOutsideGeneratedCode),
+      [InsideGeneratedCode] "I"(kInsideGeneratedCode));
+  // clang-format on
+}
 
-#undef DEFINE_ENTRY_TOKEN
+[[gnu::naked]] [[gnu::noinline]] void berberis_entry_ExitGeneratedCode() {
+  END_GENERATED_CODE("jr $ra\n");
+}
 
-void berberis_RunGeneratedCode(ThreadState* state, HostCode code) {
-  const HostCodeAddr entry = AsHostCodeAddr(code);
-  SetResidence(*state, kOutsideGeneratedCode);
+[[gnu::naked]] [[gnu::noinline]] void berberis_entry_Stop() {
+  END_GENERATED_CODE("jr $ra\n");
+}
 
-  if (entry == kEntryInterpret) {
-    berberis_HandleInterpret(state);
-  } else if (entry == kEntryNotTranslated) {
-    berberis_HandleNotTranslated(state);
-  } else if (entry == kEntryNoExec) {
-    berberis_HandleNoExec(state);
-  } else if (entry == kEntryStop || entry == kEntryExitGeneratedCode ||
-             entry == kEntryTranslating || entry == kEntryInvalidating) {
-    return;
-  } else if (entry == kEntryWrapping) {
-    LOG_ALWAYS_FATAL("LoongArch64 host trampoline dispatch is not implemented");
-  } else if (entry == AsHostCodeAddr(AsHostCode(berberis_entry_WrappedHostCall))) {
-    RunHostCallFromGuest(state);
-  } else {
-    LOG_ALWAYS_FATAL("LoongArch64 JIT code dispatch is disabled in interpreter-only mode");
-  }
+[[gnu::naked]] [[gnu::noinline]] void berberis_entry_NoExec() {
+  END_GENERATED_CODE("b berberis_HandleNoExec\n");
+}
+
+[[gnu::naked]] [[gnu::noinline]] void berberis_entry_NotTranslated() {
+  END_GENERATED_CODE("b berberis_HandleNotTranslated\n");
+}
+
+[[gnu::naked]] [[gnu::noinline]] void berberis_entry_Translating() {
+  END_GENERATED_CODE("jr $ra\n");
+}
+
+[[gnu::naked]] [[gnu::noinline]] void berberis_entry_Invalidating() {
+  END_GENERATED_CODE("jr $ra\n");
+}
+
+[[gnu::naked]] [[gnu::noinline]] void berberis_entry_Wrapping() {
+  END_GENERATED_CODE("jr $ra\n");
+}
+
+[[gnu::naked]] [[gnu::noinline]] void berberis_entry_HandleLiteCounterThresholdReached() {
+  END_GENERATED_CODE("b berberis_HandleLiteCounterThresholdReached\n");
+}
+
+[[gnu::naked]] [[gnu::noinline]] void berberis_entry_WrappedHostCall() {
+  // clang-format off
+  asm(
+      "st.d $s7, $s8, %[InsnAddr]\n"
+      "addi.w $t0, $zero, %[OutsideGeneratedCode]\n"
+      "st.b $t0, $s8, %[Residence]\n"
+      "move $a0, $s8\n"
+      "bl berberis_RunHostCallFromGuest\n"
+      "move $a0, $s8\n"
+      "bl berberis_GetDispatchAddress\n"
+      "move $t1, $a0\n"
+      "ld.d $s7, $s8, %[InsnAddr]\n"
+      "addi.w $t0, $zero, %[InsideGeneratedCode]\n"
+      "st.b $t0, $s8, %[Residence]\n"
+      "jr $t1\n"
+      ::[InsnAddr] "I"(offsetof(ThreadState, cpu.insn_addr)),
+      [Residence] "I"(offsetof(ThreadState, residence)),
+      [OutsideGeneratedCode] "I"(kOutsideGeneratedCode),
+      [InsideGeneratedCode] "I"(kInsideGeneratedCode));
+  // clang-format on
 }
 
 }  // extern "C"
+
 }  // namespace berberis
