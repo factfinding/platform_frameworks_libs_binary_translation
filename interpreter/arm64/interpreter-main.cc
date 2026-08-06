@@ -52,7 +52,7 @@ void InterpretInsn(ThreadState* state) {
 void InterpretBatch(ThreadState* state,
                     int max_insns,
                     TranslationCache* cache,
-                    bool check_sequential_cache) {
+                    InterpreterCacheLookupMode cache_lookup_mode) {
   // Create interpreter/decoder ONCE and reuse across instructions.
   // This eliminates per-instruction construction overhead (~60% of cost).
   Interpreter interpreter(state);
@@ -80,7 +80,7 @@ void InterpretBatch(ThreadState* state,
     // enter a translation installed at the next sequential PC.  An
     // interpreter-only runtime has no such translations, but still must check
     // non-sequential targets for wrapped host calls and special entries.
-    if (check_sequential_cache || new_pc != pc + insn_len) {
+    if (cache_lookup_mode == InterpreterCacheLookupMode::kAll || new_pc != pc + insn_len) {
       auto code = cache->GetHostCodePtr(new_pc)->load();
       if (code != kEntryInterpret && code != kEntryNotTranslated &&
           code != kEntryTranslating) {

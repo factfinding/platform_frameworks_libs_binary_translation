@@ -19,18 +19,30 @@
 
 #include "berberis/guest_state/guest_state.h"
 
-namespace berberis { class TranslationCache; }
+namespace berberis {
+class TranslationCache;
+}
 
 namespace berberis {
+
+enum class InterpreterCacheLookupMode {
+  // Check every next PC so execution can enter a translation installed at a
+  // sequential address.
+  kAll,
+  // Skip sequential lookups when no translated code can exist, but continue
+  // checking control-flow targets for host wrappers and special handlers.
+  kNonSequentialOnly,
+};
 
 void InitInterpreter();
 void InterpretInsn(ThreadState* state);
 // Batch interpreter — reuses Interpreter/Decoder objects across instructions
 // to eliminate per-instruction construction overhead (~3x faster).
-void InterpretBatch(ThreadState* state,
-                    int max_insns,
-                    TranslationCache* cache,
-                    bool check_sequential_cache = true);
+void InterpretBatch(
+    ThreadState* state,
+    int max_insns,
+    TranslationCache* cache,
+    InterpreterCacheLookupMode cache_lookup_mode = InterpreterCacheLookupMode::kAll);
 
 }  // namespace berberis
 
