@@ -167,6 +167,9 @@ class Assembler : public AssemblerBase {
   void Bne(Register rj, Register rd, int32_t offset) {
     Emit32(0x5c00'0000 | EncodeOffset16(offset) | EncodeRj(rj) | EncodeRd(rd));
   }
+  void Bltu(Register rj, Register rd, int32_t offset) {
+    Emit32(0x6800'0000 | EncodeOffset16(offset) | EncodeRj(rj) | EncodeRd(rd));
+  }
   void Beqz(Register rj, int32_t offset) {
     Emit32(0x4000'0000 | EncodeOffset21(offset) | EncodeRj(rj));
   }
@@ -186,6 +189,10 @@ class Assembler : public AssemblerBase {
   void Bne(Register rj, Register rd, const Label& label) {
     AddFixup(label, FixupKind::kOffset16);
     Bne(rj, rd, 0);
+  }
+  void Bltu(Register rj, Register rd, const Label& label) {
+    AddFixup(label, FixupKind::kOffset16);
+    Bltu(rj, rd, 0);
   }
   void Beqz(Register rj, const Label& label) {
     AddFixup(label, FixupKind::kOffset21);
