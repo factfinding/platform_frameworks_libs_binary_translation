@@ -22,6 +22,7 @@
 #include <iterator>
 #include <string>
 
+#include "berberis/assembler/loongarch64.h"
 #include "berberis/assembler/machine_code.h"
 #include "berberis/assembler/rv32e.h"
 #include "berberis/assembler/rv32i.h"
@@ -38,6 +39,8 @@ using CodeEmitter = berberis::x86_32::Assembler;
 using CodeEmitter = berberis::x86_64::Assembler;
 #elif defined(__riscv)
 using CodeEmitter = berberis::riscv64::Assembler;
+#elif defined(__loongarch__)
+using CodeEmitter = berberis::loongarch64::Assembler;
 #else
 #error "Unsupported platform"
 #endif

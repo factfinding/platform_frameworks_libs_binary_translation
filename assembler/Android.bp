@@ -244,6 +244,7 @@ cc_test_library {
     srcs: [
         "assembler_test.cc",
         "immediates_test.cc",
+        "loongarch64_test.cc",
         "machine_code_test.cc",
     ],
     generated_sources: ["libberberis_assembler_test_gen_sources"],
