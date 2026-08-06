@@ -275,6 +275,20 @@ TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesBitfieldExtracts) {
   EXPECT_EQ(state.cpu.x[3], UINT64_C(0xffff'ffff'ffff'ff80));
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesLogicalImmediates) {
+  // and w9, w8, #0xff; orr x3, x1, #0xff00; eor x4, x1, #0xff
+  constexpr std::array<uint32_t, 3> kGuestCode = {0x1200'1d09, 0xb278'1c23, 0xd240'1c24};
+
+  ThreadState state{};
+  state.cpu.x[1] = 0x1234'5678'9abc'def0;
+  state.cpu.x[8] = 0xffff'ffff'1234'56ab;
+  TranslateAndRun(kGuestCode, &state);
+
+  EXPECT_EQ(state.cpu.x[9], 0xabu);
+  EXPECT_EQ(state.cpu.x[3], state.cpu.x[1] | 0xff00u);
+  EXPECT_EQ(state.cpu.x[4], (state.cpu.x[1] ^ 0xffu));
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesPcRelativeAddressesAndNop) {
   // adr x6, +8; adrp x7, current page; nop
   constexpr std::array<uint32_t, 3> kGuestCode = {0x1000'0046, 0x9000'0007, 0xd503'201f};

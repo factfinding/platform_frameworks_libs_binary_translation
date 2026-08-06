@@ -43,6 +43,47 @@ constexpr int64_t SignExtend(uint64_t value, uint32_t width) {
   return static_cast<int64_t>((value & mask) ^ sign) - static_cast<int64_t>(sign);
 }
 
+bool DecodeLogicalImmediate(uint32_t n,
+                            uint32_t immr,
+                            uint32_t imms,
+                            uint32_t data_size,
+                            uint64_t* result) {
+  uint32_t len_source = (n << 6) | (~imms & 0x3f);
+  int32_t len = -1;
+  for (int32_t bit = 6; bit >= 0; --bit) {
+    if ((len_source & (uint32_t{1} << bit)) != 0) {
+      len = bit;
+      break;
+    }
+  }
+  if (len < 1) {
+    return false;
+  }
+  uint32_t levels = (uint32_t{1} << len) - 1;
+  uint32_t s = imms & levels;
+  uint32_t r = immr & levels;
+  if (s == levels) {
+    return false;
+  }
+
+  uint32_t element_size = uint32_t{1} << len;
+  if (element_size > data_size) {
+    return false;
+  }
+  uint64_t element_mask = element_size == 64 ? UINT64_MAX : (uint64_t{1} << element_size) - 1;
+  uint64_t element = (uint64_t{1} << (s + 1)) - 1;
+  if (r != 0) {
+    element = ((element >> r) | (element << (element_size - r))) & element_mask;
+  }
+
+  uint64_t value = 0;
+  for (uint32_t offset = 0; offset < data_size; offset += element_size) {
+    value |= element << offset;
+  }
+  *result = value;
+  return true;
+}
+
 class LiteTranslator {
  public:
   explicit LiteTranslator(MachineCode* machine_code, bool enable_guest_memory, bool allow_dispatch)
@@ -62,6 +103,9 @@ class LiteTranslator {
     }
     if ((insn & 0x1f00'0000u) == 0x0a00'0000u) {
       return TranslateLogicalShiftedRegister(insn);
+    }
+    if ((insn & 0x1f80'0000u) == 0x1200'0000u) {
+      return TranslateLogicalImmediate(insn);
     }
     if ((insn & 0x1f80'0000u) == 0x1300'0000u) {
       return TranslateBitfieldExtract(insn);
@@ -461,6 +505,44 @@ class LiteTranslator {
     if (!ShiftOperand(Assembler::t1, shift_kind, amount, is_64_bit)) {
       return false;
     }
+    switch (opc) {
+      case 0:
+      case 3:
+        as_.And(Assembler::t0, Assembler::t0, Assembler::t1);
+        break;
+      case 1:
+        as_.Or(Assembler::t0, Assembler::t0, Assembler::t1);
+        break;
+      case 2:
+        as_.Xor(Assembler::t0, Assembler::t0, Assembler::t1);
+        break;
+    }
+    if (!is_64_bit) {
+      ZeroExtend32(Assembler::t0);
+    }
+    if (opc == 3) {
+      ComputeLogicalFlags(Assembler::t0, is_64_bit ? 64 : 32);
+    }
+    StoreXOrDiscard(rd, Assembler::t0);
+    return true;
+  }
+
+  bool TranslateLogicalImmediate(uint32_t insn) {
+    bool is_64_bit = (insn >> 31) != 0;
+    uint32_t opc = (insn >> 29) & 3;
+    uint32_t n = (insn >> 22) & 1;
+    uint32_t immr = (insn >> 16) & 0x3f;
+    uint32_t imms = (insn >> 10) & 0x3f;
+    uint32_t rn = (insn >> 5) & 31;
+    uint32_t rd = insn & 31;
+    uint64_t immediate;
+    if ((!is_64_bit && n != 0) ||
+        !DecodeLogicalImmediate(n, immr, imms, is_64_bit ? 64 : 32, &immediate)) {
+      return false;
+    }
+
+    LoadXOrZero(rn, Assembler::t0);
+    as_.Li(Assembler::t1, immediate);
     switch (opc) {
       case 0:
       case 3:
