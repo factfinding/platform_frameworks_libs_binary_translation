@@ -134,6 +134,16 @@ class Assembler : public AssemblerBase {
   void Lu12iW(Register rd, int32_t imm20) { Emit1RI20(0x1400'0000, rd, imm20); }
   void Lu32iD(Register rd, int32_t imm20) { Emit1RI20(0x1600'0000, rd, imm20); }
 
+  // Materialize an arbitrary 64-bit constant without a literal pool.  Keeping
+  // this sequence fixed-size makes it safe to use for generated-code exits,
+  // where both the guest PC and the runtime entry are full host pointers.
+  void Li(Register rd, uint64_t value) {
+    Lu12iW(rd, SignExtend(value >> 12, 20));
+    Ori(rd, rd, value & 0xfff);
+    Lu32iD(rd, SignExtend(value >> 32, 20));
+    Lu52iD(rd, rd, SignExtend(value >> 52, 12));
+  }
+
   void LdD(Register rd, Register rj, int32_t imm12) {
     Emit2RI12(0x28c0'0000, rd, rj, EncodeSigned(imm12, 12));
   }
@@ -232,6 +242,13 @@ class Assembler : public AssemblerBase {
     CHECK_GE(value, min);
     CHECK_LE(value, max);
     return static_cast<uint32_t>(value) & ((1u << width) - 1);
+  }
+
+  static int32_t SignExtend(uint64_t value, uint32_t width) {
+    uint64_t mask = (uint64_t{1} << width) - 1;
+    value &= mask;
+    uint64_t sign = uint64_t{1} << (width - 1);
+    return static_cast<int32_t>((value ^ sign) - sign);
   }
 
   static uint32_t EncodeScaledOffset(int32_t offset, uint32_t width) {

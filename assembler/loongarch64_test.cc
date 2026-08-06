@@ -85,5 +85,29 @@ TEST(LoongArch64AssemblerTest, ResolvesForwardAndBackwardLabels) {
   EXPECT_EQ(*code.AddrAs<const uint32_t>(8), 0x43fff89fu);
 }
 
+TEST(LoongArch64AssemblerTest, Materializes64BitImmediate) {
+  MachineCode code;
+  Assembler assembler(&code);
+
+  assembler.Li(Assembler::a0, 0x1234'5678'9abc'def0);
+  assembler.Li(Assembler::a1, 0xffff'ffff'ffff'ffff);
+
+  // Generated independently with LLVM 21 llvm-mc.
+  constexpr std::array<uint32_t, 8> kExpected = {
+      0x1535'79a4,
+      0x03bb'c084,
+      0x168a'cf04,
+      0x0304'8c84,
+      0x15ff'ffe5,
+      0x03bf'fca5,
+      0x17ff'ffe5,
+      0x033f'fca5,
+  };
+  ASSERT_EQ(code.install_size(), sizeof(kExpected));
+  for (size_t i = 0; i < kExpected.size(); ++i) {
+    EXPECT_EQ(*code.AddrAs<const uint32_t>(i * sizeof(uint32_t)), kExpected[i]) << i;
+  }
+}
+
 }  // namespace
 }  // namespace berberis::loongarch64
