@@ -176,6 +176,22 @@ TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesUnsignedImmediateLoadsAndStore
   EXPECT_EQ(memory[2], 0xaabb'ccdd'eeff'0011u);
 }
 
+TEST(LoongArch64RuntimeLibraryTest, GuestMemoryCanBeKeptInInterpreter) {
+  // ldr x1, [x0]
+  constexpr std::array<uint32_t, 1> kGuestCode = {0xf940'0001};
+  GuestAddr start_pc = ToGuestAddr(kGuestCode.data());
+  MachineCode code;
+  LiteTranslateParams params;
+  params.end_pc = start_pc + sizeof(kGuestCode);
+  params.allow_dispatch = false;
+  params.enable_guest_memory = false;
+
+  auto [success, stop_pc] = TryLiteTranslateRegion(start_pc, &code, params);
+
+  EXPECT_FALSE(success);
+  EXPECT_EQ(stop_pc, start_pc);
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesPreAndPostIndexedMemory) {
   // str x1, [x0, #-8]!; ldr x2, [x0], #8
   constexpr std::array<uint32_t, 2> kGuestCode = {0xf81f'8c01, 0xf840'8402};

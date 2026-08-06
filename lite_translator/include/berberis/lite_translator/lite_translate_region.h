@@ -31,6 +31,7 @@ struct LiteTranslateParams {
   GuestAddr end_pc = GetGuestAddrRangeEnd();
   bool allow_dispatch = true;
   bool enable_reg_mapping = true;
+  bool enable_guest_memory = true;
   bool enable_self_profiling = false;
   uint32_t* counter_location = nullptr;
   uint32_t counter_threshold = config::kGearSwitchThreshold;

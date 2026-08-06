@@ -43,7 +43,8 @@ constexpr int64_t SignExtend(uint64_t value, uint32_t width) {
 
 class LiteTranslator {
  public:
-  explicit LiteTranslator(MachineCode* machine_code) : as_(machine_code) {}
+  explicit LiteTranslator(MachineCode* machine_code, bool enable_guest_memory)
+      : as_(machine_code), enable_guest_memory_(enable_guest_memory) {}
 
   bool Translate(uint32_t insn, GuestAddr pc) {
     if ((insn & 0x1f80'0000u) == 0x1280'0000u) {
@@ -62,12 +63,21 @@ class LiteTranslator {
       return TranslatePcRelativeAddress(insn, pc);
     }
     if ((insn & 0x3b00'0000u) == 0x3900'0000u) {
+      if (!enable_guest_memory_) {
+        return false;
+      }
       return TranslateLoadStoreUnsignedImmediate(insn, pc);
     }
     if ((insn & 0x3b20'0000u) == 0x3800'0000u) {
+      if (!enable_guest_memory_) {
+        return false;
+      }
       return TranslateLoadStoreIndexed(insn, pc);
     }
     if ((insn & 0x3e00'0000u) == 0x2800'0000u) {
+      if (!enable_guest_memory_) {
+        return false;
+      }
       return TranslateLoadStorePair(insn, pc);
     }
     if ((insn & 0x1fe0'0800u) == 0x1a80'0000u) {
@@ -699,6 +709,7 @@ class LiteTranslator {
   }
 
   Assembler as_;
+  bool enable_guest_memory_;
   bool region_end_reached_ = false;
 };
 
@@ -715,7 +726,7 @@ std::tuple<bool, GuestAddr> TryLiteTranslateRegion(GuestAddr start_pc,
     return {false, start_pc};
   }
 
-  LiteTranslator translator(machine_code);
+  LiteTranslator translator(machine_code, params.enable_guest_memory);
   GuestAddr pc = start_pc;
   while (pc < params.end_pc && !translator.region_end_reached()) {
     uint32_t insn = *ToHostAddr<const uint32_t>(pc);

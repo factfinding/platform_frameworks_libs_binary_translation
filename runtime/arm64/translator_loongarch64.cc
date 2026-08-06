@@ -74,6 +74,7 @@ std::tuple<bool, HostCodePiece, size_t> TryLiteTranslateAndInstallRegion(GuestAd
   params.end_pc = pc + (executable_size < max_size ? executable_size : max_size);
   params.allow_dispatch = false;
   params.enable_reg_mapping = false;
+  params.enable_guest_memory = false;
 
   MachineCode machine_code;
   auto [success, stop_pc] = TryLiteTranslateRegion(pc, &machine_code, params);
