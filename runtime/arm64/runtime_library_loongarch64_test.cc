@@ -230,5 +230,39 @@ TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesCmpAndConditionalBranch) {
   EXPECT_EQ(GetInsnAddr(overflow_state.cpu), ToGuestAddr(kLtCode.data() + 3));
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesFlagSettingRegisterOperations) {
+  // adds w2, w0, w1
+  constexpr std::array<uint32_t, 1> kAddsCode = {0x2b01'0002};
+  ThreadState carry_state{};
+  carry_state.cpu.x[0] = UINT32_MAX;
+  carry_state.cpu.x[1] = 1;
+  TranslateAndRun(kAddsCode, &carry_state);
+  EXPECT_EQ(carry_state.cpu.x[2], 0u);
+  EXPECT_EQ(carry_state.cpu.flags, 6u);  // Z | C
+
+  ThreadState overflow_state{};
+  overflow_state.cpu.x[0] = 0x7fff'ffff;
+  overflow_state.cpu.x[1] = 1;
+  TranslateAndRun(kAddsCode, &overflow_state);
+  EXPECT_EQ(overflow_state.cpu.x[2], 0x8000'0000u);
+  EXPECT_EQ(overflow_state.cpu.flags, 9u);  // N | V
+
+  // cmp x0, x1
+  constexpr std::array<uint32_t, 1> kCmpCode = {0xeb01'001f};
+  ThreadState cmp_state{};
+  cmp_state.cpu.x[0] = 3;
+  cmp_state.cpu.x[1] = 5;
+  TranslateAndRun(kCmpCode, &cmp_state);
+  EXPECT_EQ(cmp_state.cpu.flags, 8u);  // N
+
+  // tst x0, x1
+  constexpr std::array<uint32_t, 1> kTstCode = {0xea01'001f};
+  ThreadState tst_state{};
+  tst_state.cpu.x[0] = 0xf0;
+  tst_state.cpu.x[1] = 0x0f;
+  TranslateAndRun(kTstCode, &tst_state);
+  EXPECT_EQ(tst_state.cpu.flags, 4u);  // Z
+}
+
 }  // namespace
 }  // namespace berberis

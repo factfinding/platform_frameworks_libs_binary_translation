@@ -208,10 +208,6 @@ class LiteTranslator {
     uint32_t shift = (insn >> 22) & 1;
     uint32_t rn = (insn >> 5) & 31;
     uint32_t rd = insn & 31;
-    if (set_flags && !is_sub) {
-      return false;
-    }
-
     uint64_t imm = static_cast<uint64_t>((insn >> 10) & 0xfff) << (shift * 12);
     LoadXOrSp(rn, Assembler::t0);
     if (set_flags) {
@@ -231,9 +227,17 @@ class LiteTranslator {
       }
     }
     if (set_flags) {
-      ComputeSubFlags(Assembler::t4, Assembler::t1, Assembler::t0, is_64_bit ? 64 : 32);
+      if (is_sub) {
+        ComputeSubFlags(Assembler::t4, Assembler::t1, Assembler::t0, is_64_bit ? 64 : 32);
+      } else {
+        ComputeAddFlags(Assembler::t4, Assembler::t1, Assembler::t0, is_64_bit ? 64 : 32);
+      }
     }
-    StoreXOrSp(rd, Assembler::t0);
+    if (set_flags) {
+      StoreXOrDiscard(rd, Assembler::t0);
+    } else {
+      StoreXOrSp(rd, Assembler::t0);
+    }
     return true;
   }
 
@@ -264,6 +268,37 @@ class LiteTranslator {
     as_.StW(Assembler::t3, Assembler::s8, kFlagsOffset);
   }
 
+  void ComputeAddFlags(Register lhs, Register rhs, Register result, uint32_t width) {
+    as_.Move(Assembler::t3, Assembler::zero);
+    as_.SrliD(Assembler::t5, result, width - 1);
+    as_.SlliD(Assembler::t5, Assembler::t5, 3);
+    as_.Or(Assembler::t3, Assembler::t3, Assembler::t5);
+
+    // V = sign(~(lhs ^ rhs) & (lhs ^ result)) for addition.
+    as_.Xor(Assembler::t5, lhs, rhs);
+    as_.Li(Assembler::t7, UINT64_MAX);
+    as_.Xor(Assembler::t5, Assembler::t5, Assembler::t7);
+    as_.Xor(Assembler::t6, lhs, result);
+    as_.And(Assembler::t5, Assembler::t5, Assembler::t6);
+    as_.SrliD(Assembler::t5, Assembler::t5, width - 1);
+    as_.Or(Assembler::t3, Assembler::t3, Assembler::t5);
+
+    // Carry is an unsigned wrap: result < lhs.
+    Assembler::Label* carry = as_.MakeLabel();
+    Assembler::Label* carry_done = as_.MakeLabel();
+    as_.Bltu(result, lhs, *carry);
+    as_.B(*carry_done);
+    as_.Bind(carry);
+    as_.AddiD(Assembler::t3, Assembler::t3, 2);
+    as_.Bind(carry_done);
+
+    Assembler::Label* nonzero = as_.MakeLabel();
+    as_.Bnez(result, *nonzero);
+    as_.AddiD(Assembler::t3, Assembler::t3, 4);
+    as_.Bind(nonzero);
+    as_.StW(Assembler::t3, Assembler::s8, kFlagsOffset);
+  }
+
   bool TranslateAddSubShiftedRegister(uint32_t insn) {
     bool is_64_bit = (insn >> 31) != 0;
     bool is_sub = ((insn >> 30) & 1) != 0;
@@ -273,14 +308,16 @@ class LiteTranslator {
     uint32_t amount = (insn >> 10) & 0x3f;
     uint32_t rn = (insn >> 5) & 31;
     uint32_t rd = insn & 31;
-    if (set_flags) {
-      return false;
-    }
-
     LoadXOrZero(rn, Assembler::t0);
     LoadXOrZero(rm, Assembler::t1);
     if (!ShiftOperand(Assembler::t1, shift_kind, amount, is_64_bit)) {
       return false;
+    }
+    if (set_flags) {
+      as_.Move(Assembler::t4, Assembler::t0);
+      if (!is_64_bit) {
+        ZeroExtend32(Assembler::t4);
+      }
     }
     if (is_sub) {
       as_.SubD(Assembler::t0, Assembler::t0, Assembler::t1);
@@ -289,6 +326,13 @@ class LiteTranslator {
     }
     if (!is_64_bit) {
       ZeroExtend32(Assembler::t0);
+    }
+    if (set_flags) {
+      if (is_sub) {
+        ComputeSubFlags(Assembler::t4, Assembler::t1, Assembler::t0, is_64_bit ? 64 : 32);
+      } else {
+        ComputeAddFlags(Assembler::t4, Assembler::t1, Assembler::t0, is_64_bit ? 64 : 32);
+      }
     }
     StoreXOrDiscard(rd, Assembler::t0);
     return true;
@@ -303,7 +347,7 @@ class LiteTranslator {
     uint32_t amount = (insn >> 10) & 0x3f;
     uint32_t rn = (insn >> 5) & 31;
     uint32_t rd = insn & 31;
-    if (opc == 3 || invert) {
+    if (invert) {
       return false;
     }
 
@@ -314,6 +358,7 @@ class LiteTranslator {
     }
     switch (opc) {
       case 0:
+      case 3:
         as_.And(Assembler::t0, Assembler::t0, Assembler::t1);
         break;
       case 1:
@@ -326,8 +371,21 @@ class LiteTranslator {
     if (!is_64_bit) {
       ZeroExtend32(Assembler::t0);
     }
+    if (opc == 3) {
+      ComputeLogicalFlags(Assembler::t0, is_64_bit ? 64 : 32);
+    }
     StoreXOrDiscard(rd, Assembler::t0);
     return true;
+  }
+
+  void ComputeLogicalFlags(Register result, uint32_t width) {
+    as_.SrliD(Assembler::t3, result, width - 1);
+    as_.SlliD(Assembler::t3, Assembler::t3, 3);
+    Assembler::Label* nonzero = as_.MakeLabel();
+    as_.Bnez(result, *nonzero);
+    as_.AddiD(Assembler::t3, Assembler::t3, 4);
+    as_.Bind(nonzero);
+    as_.StW(Assembler::t3, Assembler::s8, kFlagsOffset);
   }
 
   bool TranslatePcRelativeAddress(uint32_t insn, GuestAddr pc) {
