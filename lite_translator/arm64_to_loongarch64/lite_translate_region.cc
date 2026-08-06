@@ -33,6 +33,7 @@ using Assembler = loongarch64::Assembler;
 using Register = loongarch64::Register;
 
 constexpr int32_t kSpOffset = offsetof(ThreadState, cpu) + offsetof(CPUState, sp);
+constexpr int32_t kFlagsOffset = offsetof(ThreadState, cpu) + offsetof(CPUState, flags);
 
 constexpr int64_t SignExtend(uint64_t value, uint32_t width) {
   uint64_t sign = uint64_t{1} << (width - 1);
@@ -76,6 +77,11 @@ class LiteTranslator {
     }
     if ((insn & 0x7e00'0000u) == 0x3400'0000u) {
       TranslateCompareAndBranch(insn, pc);
+      region_end_reached_ = true;
+      return true;
+    }
+    if ((insn & 0xff00'0010u) == 0x5400'0000u) {
+      TranslateConditionalBranch(insn, pc);
       region_end_reached_ = true;
       return true;
     }
@@ -202,12 +208,15 @@ class LiteTranslator {
     uint32_t shift = (insn >> 22) & 1;
     uint32_t rn = (insn >> 5) & 31;
     uint32_t rd = insn & 31;
-    if (set_flags) {
+    if (set_flags && !is_sub) {
       return false;
     }
 
     uint64_t imm = static_cast<uint64_t>((insn >> 10) & 0xfff) << (shift * 12);
     LoadXOrSp(rn, Assembler::t0);
+    if (set_flags) {
+      as_.Move(Assembler::t4, Assembler::t0);
+    }
     as_.Li(Assembler::t1, imm);
     if (is_sub) {
       as_.SubD(Assembler::t0, Assembler::t0, Assembler::t1);
@@ -216,9 +225,43 @@ class LiteTranslator {
     }
     if (!is_64_bit) {
       ZeroExtend32(Assembler::t0);
+      if (set_flags) {
+        ZeroExtend32(Assembler::t4);
+        ZeroExtend32(Assembler::t1);
+      }
+    }
+    if (set_flags) {
+      ComputeSubFlags(Assembler::t4, Assembler::t1, Assembler::t0, is_64_bit ? 64 : 32);
     }
     StoreXOrSp(rd, Assembler::t0);
     return true;
+  }
+
+  void ComputeSubFlags(Register lhs, Register rhs, Register result, uint32_t width) {
+    as_.Move(Assembler::t3, Assembler::zero);
+
+    // N is the sign bit of the result.
+    as_.SrliD(Assembler::t5, result, width - 1);
+    as_.SlliD(Assembler::t5, Assembler::t5, 3);
+    as_.Or(Assembler::t3, Assembler::t3, Assembler::t5);
+
+    // V = sign((lhs ^ rhs) & (lhs ^ result)) for subtraction.
+    as_.Xor(Assembler::t5, lhs, rhs);
+    as_.Xor(Assembler::t6, lhs, result);
+    as_.And(Assembler::t5, Assembler::t5, Assembler::t6);
+    as_.SrliD(Assembler::t5, Assembler::t5, width - 1);
+    as_.Or(Assembler::t3, Assembler::t3, Assembler::t5);
+
+    Assembler::Label* no_carry = as_.MakeLabel();
+    as_.Bltu(lhs, rhs, *no_carry);
+    as_.AddiD(Assembler::t3, Assembler::t3, 2);
+    as_.Bind(no_carry);
+
+    Assembler::Label* nonzero = as_.MakeLabel();
+    as_.Bnez(result, *nonzero);
+    as_.AddiD(Assembler::t3, Assembler::t3, 4);
+    as_.Bind(nonzero);
+    as_.StW(Assembler::t3, Assembler::s8, kFlagsOffset);
   }
 
   bool TranslateAddSubShiftedRegister(uint32_t insn) {
@@ -483,6 +526,63 @@ class LiteTranslator {
     } else {
       as_.Beqz(Assembler::t1, *taken);
     }
+    Exit(pc + 4);
+    as_.Bind(taken);
+    Exit(pc + displacement);
+  }
+
+  void TranslateConditionalBranch(uint32_t insn, GuestAddr pc) {
+    int64_t displacement = SignExtend((insn >> 5) & 0x7ffff, 19) * 4;
+    uint32_t condition = insn & 0xf;
+    as_.LdWU(Assembler::t1, Assembler::s8, kFlagsOffset);
+
+    // Normalize N/Z/C/V into individual zero-or-one registers.
+    as_.SrliD(Assembler::t2, Assembler::t1, 3);  // N
+    as_.SrliD(Assembler::t3, Assembler::t1, 2);  // Z
+    as_.SrliD(Assembler::t4, Assembler::t1, 1);  // C
+    as_.Li(Assembler::t5, 1);
+    as_.And(Assembler::t2, Assembler::t2, Assembler::t5);
+    as_.And(Assembler::t3, Assembler::t3, Assembler::t5);
+    as_.And(Assembler::t4, Assembler::t4, Assembler::t5);
+    as_.And(Assembler::t1, Assembler::t1, Assembler::t5);  // V
+
+    switch (condition >> 1) {
+      case 0:  // EQ/NE: Z
+        as_.Move(Assembler::t2, Assembler::t3);
+        break;
+      case 1:  // CS/CC: C
+        as_.Move(Assembler::t2, Assembler::t4);
+        break;
+      case 2:  // MI/PL: N
+        break;
+      case 3:  // VS/VC: V
+        as_.Move(Assembler::t2, Assembler::t1);
+        break;
+      case 4:  // HI/LS: C && !Z
+        as_.Xor(Assembler::t3, Assembler::t3, Assembler::t5);
+        as_.And(Assembler::t2, Assembler::t4, Assembler::t3);
+        break;
+      case 5:  // GE/LT: N == V
+        as_.Xor(Assembler::t2, Assembler::t2, Assembler::t1);
+        as_.Xor(Assembler::t2, Assembler::t2, Assembler::t5);
+        break;
+      case 6:  // GT/LE: !Z && N == V
+        as_.Xor(Assembler::t2, Assembler::t2, Assembler::t1);
+        as_.Xor(Assembler::t2, Assembler::t2, Assembler::t5);
+        as_.Xor(Assembler::t3, Assembler::t3, Assembler::t5);
+        as_.And(Assembler::t2, Assembler::t2, Assembler::t3);
+        break;
+      case 7:  // AL/NV
+        as_.Move(Assembler::t2, Assembler::t5);
+        break;
+    }
+    // Odd conditions are the inverse, except NV which ARM treats as always.
+    if ((condition & 1) != 0 && condition != 0xf) {
+      as_.Xor(Assembler::t2, Assembler::t2, Assembler::t5);
+    }
+
+    Assembler::Label* taken = as_.MakeLabel();
+    as_.Bnez(Assembler::t2, *taken);
     Exit(pc + 4);
     as_.Bind(taken);
     Exit(pc + displacement);

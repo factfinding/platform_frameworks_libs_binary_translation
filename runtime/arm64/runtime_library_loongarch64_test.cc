@@ -205,5 +205,30 @@ TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesStackRegisterPairs) {
   EXPECT_EQ(state.cpu.sp, ToGuestAddr(stack.data() + 2));
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesCmpAndConditionalBranch) {
+  // cmp x0, #5; b.eq +8
+  constexpr std::array<uint32_t, 4> kEqCode = {0xf100'141f, 0x5400'0040, 0xd280'0021, 0xd280'0041};
+  ThreadState equal_state{};
+  equal_state.cpu.x[0] = 5;
+  TranslateAndRun(kEqCode, &equal_state);
+  EXPECT_EQ(equal_state.cpu.flags, 6u);  // Z | C
+  EXPECT_EQ(GetInsnAddr(equal_state.cpu), ToGuestAddr(kEqCode.data() + 3));
+
+  ThreadState unequal_state{};
+  unequal_state.cpu.x[0] = 3;
+  TranslateAndRun(kEqCode, &unequal_state);
+  EXPECT_EQ(unequal_state.cpu.flags, 8u);  // N
+  EXPECT_EQ(GetInsnAddr(unequal_state.cpu), ToGuestAddr(kEqCode.data() + 2));
+
+  // cmp x0, #1; b.lt +8.  INT64_MIN - 1 overflows to INT64_MAX,
+  // so signed LT is true because N != V.
+  constexpr std::array<uint32_t, 4> kLtCode = {0xf100'041f, 0x5400'004b, 0xd280'0021, 0xd280'0041};
+  ThreadState overflow_state{};
+  overflow_state.cpu.x[0] = uint64_t{1} << 63;
+  TranslateAndRun(kLtCode, &overflow_state);
+  EXPECT_EQ(overflow_state.cpu.flags, 3u);  // C | V
+  EXPECT_EQ(GetInsnAddr(overflow_state.cpu), ToGuestAddr(kLtCode.data() + 3));
+}
+
 }  // namespace
 }  // namespace berberis
