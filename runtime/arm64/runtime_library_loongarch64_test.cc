@@ -114,14 +114,32 @@ TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesTestAndBranch) {
   EXPECT_EQ(GetInsnAddr(clear_state.cpu), ToGuestAddr(kTbzCode.data() + 2));
 
   ThreadState set_state{};
-  set_state.cpu.x[0] = uint64_t{1} << 5;
+  set_state.cpu.x[0] = (uint64_t{1} << 63) | (uint64_t{1} << 5);
   TranslateAndRun(kTbzCode, &set_state);
   EXPECT_EQ(GetInsnAddr(set_state.cpu), ToGuestAddr(kTbzCode.data() + 1));
+
+  ThreadState high_bits_only_state{};
+  high_bits_only_state.cpu.x[0] = uint64_t{1} << 63;
+  TranslateAndRun(kTbzCode, &high_bits_only_state);
+  EXPECT_EQ(GetInsnAddr(high_bits_only_state.cpu), ToGuestAddr(kTbzCode.data() + 2));
 
   // tbnz w0, #5, +8
   constexpr std::array<uint32_t, 3> kTbnzCode = {0x3728'0040, 0xd503'201f, 0xd503'201f};
   TranslateAndRun(kTbnzCode, &set_state);
   EXPECT_EQ(GetInsnAddr(set_state.cpu), ToGuestAddr(kTbnzCode.data() + 2));
+
+  // Exercise the top testable bit in both W and X forms.
+  constexpr std::array<uint32_t, 3> kTbzW31Code = {0x36f8'0040, 0xd503'201f, 0xd503'201f};
+  ThreadState w31_state{};
+  w31_state.cpu.x[0] = uint64_t{1} << 31;
+  TranslateAndRun(kTbzW31Code, &w31_state);
+  EXPECT_EQ(GetInsnAddr(w31_state.cpu), ToGuestAddr(kTbzW31Code.data() + 1));
+
+  constexpr std::array<uint32_t, 3> kTbnzX63Code = {0xb7f8'0040, 0xd503'201f, 0xd503'201f};
+  ThreadState x63_state{};
+  x63_state.cpu.x[0] = uint64_t{1} << 63;
+  TranslateAndRun(kTbnzX63Code, &x63_state);
+  EXPECT_EQ(GetInsnAddr(x63_state.cpu), ToGuestAddr(kTbnzX63Code.data() + 2));
 }
 
 TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesBranchWithLink) {

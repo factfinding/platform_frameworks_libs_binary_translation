@@ -107,9 +107,7 @@ class LiteTranslator {
     if ((insn & 0x1f00'0000u) == 0x0a00'0000u) {
       return TranslateLogicalShiftedRegister(insn);
     }
-    // Keep logical immediates on the interpreter path while the experimental
-    // LoongArch64 translators are disabled for application testing.
-    if (false && (insn & 0x1f80'0000u) == 0x1200'0000u) {
+    if ((insn & 0x1f80'0000u) == 0x1200'0000u) {
       return TranslateLogicalImmediate(insn);
     }
     if ((insn & 0x1f80'0000u) == 0x1300'0000u) {
@@ -160,9 +158,7 @@ class LiteTranslator {
       region_end_reached_ = true;
       return true;
     }
-    // Keep TBZ/TBNZ on the interpreter path: this translator has caused an
-    // application-startup fault in generated code.
-    if (false && (insn & 0x7e00'0000u) == 0x3600'0000u) {
+    if ((insn & 0x7e00'0000u) == 0x3600'0000u) {
       TranslateTestAndBranch(insn, pc);
       region_end_reached_ = true;
       return true;
@@ -1034,6 +1030,10 @@ class LiteTranslator {
 
     LoadXOrZero(rt, Assembler::t1);
     as_.SrliD(Assembler::t1, Assembler::t1, bit);
+    // TBZ/TBNZ tests exactly one bit.  Testing the shifted value directly
+    // would incorrectly include every bit above the requested position.
+    as_.AddiD(Assembler::t0, Assembler::zero, 1);
+    as_.And(Assembler::t1, Assembler::t1, Assembler::t0);
     Assembler::Label* taken = as_.MakeLabel();
     if (nonzero) {
       as_.Bnez(Assembler::t1, *taken);
