@@ -101,6 +101,9 @@ class LiteTranslator {
     if ((insn & 0x1f20'0000u) == 0x0b00'0000u) {
       return TranslateAddSubShiftedRegister(insn);
     }
+    if ((insn & 0x1fe0'0000u) == 0x0b20'0000u) {
+      return TranslateAddSubExtendedRegister(insn);
+    }
     if ((insn & 0x1f00'0000u) == 0x0a00'0000u) {
       return TranslateLogicalShiftedRegister(insn);
     }
@@ -141,6 +144,11 @@ class LiteTranslator {
     }
     if ((insn & 0x1fe0'0800u) == 0x1a80'0000u) {
       return TranslateConditionalSelect(insn);
+    }
+    if ((insn & 0x7fe0'fc00u) == 0x1ac0'2000u || (insn & 0x7fe0'fc00u) == 0x1ac0'2400u ||
+        (insn & 0x7fe0'fc00u) == 0x1ac0'2800u || (insn & 0x7fe0'fc00u) == 0x1ac0'2c00u ||
+        (insn & 0x7fe0'fc00u) == 0x1ac0'0800u || (insn & 0x7fe0'fc00u) == 0x1ac0'0c00u) {
+      return TranslateDataProcessingTwoSource(insn);
     }
     if ((insn & 0x7c00'0000u) == 0x1400'0000u) {
       TranslateBranchImmediate(insn, pc);
@@ -491,6 +499,64 @@ class LiteTranslator {
     return true;
   }
 
+  bool TranslateAddSubExtendedRegister(uint32_t insn) {
+    bool is_64_bit = (insn >> 31) != 0;
+    bool is_sub = ((insn >> 30) & 1) != 0;
+    bool set_flags = ((insn >> 29) & 1) != 0;
+    uint32_t rm = (insn >> 16) & 31;
+    uint32_t option = (insn >> 13) & 7;
+    uint32_t amount = (insn >> 10) & 7;
+    uint32_t rn = (insn >> 5) & 31;
+    uint32_t rd = insn & 31;
+    if (amount > 4) {
+      return false;
+    }
+
+    LoadXOrSp(rn, Assembler::t0);
+    LoadXOrZero(rm, Assembler::t1);
+    uint32_t source_width = 8u << (option & 3);
+    if (source_width < 64) {
+      uint32_t shift = 64 - source_width;
+      as_.SlliD(Assembler::t1, Assembler::t1, shift);
+      if ((option & 4) != 0) {
+        as_.SraiD(Assembler::t1, Assembler::t1, shift);
+      } else {
+        as_.SrliD(Assembler::t1, Assembler::t1, shift);
+      }
+    }
+    if (amount != 0) {
+      as_.SlliD(Assembler::t1, Assembler::t1, amount);
+    }
+    if (set_flags) {
+      as_.Move(Assembler::t4, Assembler::t0);
+      if (!is_64_bit) {
+        ZeroExtend32(Assembler::t4);
+      }
+    }
+    if (is_sub) {
+      as_.SubD(Assembler::t0, Assembler::t0, Assembler::t1);
+    } else {
+      as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
+    }
+    if (!is_64_bit) {
+      ZeroExtend32(Assembler::t0);
+      ZeroExtend32(Assembler::t1);
+    }
+    if (set_flags) {
+      if (is_sub) {
+        ComputeSubFlags(Assembler::t4, Assembler::t1, Assembler::t0, is_64_bit ? 64 : 32);
+      } else {
+        ComputeAddFlags(Assembler::t4, Assembler::t1, Assembler::t0, is_64_bit ? 64 : 32);
+      }
+    }
+    if (set_flags) {
+      StoreXOrDiscard(rd, Assembler::t0);
+    } else {
+      StoreXOrSp(rd, Assembler::t0);
+    }
+    return true;
+  }
+
   bool TranslateLogicalShiftedRegister(uint32_t insn) {
     bool is_64_bit = (insn >> 31) != 0;
     uint32_t opc = (insn >> 29) & 3;
@@ -578,12 +644,24 @@ class LiteTranslator {
     uint32_t rn = (insn >> 5) & 31;
     uint32_t rd = insn & 31;
     uint32_t data_size = is_64_bit ? 64 : 32;
-    // BFM needs the old destination value, and immr > imms uses the wrapping
-    // insert form.  Keep both in the interpreter until those semantics are
-    // implemented; the hot sign/zero extensions and extracts are non-wrapping.
-    if (opc > 2 || opc == 1 || n != is_64_bit || immr >= data_size || imms >= data_size ||
-        immr > imms) {
+    // BFM needs the old destination value.  Of the wrapping forms, handle the
+    // UBFM encoding used by the LSL alias; leave general BFM/SBFIZ/UBFIZ forms
+    // in the interpreter until their insert semantics are implemented.
+    if (opc > 2 || opc == 1 || n != is_64_bit || immr >= data_size || imms >= data_size) {
       return false;
+    }
+
+    if (immr > imms) {
+      if (opc != 2 || immr != imms + 1) {
+        return false;
+      }
+      LoadXOrZero(rn, Assembler::t0);
+      as_.SlliD(Assembler::t0, Assembler::t0, data_size - immr);
+      if (!is_64_bit) {
+        ZeroExtend32(Assembler::t0);
+      }
+      StoreXOrDiscard(rd, Assembler::t0);
+      return true;
     }
 
     uint32_t field_width = imms - immr + 1;
@@ -602,6 +680,92 @@ class LiteTranslator {
       uint64_t mask = field_width == 64 ? UINT64_MAX : (uint64_t{1} << field_width) - 1;
       as_.Li(Assembler::t1, mask);
       as_.And(Assembler::t0, Assembler::t0, Assembler::t1);
+    }
+    if (!is_64_bit) {
+      ZeroExtend32(Assembler::t0);
+    }
+    StoreXOrDiscard(rd, Assembler::t0);
+    return true;
+  }
+
+  bool TranslateDataProcessingTwoSource(uint32_t insn) {
+    bool is_64_bit = (insn >> 31) != 0;
+    uint32_t opcode = insn & 0x7fe0'fc00u;
+    uint32_t rm = (insn >> 16) & 31;
+    uint32_t rn = (insn >> 5) & 31;
+    uint32_t rd = insn & 31;
+
+    LoadXOrZero(rn, Assembler::t0);
+    LoadXOrZero(rm, Assembler::t1);
+    switch (opcode) {
+      case 0x1ac0'2000u:  // LSLV
+        if (is_64_bit) {
+          as_.SllD(Assembler::t0, Assembler::t0, Assembler::t1);
+        } else {
+          as_.SllW(Assembler::t0, Assembler::t0, Assembler::t1);
+        }
+        break;
+      case 0x1ac0'2400u:  // LSRV
+        if (is_64_bit) {
+          as_.SrlD(Assembler::t0, Assembler::t0, Assembler::t1);
+        } else {
+          as_.SrlW(Assembler::t0, Assembler::t0, Assembler::t1);
+        }
+        break;
+      case 0x1ac0'2800u:  // ASRV
+        if (is_64_bit) {
+          as_.SraD(Assembler::t0, Assembler::t0, Assembler::t1);
+        } else {
+          as_.SraW(Assembler::t0, Assembler::t0, Assembler::t1);
+        }
+        break;
+      case 0x1ac0'2c00u:  // RORV
+        if (is_64_bit) {
+          as_.RotrD(Assembler::t0, Assembler::t0, Assembler::t1);
+        } else {
+          as_.RotrW(Assembler::t0, Assembler::t0, Assembler::t1);
+        }
+        break;
+      case 0x1ac0'0800u: {  // UDIV
+        Assembler::Label* divisor_zero = as_.MakeLabel();
+        Assembler::Label* done = as_.MakeLabel();
+        if (!is_64_bit) {
+          ZeroExtend32(Assembler::t0);
+          ZeroExtend32(Assembler::t1);
+        }
+        as_.Beqz(Assembler::t1, *divisor_zero);
+        as_.DivDU(Assembler::t0, Assembler::t0, Assembler::t1);
+        as_.B(*done);
+        as_.Bind(divisor_zero);
+        as_.Move(Assembler::t0, Assembler::zero);
+        as_.Bind(done);
+        break;
+      }
+      case 0x1ac0'0c00u: {  // SDIV
+        Assembler::Label* divisor_zero = as_.MakeLabel();
+        Assembler::Label* do_divide = as_.MakeLabel();
+        Assembler::Label* done = as_.MakeLabel();
+        if (!is_64_bit) {
+          SignExtend32(Assembler::t0);
+          SignExtend32(Assembler::t1);
+        }
+        as_.Beqz(Assembler::t1, *divisor_zero);
+        if (is_64_bit) {
+          as_.Li(Assembler::t2, uint64_t{1} << 63);
+          as_.Bne(Assembler::t0, Assembler::t2, *do_divide);
+          as_.Li(Assembler::t2, UINT64_MAX);
+          as_.Beq(Assembler::t1, Assembler::t2, *done);
+          as_.Bind(do_divide);
+        }
+        as_.DivD(Assembler::t0, Assembler::t0, Assembler::t1);
+        as_.B(*done);
+        as_.Bind(divisor_zero);
+        as_.Move(Assembler::t0, Assembler::zero);
+        as_.Bind(done);
+        break;
+      }
+      default:
+        return false;
     }
     if (!is_64_bit) {
       ZeroExtend32(Assembler::t0);

@@ -275,6 +275,92 @@ TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesBitfieldExtracts) {
   EXPECT_EQ(state.cpu.x[3], UINT64_C(0xffff'ffff'ffff'ff80));
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesLslImmediateAndExtendedAddSub) {
+  // lsl x2, x1, #5; lsl w3, w4, #7;
+  // add x5, x6, w7, uxtb #3; sub x8, x9, w10, sxtw #2;
+  // add w11, wsp, w12, uxth #1; subs w13, w14, w15, sxtb
+  constexpr std::array<uint32_t, 6> kGuestCode = {
+      0xd37b'e822, 0x5319'6083, 0x8b27'0cc5, 0xcb2a'c928, 0x0b2c'27eb, 0x6b2f'81cd};
+
+  ThreadState state{};
+  state.cpu.x[1] = 0x123;
+  state.cpu.x[4] = 0x1234'5678;
+  state.cpu.x[6] = 1000;
+  state.cpu.x[7] = 0xffff'ffff'ffff'fffe;
+  state.cpu.x[9] = 1000;
+  state.cpu.x[10] = 0xffff'fffe;
+  state.cpu.x[12] = 0x12345;
+  state.cpu.x[14] = 1;
+  state.cpu.x[15] = 0xff;
+  state.cpu.sp = 0x1000;
+  TranslateAndRun(kGuestCode, &state);
+
+  EXPECT_EQ(state.cpu.x[2], 0x2460u);
+  EXPECT_EQ(state.cpu.x[3], 0x1a2b'3c00u);
+  EXPECT_EQ(state.cpu.x[5], 3032u);
+  EXPECT_EQ(state.cpu.x[8], 1008u);
+  EXPECT_EQ(state.cpu.x[11], 0x568au);
+  EXPECT_EQ(state.cpu.x[13], 2u);
+  EXPECT_EQ(state.cpu.flags, 0u);
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesVariableShiftsAndDivision) {
+  // lslv/lsrv/asrv/rorv x[2-5], x0, x1; udiv x6, x0, x1;
+  // sdiv x7, x8, x9; then the equivalent W-register operations.
+  constexpr std::array<uint32_t, 12> kGuestCode = {0x9ac1'2002,
+                                                   0x9ac1'2403,
+                                                   0x9ac1'2804,
+                                                   0x9ac1'2c05,
+                                                   0x9ac1'0806,
+                                                   0x9ac9'0d07,
+                                                   0x1acc'216a,
+                                                   0x1acc'256d,
+                                                   0x1acc'296e,
+                                                   0x1acc'2d6f,
+                                                   0x1acc'0970,
+                                                   0x1ad3'0e51};
+
+  ThreadState state{};
+  state.cpu.x[0] = 0x8000'0000'0000'0001;
+  state.cpu.x[1] = 65;
+  state.cpu.x[8] = static_cast<uint64_t>(-100);
+  state.cpu.x[9] = 7;
+  state.cpu.x[11] = 0x8000'0001;
+  state.cpu.x[12] = 33;
+  state.cpu.x[18] = static_cast<uint32_t>(-100);
+  state.cpu.x[19] = 7;
+  TranslateAndRun(kGuestCode, &state);
+
+  EXPECT_EQ(state.cpu.x[2], 2u);
+  EXPECT_EQ(state.cpu.x[3], 0x4000'0000'0000'0000u);
+  EXPECT_EQ(state.cpu.x[4], 0xc000'0000'0000'0000u);
+  EXPECT_EQ(state.cpu.x[5], 0xc000'0000'0000'0000u);
+  EXPECT_EQ(state.cpu.x[6], UINT64_C(0x8000'0000'0000'0001) / 65);
+  EXPECT_EQ(state.cpu.x[7], static_cast<uint64_t>(-14));
+  EXPECT_EQ(state.cpu.x[10], 2u);
+  EXPECT_EQ(state.cpu.x[13], 0x4000'0000u);
+  EXPECT_EQ(state.cpu.x[14], 0xc000'0000u);
+  EXPECT_EQ(state.cpu.x[15], 0xc000'0000u);
+  EXPECT_EQ(state.cpu.x[16], UINT32_C(0x8000'0001) / 33);
+  EXPECT_EQ(state.cpu.x[17], static_cast<uint32_t>(-14));
+
+  ThreadState edge_state{};
+  edge_state.cpu.x[0] = UINT64_C(0x8000'0000'0000'0000);
+  edge_state.cpu.x[1] = 0;
+  edge_state.cpu.x[8] = UINT64_C(0x8000'0000'0000'0000);
+  edge_state.cpu.x[9] = UINT64_MAX;
+  edge_state.cpu.x[11] = UINT32_C(0x8000'0000);
+  edge_state.cpu.x[12] = 0;
+  edge_state.cpu.x[18] = UINT32_C(0x8000'0000);
+  edge_state.cpu.x[19] = UINT32_MAX;
+  TranslateAndRun(kGuestCode, &edge_state);
+
+  EXPECT_EQ(edge_state.cpu.x[6], 0u);
+  EXPECT_EQ(edge_state.cpu.x[7], UINT64_C(0x8000'0000'0000'0000));
+  EXPECT_EQ(edge_state.cpu.x[16], 0u);
+  EXPECT_EQ(edge_state.cpu.x[17], UINT32_C(0x8000'0000));
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesLogicalImmediates) {
   // and w9, w8, #0xff; orr x3, x1, #0xff00; eor x4, x1, #0xff
   constexpr std::array<uint32_t, 3> kGuestCode = {0x1200'1d09, 0xb278'1c23, 0xd240'1c24};
