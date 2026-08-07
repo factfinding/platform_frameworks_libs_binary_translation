@@ -108,6 +108,8 @@ def _gen_trampoline(out, decl):
 void DoTrampoline_JNIEnv_{name}(
     HostCode /* callee */,
     ProcessState* state) {{
+  static JniProfileCounter profile_counter("{name}");
+  ScopedJniProfile profile(&profile_counter);
   using PFN_callee = decltype(std::declval<JNIEnv>().functions->{name});
   auto [{arglist}] = GuestParamsValues<PFN_callee>(state);""".format(**decl), file=out)
 
@@ -118,13 +120,16 @@ void DoTrampoline_JNIEnv_{name}(
 
   _print_jni_call(out, args, decl)
   if decl['return_type'] == 'void':
+    print('  profile.StartHostCall();', file=out)
     print(' {callee}('.format(**decl), file=out)
   else:
     print('  auto&& [ret] = GuestReturnReference<PFN_callee>(state);', file=out)
+    print('  profile.StartHostCall();', file=out)
     print('  ret = {callee}('.format(**decl), file=out)
   for i in range(len(args) - 1):
     print('      arg_%d,' % i, file=out)
   print('      arg_%d);' % (len(args) - 1), file=out)
+  print('  profile.EndHostCall();', file=out)
   if decl['return_type'] != 'void':
     _print_jni_result(out, 'ret', decl)
 

@@ -16,14 +16,20 @@
 
 #include "berberis/jni/jni_trampolines.h"
 
+#include <stdlib.h>
+#include <time.h>
+#include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <deque>
 #include <map>
 #include <mutex>
+#include <string_view>
 #include <vector>
 
 #include <jni.h>  // NOLINT [build/include_order]
+#include <sys/system_properties.h>
 
 #include "berberis/base/checks.h"
 #include "berberis/base/gettid.h"
@@ -136,6 +142,211 @@ HostCode WrapGuestJNIOnLoad(GuestAddr pc) {
 
 namespace {
 
+constexpr uint64_t kJniProfileReportIntervalNs = 5'000'000'000ULL;
+constexpr uint64_t kJniProfileCheckMask = 63;
+constexpr size_t kJniProfileTopCount = 20;
+
+struct JniProfileCounter;
+
+std::mutex g_jni_profile_mutex;
+std::vector<JniProfileCounter*> g_jni_profile_counters;
+std::atomic<uint64_t> g_jni_profile_calls{0};
+std::atomic<uint64_t> g_jni_profile_next_report_ns{0};
+std::atomic<pid_t> g_jni_profile_config_pid{-1};
+std::atomic<bool> g_jni_profile_enabled{false};
+
+uint64_t JniProfileNowNs() {
+  timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return static_cast<uint64_t>(ts.tv_sec) * 1'000'000'000ULL + ts.tv_nsec;
+}
+
+bool IsJniProfileEnabled() {
+  const pid_t pid = getpid();
+  if (g_jni_profile_config_pid.load(std::memory_order_acquire) == pid) {
+    return g_jni_profile_enabled.load(std::memory_order_relaxed);
+  }
+
+  std::lock_guard<std::mutex> lock(g_jni_profile_mutex);
+  if (g_jni_profile_config_pid.load(std::memory_order_relaxed) != pid) {
+    char value[PROP_VALUE_MAX] = {};
+    __system_property_get("debug.berberis.jni_profile", value);
+    const std::string_view setting(value);
+    const bool enabled = setting == "1" || setting == "true" || setting == getprogname();
+    g_jni_profile_counters.clear();
+    g_jni_profile_calls.store(0, std::memory_order_relaxed);
+    g_jni_profile_next_report_ns.store(0, std::memory_order_relaxed);
+    g_jni_profile_enabled.store(enabled, std::memory_order_relaxed);
+    g_jni_profile_config_pid.store(pid, std::memory_order_release);
+    if (enabled) {
+      TRACE_AND_ALOGI("berberis-jni-profile: enabled process=%s", getprogname());
+    }
+  }
+  return g_jni_profile_enabled.load(std::memory_order_relaxed);
+}
+
+struct JniProfileCounter {
+  explicit JniProfileCounter(const char* counter_name) : name(counter_name) {}
+
+  void EnsureRegistered() {
+    const pid_t pid = getpid();
+    if (registered_pid.load(std::memory_order_acquire) != pid) {
+      std::lock_guard<std::mutex> lock(g_jni_profile_mutex);
+      if (registered_pid.load(std::memory_order_relaxed) != pid) {
+        calls.store(0, std::memory_order_relaxed);
+        total_ns.store(0, std::memory_order_relaxed);
+        host_ns.store(0, std::memory_order_relaxed);
+        max_bridge_ns.store(0, std::memory_order_relaxed);
+        g_jni_profile_counters.push_back(this);
+        registered_pid.store(pid, std::memory_order_release);
+      }
+    }
+  }
+
+  const char* name;
+  std::atomic<pid_t> registered_pid{-1};
+  std::atomic<uint64_t> calls{0};
+  std::atomic<uint64_t> total_ns{0};
+  std::atomic<uint64_t> host_ns{0};
+  std::atomic<uint64_t> max_bridge_ns{0};
+};
+
+struct JniProfileSnapshot {
+  const char* name;
+  uint64_t calls;
+  uint64_t total_ns;
+  uint64_t host_ns;
+  uint64_t max_bridge_ns;
+};
+
+void DumpJniProfile() {
+  std::vector<JniProfileSnapshot> snapshots;
+  {
+    std::lock_guard<std::mutex> lock(g_jni_profile_mutex);
+    snapshots.reserve(g_jni_profile_counters.size());
+    for (const JniProfileCounter* counter : g_jni_profile_counters) {
+      snapshots.push_back({counter->name,
+                           counter->calls.load(std::memory_order_relaxed),
+                           counter->total_ns.load(std::memory_order_relaxed),
+                           counter->host_ns.load(std::memory_order_relaxed),
+                           counter->max_bridge_ns.load(std::memory_order_relaxed)});
+    }
+  }
+
+  std::sort(snapshots.begin(), snapshots.end(), [](const auto& lhs, const auto& rhs) {
+    return lhs.total_ns - lhs.host_ns > rhs.total_ns - rhs.host_ns;
+  });
+
+  uint64_t all_calls = 0;
+  uint64_t all_bridge_ns = 0;
+  for (const auto& snapshot : snapshots) {
+    all_calls += snapshot.calls;
+    all_bridge_ns += snapshot.total_ns - snapshot.host_ns;
+  }
+
+  TRACE_AND_ALOGI("berberis-jni-profile: total_calls=%llu bridge_ms=%.3f counters=%zu",
+                  static_cast<unsigned long long>(all_calls),
+                  static_cast<double>(all_bridge_ns) / 1'000'000.0,
+                  snapshots.size());
+  const size_t limit = std::min(kJniProfileTopCount, snapshots.size());
+  for (size_t i = 0; i < limit; ++i) {
+    const auto& snapshot = snapshots[i];
+    if (snapshot.calls == 0) {
+      break;
+    }
+    const uint64_t bridge_ns = snapshot.total_ns - snapshot.host_ns;
+    const double share = all_bridge_ns == 0 ? 0.0 : 100.0 * bridge_ns / all_bridge_ns;
+    TRACE_AND_ALOGI(
+        "berberis-jni-profile: rank=%zu name=%s calls=%llu bridge_ms=%.3f host_ms=%.3f "
+        "avg_bridge_ns=%.1f max_bridge_us=%.3f share=%.2f%%",
+        i + 1,
+        snapshot.name,
+        static_cast<unsigned long long>(snapshot.calls),
+        static_cast<double>(bridge_ns) / 1'000'000.0,
+        static_cast<double>(snapshot.host_ns) / 1'000'000.0,
+        static_cast<double>(bridge_ns) / snapshot.calls,
+        static_cast<double>(snapshot.max_bridge_ns) / 1'000.0,
+        share);
+  }
+}
+
+class ScopedJniProfile {
+ public:
+  explicit ScopedJniProfile(JniProfileCounter* counter)
+      : counter_(IsJniProfileEnabled() ? counter : nullptr),
+        start_ns_(counter_ == nullptr ? 0 : JniProfileNowNs()) {
+    if (counter_ != nullptr) {
+      counter_->EnsureRegistered();
+    }
+  }
+
+  void StartHostCall() {
+    if (counter_ != nullptr) {
+      host_start_ns_ = JniProfileNowNs();
+    }
+  }
+
+  void EndHostCall() {
+    if (counter_ != nullptr && host_start_ns_ != 0) {
+      host_elapsed_ns_ += JniProfileNowNs() - host_start_ns_;
+      host_start_ns_ = 0;
+    }
+  }
+
+  ~ScopedJniProfile() {
+    if (counter_ == nullptr) {
+      return;
+    }
+
+    const uint64_t now_ns = JniProfileNowNs();
+    if (host_start_ns_ != 0) {
+      host_elapsed_ns_ += now_ns - host_start_ns_;
+      host_start_ns_ = 0;
+    }
+    const uint64_t elapsed_ns = now_ns - start_ns_;
+    const uint64_t bridge_ns = elapsed_ns - host_elapsed_ns_;
+    counter_->calls.fetch_add(1, std::memory_order_relaxed);
+    counter_->total_ns.fetch_add(elapsed_ns, std::memory_order_relaxed);
+    counter_->host_ns.fetch_add(host_elapsed_ns_, std::memory_order_relaxed);
+    uint64_t old_max = counter_->max_bridge_ns.load(std::memory_order_relaxed);
+    while (bridge_ns > old_max && !counter_->max_bridge_ns.compare_exchange_weak(
+                                      old_max, bridge_ns, std::memory_order_relaxed)) {
+    }
+
+    const uint64_t call = g_jni_profile_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (call <= 64 && (call & (call - 1)) == 0) {
+      DumpJniProfile();
+      if (call == 64) {
+        g_jni_profile_next_report_ns.store(now_ns + kJniProfileReportIntervalNs,
+                                           std::memory_order_relaxed);
+      }
+      return;
+    }
+    if ((call & kJniProfileCheckMask) != 0) {
+      return;
+    }
+
+    uint64_t next_report = g_jni_profile_next_report_ns.load(std::memory_order_relaxed);
+    if (next_report == 0) {
+      g_jni_profile_next_report_ns.compare_exchange_strong(
+          next_report, now_ns + kJniProfileReportIntervalNs, std::memory_order_relaxed);
+      return;
+    }
+    if (now_ns < next_report ||
+        !g_jni_profile_next_report_ns.compare_exchange_strong(
+            next_report, now_ns + kJniProfileReportIntervalNs, std::memory_order_relaxed)) {
+      return;
+    }
+    DumpJniProfile();
+  }
+
+ private:
+  JniProfileCounter* counter_;
+  uint64_t start_ns_;
+  uint64_t host_start_ns_ = 0;
+  uint64_t host_elapsed_ns_ = 0;
+};
+
 std::vector<jvalue> ConvertVAList(JNIEnv* env, jmethodID methodID, GuestVAListParams&& params) {
   std::vector<jvalue> result;
   const char* short_signature = GetJMethodShorty(env, methodID);
@@ -186,30 +397,40 @@ std::vector<jvalue> ConvertVAList(JNIEnv* env, jmethodID methodID, GuestVAListPa
 //     JNIEnv *env, jclass clazz,
 //     const JNINativeMethod *methods, jint nMethods);
 void DoTrampoline_JNIEnv_RegisterNatives(HostCode /* callee */, ProcessState* state) {
+  static JniProfileCounter profile_counter("RegisterNatives");
+  ScopedJniProfile profile(&profile_counter);
   using PFN_callee = decltype(std::declval<JNIEnv>().functions->RegisterNatives);
   auto [guest_env, arg_clazz, arg_methods, arg_n] = GuestParamsValues<PFN_callee>(state);
   JNIEnv* arg_env = ToHostJNIEnv(guest_env);
 
   auto&& [ret] = GuestReturnReference<PFN_callee>(state);
+  profile.StartHostCall();
   ret = (arg_env->functions)->RegisterNatives(arg_env, arg_clazz, arg_methods, arg_n);
+  profile.EndHostCall();
 }
 
 // jint GetJavaVM(
 //     JNIEnv *env, JavaVM **vm);
 void DoTrampoline_JNIEnv_GetJavaVM(HostCode /* callee */, ProcessState* state) {
+  static JniProfileCounter profile_counter("GetJavaVM");
+  ScopedJniProfile profile(&profile_counter);
   using PFN_callee = decltype(std::declval<JNIEnv>().functions->GetJavaVM);
   auto [guest_env, arg_vm] = GuestParamsValues<PFN_callee>(state);
   JNIEnv* arg_env = ToHostJNIEnv(guest_env);
   JavaVM* host_vm;
 
   auto&& [ret] = GuestReturnReference<PFN_callee>(state);
+  profile.StartHostCall();
   ret = (arg_env->functions)->GetJavaVM(arg_env, &host_vm);
+  profile.EndHostCall();
   if (ret == 0) {
     *bit_cast<GuestType<JavaVM*>*>(arg_vm) = ToGuestJavaVM(host_vm);
   }
 }
 
 void DoTrampoline_JNIEnv_CallStaticVoidMethodV(HostCode /* callee */, ProcessState* state) {
+  static JniProfileCounter profile_counter("CallStaticVoidMethodV");
+  ScopedJniProfile profile(&profile_counter);
   using PFN_callee = decltype(std::declval<JNIEnv>().functions->CallStaticVoidMethodV);
   auto [arg_env, arg_1, arg_2, arg_va] = GuestParamsValues<PFN_callee>(state);
   JNIEnv* arg_0 = ToHostJNIEnv(arg_env);
@@ -217,9 +438,11 @@ void DoTrampoline_JNIEnv_CallStaticVoidMethodV(HostCode /* callee */, ProcessSta
   jvalue* arg_3 = &arg_vector[0];
 
   // Note, this call is the only difference from the auto-generated trampoline.
+  profile.StartHostCall();
   JNIEnv_CallStaticVoidMethodV_ForGuest(arg_0, arg_1, arg_2, arg_3);
 
   (arg_0->functions)->CallStaticVoidMethodA(arg_0, arg_1, arg_2, arg_3);
+  profile.EndHostCall();
 }
 
 // region digitalis
@@ -238,6 +461,8 @@ void DoTrampoline_JNIEnv_CallStaticVoidMethodV(HostCode /* callee */, ProcessSta
 // takes its own (null-tolerant) failure branch. arm64-guest only; the riscv64
 // build reproduces the original auto-generated forwarding (byte-identical).
 void DoTrampoline_JNIEnv_GetStaticFieldID(HostCode /* callee */, ProcessState* state) {
+  static JniProfileCounter profile_counter("GetStaticFieldID");
+  ScopedJniProfile profile(&profile_counter);
   using PFN_callee = decltype(std::declval<JNIEnv>().functions->GetStaticFieldID);
   auto [guest_env, arg_clazz, arg_name, arg_sig] = GuestParamsValues<PFN_callee>(state);
   JNIEnv* arg_env = ToHostJNIEnv(guest_env);
@@ -251,7 +476,9 @@ void DoTrampoline_JNIEnv_GetStaticFieldID(HostCode /* callee */, ProcessState* s
     return;
   }
 #endif
+  profile.StartHostCall();
   ret = (arg_env->functions)->GetStaticFieldID(arg_env, arg_clazz, arg_name, arg_sig);
+  profile.EndHostCall();
 }
 // endregion
 
@@ -504,9 +731,9 @@ void GrantHiddenApiExemptions(JavaVM* host_java_vm) {
     env->ExceptionClear();
   }
   jmethodID set_exemptions =
-      vmruntime_class ? env->GetMethodID(
-                            vmruntime_class, "setHiddenApiExemptions", "([Ljava/lang/String;)V")
-                      : nullptr;
+      vmruntime_class
+          ? env->GetMethodID(vmruntime_class, "setHiddenApiExemptions", "([Ljava/lang/String;)V")
+          : nullptr;
   if (env->ExceptionCheck()) {
     env->ExceptionClear();
   }
