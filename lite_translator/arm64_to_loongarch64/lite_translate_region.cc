@@ -107,7 +107,9 @@ class LiteTranslator {
     if ((insn & 0x1f00'0000u) == 0x0a00'0000u) {
       return TranslateLogicalShiftedRegister(insn);
     }
-    if ((insn & 0x1f80'0000u) == 0x1200'0000u) {
+    // Keep logical immediates interpreted until exhaustive execution tests
+    // isolate the late application crash caused by this generated path.
+    if (false && (insn & 0x1f80'0000u) == 0x1200'0000u) {
       return TranslateLogicalImmediate(insn);
     }
     if ((insn & 0x1f80'0000u) == 0x1300'0000u) {
