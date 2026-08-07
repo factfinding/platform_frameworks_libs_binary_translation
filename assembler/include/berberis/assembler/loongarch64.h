@@ -172,6 +172,16 @@ class Assembler : public AssemblerBase {
   void SlliD(Register rd, Register rj, uint32_t shift) { Emit2RI6(0x0041'0000, rd, rj, shift); }
   void SrliD(Register rd, Register rj, uint32_t shift) { Emit2RI6(0x0045'0000, rd, rj, shift); }
   void SraiD(Register rd, Register rj, uint32_t shift) { Emit2RI6(0x0049'0000, rd, rj, shift); }
+  void SllW(Register rd, Register rj, Register rk) { Emit3R(0x0017'0000, rd, rj, rk); }
+  void SrlW(Register rd, Register rj, Register rk) { Emit3R(0x0017'8000, rd, rj, rk); }
+  void SraW(Register rd, Register rj, Register rk) { Emit3R(0x0018'0000, rd, rj, rk); }
+  void RotrW(Register rd, Register rj, Register rk) { Emit3R(0x001b'0000, rd, rj, rk); }
+  void SllD(Register rd, Register rj, Register rk) { Emit3R(0x0018'8000, rd, rj, rk); }
+  void SrlD(Register rd, Register rj, Register rk) { Emit3R(0x0019'0000, rd, rj, rk); }
+  void SraD(Register rd, Register rj, Register rk) { Emit3R(0x0019'8000, rd, rj, rk); }
+  void RotrD(Register rd, Register rj, Register rk) { Emit3R(0x001b'8000, rd, rj, rk); }
+  void DivD(Register rd, Register rj, Register rk) { Emit3R(0x0022'0000, rd, rj, rk); }
+  void DivDU(Register rd, Register rj, Register rk) { Emit3R(0x0023'0000, rd, rj, rk); }
 
   void Beq(Register rj, Register rd, int32_t offset) {
     Emit32(0x5800'0000 | EncodeOffset16(offset) | EncodeRj(rj) | EncodeRd(rd));

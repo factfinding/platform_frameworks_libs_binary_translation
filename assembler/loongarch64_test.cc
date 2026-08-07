@@ -93,6 +93,40 @@ TEST(LoongArch64AssemblerTest, ResolvesForwardAndBackwardLabels) {
   EXPECT_EQ(*code.AddrAs<const uint32_t>(8), 0x43fff89fu);
 }
 
+TEST(LoongArch64AssemblerTest, EncodesVariableShiftsAndDivision) {
+  MachineCode code;
+  Assembler assembler(&code);
+
+  assembler.SllW(Assembler::a0, Assembler::a1, Assembler::a2);
+  assembler.SrlW(Assembler::a0, Assembler::a1, Assembler::a2);
+  assembler.SraW(Assembler::a0, Assembler::a1, Assembler::a2);
+  assembler.RotrW(Assembler::a0, Assembler::a1, Assembler::a2);
+  assembler.SllD(Assembler::a0, Assembler::a1, Assembler::a2);
+  assembler.SrlD(Assembler::a0, Assembler::a1, Assembler::a2);
+  assembler.SraD(Assembler::a0, Assembler::a1, Assembler::a2);
+  assembler.RotrD(Assembler::a0, Assembler::a1, Assembler::a2);
+  assembler.DivD(Assembler::a0, Assembler::a1, Assembler::a2);
+  assembler.DivDU(Assembler::a0, Assembler::a1, Assembler::a2);
+
+  // Values are generated independently with GNU as 2.47 for LoongArch64.
+  constexpr std::array<uint32_t, 10> kExpected = {
+      0x0017'18a4,
+      0x0017'98a4,
+      0x0018'18a4,
+      0x001b'18a4,
+      0x0018'98a4,
+      0x0019'18a4,
+      0x0019'98a4,
+      0x001b'98a4,
+      0x0022'18a4,
+      0x0023'18a4,
+  };
+  ASSERT_EQ(code.install_size(), sizeof(kExpected));
+  for (size_t i = 0; i < kExpected.size(); ++i) {
+    EXPECT_EQ(*code.AddrAs<const uint32_t>(i * sizeof(uint32_t)), kExpected[i]) << i;
+  }
+}
+
 TEST(LoongArch64AssemblerTest, Materializes64BitImmediate) {
   MachineCode code;
   Assembler assembler(&code);
