@@ -521,6 +521,86 @@ TEST(LoongArch64RuntimeLibraryTest, LiteLogicalImmediateAndXMatchesInterpreterFo
   }
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesLogicalImmediateOrr) {
+  // orr w25, wzr, #3; orr x8, x8, #8
+  constexpr std::array<uint32_t, 2> kGuestCode = {0x3200'07f9, 0xb27d'0108};
+
+  ThreadState state{};
+  state.cpu.x[8] = 0x1234'5678'9abc'def0u;
+  TranslateAndRun(kGuestCode, &state);
+
+  EXPECT_EQ(state.cpu.x[25], 3u);
+  EXPECT_EQ(state.cpu.x[8], 0x1234'5678'9abc'def8u);
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteLogicalImmediateOrrXMatchesInterpreterExhaustively) {
+  constexpr uint64_t kInput = 0xa55a'f00f'963c'c369;
+  for (uint32_t n = 0; n < 2; ++n) {
+    for (uint32_t immr = 0; immr < 64; ++immr) {
+      for (uint32_t imms = 0; imms < 64; ++imms) {
+        const uint32_t len_source = (n << 6) | (~imms & 0x3f);
+        int32_t len = -1;
+        for (int32_t bit = 6; bit >= 0; --bit) {
+          if ((len_source & (uint32_t{1} << bit)) != 0) {
+            len = bit;
+            break;
+          }
+        }
+        if (len < 1) {
+          continue;
+        }
+        const uint32_t levels = (uint32_t{1} << len) - 1;
+        if ((imms & levels) == levels) {
+          continue;
+        }
+
+        const std::array<uint32_t, 1> guest_code = {0xb200'0001u | (n << 22) | (immr << 16) |
+                                                    (imms << 10)};
+        ThreadState interpreted{};
+        interpreted.cpu.x[0] = kInput;
+        SetInsnAddr(interpreted.cpu, ToGuestAddr(guest_code.data()));
+        InterpretInsn(&interpreted);
+
+        ThreadState translated{};
+        translated.cpu.x[0] = kInput;
+        TranslateAndRun(guest_code, &translated);
+
+        SCOPED_TRACE(testing::Message() << "n=" << n << " immr=" << immr << " imms=" << imms);
+        EXPECT_EQ(translated.cpu.x[1], interpreted.cpu.x[1]);
+      }
+    }
+  }
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteLogicalImmediateOrrMatchesInterpreterForAllRegisters) {
+  // Immediate fields from "orr w25, wzr, #3", the hottest jkchess ORR fallback.
+  constexpr uint32_t kInsnTemplate = 0x3200'0400u;
+  for (uint32_t rn = 0; rn < 32; ++rn) {
+    for (uint32_t rd = 0; rd < 32; ++rd) {
+      const std::array<uint32_t, 1> guest_code = {kInsnTemplate | (rn << 5) | rd};
+      ThreadState interpreted{};
+      ThreadState translated{};
+      for (uint32_t reg = 0; reg < 31; ++reg) {
+        const uint64_t value =
+            0xa55a'f00f'963c'c369u ^ (uint64_t{reg} * 0x0101'0101'0101'0101u);
+        interpreted.cpu.x[reg] = value;
+        translated.cpu.x[reg] = value;
+      }
+      interpreted.cpu.sp = 0x1234'5678'9abc'def0u;
+      translated.cpu.sp = interpreted.cpu.sp;
+      SetInsnAddr(interpreted.cpu, ToGuestAddr(guest_code.data()));
+      InterpretInsn(&interpreted);
+      TranslateAndRun(guest_code, &translated);
+
+      SCOPED_TRACE(testing::Message() << "rn=" << rn << " rd=" << rd);
+      for (uint32_t reg = 0; reg < 31; ++reg) {
+        EXPECT_EQ(translated.cpu.x[reg], interpreted.cpu.x[reg]);
+      }
+      EXPECT_EQ(translated.cpu.sp, interpreted.cpu.sp);
+    }
+  }
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesPcRelativeAddressesAndNop) {
   // adr x6, +8; adrp x7, current page; nop
   constexpr std::array<uint32_t, 3> kGuestCode = {0x1000'0046, 0x9000'0007, 0xd503'201f};

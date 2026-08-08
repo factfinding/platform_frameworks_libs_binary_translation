@@ -38,7 +38,7 @@ constexpr int32_t kSpOffset = offsetof(ThreadState, cpu) + offsetof(CPUState, sp
 constexpr int32_t kFlagsOffset = offsetof(ThreadState, cpu) + offsetof(CPUState, flags);
 // Logical-immediate operations are enabled independently.  Validate each
 // opcode in production workloads before adding it to this mask.
-constexpr uint32_t kLogicalImmediateOpcMask = 1u << 0;  // AND
+constexpr uint32_t kLogicalImmediateOpcMask = (1u << 0) | (1u << 1);  // AND, ORR
 
 constexpr int64_t SignExtend(uint64_t value, uint32_t width) {
   uint64_t sign = uint64_t{1} << (width - 1);
