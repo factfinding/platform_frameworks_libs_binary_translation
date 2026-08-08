@@ -810,7 +810,8 @@ class LiteTranslator {
     uint32_t imm12 = (insn >> 10) & 0xfff;
     uint32_t rn = (insn >> 5) & 31;
     uint32_t rt = insn & 31;
-    if (opc > 1) {
+    const bool ldrsw = size == 2 && opc == 2;
+    if (opc > 1 && !ldrsw) {
       return false;
     }
 
@@ -818,7 +819,7 @@ class LiteTranslator {
     as_.Li(Assembler::t1, static_cast<uint64_t>(imm12) << size);
     as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
     ApplyTbi(Assembler::t0);
-    EmitLoadStore(size, opc == 1, rt, pc);
+    EmitLoadStore(size, opc, rt, pc);
     return true;
   }
 
@@ -833,7 +834,8 @@ class LiteTranslator {
     uint32_t rn = (insn >> 5) & 31;
     uint32_t rt = insn & 31;
     bool writeback = mode == 1 || mode == 3;
-    if (opc > 1 || mode == 2 || (writeback && rn != 31 && rn == rt)) {
+    const bool ldrsw = size == 2 && opc == 2;
+    if ((opc > 1 && !ldrsw) || mode == 2 || (writeback && rn != 31 && rn == rt)) {
       return false;
     }
 
@@ -843,7 +845,7 @@ class LiteTranslator {
       as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
     }
     ApplyTbi(Assembler::t0);
-    EmitLoadStore(size, opc == 1, rt, pc);
+    EmitLoadStore(size, opc, rt, pc);
     if (writeback) {
       LoadXOrSp(rn, Assembler::t0);
       as_.Li(Assembler::t1, offset);
@@ -866,7 +868,8 @@ class LiteTranslator {
     uint32_t rt = insn & 31;
     // The integer register-offset form accepts UXTW, UXTX/LSL, SXTW and
     // SXTX.  Other option encodings are reserved for this instruction class.
-    if (opc > 1 || (option != 2 && option != 3 && option != 6 && option != 7)) {
+    const bool ldrsw = size == 2 && opc == 2;
+    if ((opc > 1 && !ldrsw) || (option != 2 && option != 3 && option != 6 && option != 7)) {
       return false;
     }
 
@@ -882,7 +885,7 @@ class LiteTranslator {
     }
     as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
     ApplyTbi(Assembler::t0);
-    EmitLoadStore(size, opc == 1, rt, pc);
+    EmitLoadStore(size, opc, rt, pc);
     return true;
   }
 
@@ -949,24 +952,29 @@ class LiteTranslator {
     return true;
   }
 
-  void EmitLoadStore(uint32_t size, bool load, uint32_t rt, GuestAddr pc) {
+  void EmitLoadStore(uint32_t size, uint32_t opc, uint32_t rt, GuestAddr pc) {
     Assembler::Label* recovery = as_.MakeLabel();
     Assembler::Label* done = as_.MakeLabel();
-    if (load) {
+    if (opc != 0) {
       as_.SetRecoveryPoint(recovery);
-      switch (size) {
-        case 0:
-          as_.LdBU(Assembler::t1, Assembler::t0, 0);
-          break;
-        case 1:
-          as_.LdHU(Assembler::t1, Assembler::t0, 0);
-          break;
-        case 2:
-          as_.LdWU(Assembler::t1, Assembler::t0, 0);
-          break;
-        case 3:
-          as_.LdD(Assembler::t1, Assembler::t0, 0);
-          break;
+      if (opc == 2) {
+        // Callers only admit LDRSW for opc == 2.
+        as_.LdW(Assembler::t1, Assembler::t0, 0);
+      } else {
+        switch (size) {
+          case 0:
+            as_.LdBU(Assembler::t1, Assembler::t0, 0);
+            break;
+          case 1:
+            as_.LdHU(Assembler::t1, Assembler::t0, 0);
+            break;
+          case 2:
+            as_.LdWU(Assembler::t1, Assembler::t0, 0);
+            break;
+          case 3:
+            as_.LdD(Assembler::t1, Assembler::t0, 0);
+            break;
+        }
       }
       StoreXOrDiscard(rt, Assembler::t1);
     } else {

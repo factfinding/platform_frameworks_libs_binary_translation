@@ -611,6 +611,27 @@ TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesRegisterOffsetMemory) {
   EXPECT_EQ(state.cpu.x[4], 0x1234u);
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesLoadSignedWord) {
+  // ldrsw x2, [x0]; ldrsw x3, [x0, #-4]!;
+  // ldrsw x4, [x0], #4; ldrsw x5, [x0, x6, lsl #2]
+  constexpr std::array<uint32_t, 4> kGuestCode = {
+      0xb980'0002, 0xb89f'cc03, 0xb880'4404, 0xb8a6'7805};
+  constexpr uint32_t kNegative = 0x8000'0001u;
+  constexpr uint32_t kPositive = 0x7fff'fffeu;
+  std::array<uint32_t, 3> memory = {kNegative, kPositive, kNegative};
+
+  ThreadState state{};
+  state.cpu.x[0] = ToGuestAddr(memory.data() + 1);
+  state.cpu.x[6] = 1;
+  TranslateAndRun(kGuestCode, &state);
+
+  EXPECT_EQ(state.cpu.x[2], kPositive);
+  EXPECT_EQ(state.cpu.x[3], 0xffff'ffff'8000'0001u);
+  EXPECT_EQ(state.cpu.x[4], 0xffff'ffff'8000'0001u);
+  EXPECT_EQ(state.cpu.x[5], 0xffff'ffff'8000'0001u);
+  EXPECT_EQ(state.cpu.x[0], ToGuestAddr(memory.data() + 1));
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteIndexedMemoryPreservesPointerTagOnWriteback) {
   // str x1, [x0, #-8]!; ldr x2, [x0], #8
   constexpr std::array<uint32_t, 2> kGuestCode = {0xf81f'8c01, 0xf840'8402};

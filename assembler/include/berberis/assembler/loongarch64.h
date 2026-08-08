@@ -147,6 +147,9 @@ class Assembler : public AssemblerBase {
   void LdD(Register rd, Register rj, int32_t imm12) {
     Emit2RI12(0x28c0'0000, rd, rj, EncodeSigned(imm12, 12));
   }
+  void LdW(Register rd, Register rj, int32_t imm12) {
+    Emit2RI12(0x2880'0000, rd, rj, EncodeSigned(imm12, 12));
+  }
   void LdWU(Register rd, Register rj, int32_t imm12) {
     Emit2RI12(0x2a80'0000, rd, rj, EncodeSigned(imm12, 12));
   }
