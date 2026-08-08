@@ -148,6 +148,9 @@ class LiteTranslator {
     if ((insn & 0x1fe0'0800u) == 0x1a80'0000u) {
       return TranslateConditionalSelect(insn);
     }
+    if ((insn & 0x3fe0'0410u) == 0x3a40'0000u) {
+      return TranslateConditionalCompare(insn);
+    }
     if ((insn & 0x7fe0'0000u) == 0x1b00'0000u) {
       return TranslateMultiplyAddSub(insn);
     }
@@ -1185,6 +1188,53 @@ class LiteTranslator {
     if ((condition & 1) != 0 && condition != 0xf) {
       as_.Xor(Assembler::t2, Assembler::t2, Assembler::t5);
     }
+  }
+
+  bool TranslateConditionalCompare(uint32_t insn) {
+    bool is_64_bit = (insn >> 31) != 0;
+    bool is_sub = ((insn >> 30) & 1) != 0;
+    bool is_immediate = ((insn >> 11) & 1) != 0;
+    uint32_t rm_or_imm = (insn >> 16) & 31;
+    uint32_t condition = (insn >> 12) & 15;
+    uint32_t rn = (insn >> 5) & 31;
+    uint32_t nzcv = insn & 15;
+
+    EmitCondition(condition);
+    Assembler::Label* use_immediate_flags = as_.MakeLabel();
+    Assembler::Label* done = as_.MakeLabel();
+    as_.Beqz(Assembler::t2, *use_immediate_flags);
+
+    LoadXOrZero(rn, Assembler::t0);
+    if (is_immediate) {
+      as_.Li(Assembler::t1, rm_or_imm);
+    } else {
+      LoadXOrZero(rm_or_imm, Assembler::t1);
+    }
+    if (!is_64_bit) {
+      ZeroExtend32(Assembler::t0);
+      ZeroExtend32(Assembler::t1);
+    }
+    as_.Move(Assembler::t4, Assembler::t0);
+    if (is_sub) {
+      as_.SubD(Assembler::t0, Assembler::t0, Assembler::t1);
+    } else {
+      as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
+    }
+    if (!is_64_bit) {
+      ZeroExtend32(Assembler::t0);
+    }
+    if (is_sub) {
+      ComputeSubFlags(Assembler::t4, Assembler::t1, Assembler::t0, is_64_bit ? 64 : 32);
+    } else {
+      ComputeAddFlags(Assembler::t4, Assembler::t1, Assembler::t0, is_64_bit ? 64 : 32);
+    }
+    as_.B(*done);
+
+    as_.Bind(use_immediate_flags);
+    as_.Li(Assembler::t0, nzcv);
+    as_.StW(Assembler::t0, Assembler::s8, kFlagsOffset);
+    as_.Bind(done);
+    return true;
   }
 
   bool TranslateConditionalSelect(uint32_t insn) {

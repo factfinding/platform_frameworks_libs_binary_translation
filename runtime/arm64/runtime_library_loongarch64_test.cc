@@ -1039,5 +1039,46 @@ TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesConditionalSelectFamily) {
   EXPECT_EQ(state.cpu.x[5], uint64_t{0} - 3);
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteConditionalCompareMatchesInterpreter) {
+  for (uint32_t is_64_bit = 0; is_64_bit < 2; ++is_64_bit) {
+    for (uint32_t is_sub = 0; is_sub < 2; ++is_sub) {
+      for (uint32_t is_immediate = 0; is_immediate < 2; ++is_immediate) {
+        for (uint32_t condition = 0; condition < 16; ++condition) {
+          for (uint32_t initial_flags = 0; initial_flags < 16; ++initial_flags) {
+            for (uint32_t nzcv : {0u, 5u, 10u, 15u}) {
+              constexpr uint32_t kRn = 5;
+              constexpr uint32_t kRmOrImm = 6;
+              const std::array<uint32_t, 1> guest_code = {
+                  0x3a40'0000u | (is_64_bit << 31) | (is_sub << 30) |
+                  (kRmOrImm << 16) | (condition << 12) | (is_immediate << 11) |
+                  (kRn << 5) | nzcv};
+              ThreadState interpreted{};
+              interpreted.cpu.x[kRn] = 0x8000'0000'0000'0005u;
+              interpreted.cpu.x[kRmOrImm] = 0x7fff'ffff'ffff'fff9u;
+              interpreted.cpu.flags = initial_flags;
+              SetInsnAddr(interpreted.cpu, ToGuestAddr(guest_code.data()));
+              InterpretInsn(&interpreted);
+
+              ThreadState translated{};
+              translated.cpu.x[kRn] = interpreted.cpu.x[kRn];
+              translated.cpu.x[kRmOrImm] = interpreted.cpu.x[kRmOrImm];
+              translated.cpu.flags = initial_flags;
+              TranslateAndRun(guest_code, &translated);
+
+              SCOPED_TRACE(testing::Message()
+                           << "sf=" << is_64_bit << " sub=" << is_sub
+                           << " imm=" << is_immediate << " cond=" << condition
+                           << " initial_flags=" << initial_flags << " nzcv=" << nzcv);
+              EXPECT_EQ(translated.cpu.flags, interpreted.cpu.flags);
+              EXPECT_EQ(translated.cpu.x[kRn], interpreted.cpu.x[kRn]);
+              EXPECT_EQ(translated.cpu.x[kRmOrImm], interpreted.cpu.x[kRmOrImm]);
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
 }  // namespace
 }  // namespace berberis
