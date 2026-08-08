@@ -429,6 +429,18 @@ TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesLogicalImmediateAnd) {
   EXPECT_EQ(state.cpu.x[9], 0xabu);
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteLogicalImmediateAndWritesWsp) {
+  // and wsp, w8, #0xff
+  constexpr std::array<uint32_t, 1> kGuestCode = {0x1200'1d1f};
+
+  ThreadState state{};
+  state.cpu.x[8] = 0xffff'ffff'1234'56ab;
+  state.cpu.sp = UINT64_MAX;
+  TranslateAndRun(kGuestCode, &state);
+
+  EXPECT_EQ(state.cpu.sp, 0xabu);
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesPcRelativeAddressesAndNop) {
   // adr x6, +8; adrp x7, current page; nop
   constexpr std::array<uint32_t, 3> kGuestCode = {0x1000'0046, 0x9000'0007, 0xd503'201f};

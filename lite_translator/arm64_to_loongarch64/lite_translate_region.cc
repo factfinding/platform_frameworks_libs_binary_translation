@@ -639,7 +639,14 @@ class LiteTranslator {
     if (opc == 3) {
       ComputeLogicalFlags(Assembler::t0, is_64_bit ? 64 : 32);
     }
-    StoreXOrDiscard(rd, Assembler::t0);
+    // Unlike logical shifted-register instructions, non-flag-setting logical
+    // immediate instructions use register 31 as SP/WSP for the destination.
+    // ANDS still uses XZR/WZR and discards the result.
+    if (opc == 3) {
+      StoreXOrDiscard(rd, Assembler::t0);
+    } else {
+      StoreXOrSp(rd, Assembler::t0);
+    }
     return true;
   }
 
