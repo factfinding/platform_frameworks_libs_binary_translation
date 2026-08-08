@@ -25,6 +25,7 @@
 #include "berberis/assembler/loongarch64.h"
 #include "berberis/assembler/machine_code.h"
 #include "berberis/guest_state/guest_state.h"
+#include "berberis/interpreter/arm64/interpreter.h"
 #include "berberis/runtime_primitives/code_pool.h"
 #include "berberis/runtime_primitives/host_code.h"
 #include "berberis/runtime_primitives/runtime_library.h"
@@ -439,6 +440,85 @@ TEST(LoongArch64RuntimeLibraryTest, LiteLogicalImmediateAndWritesWsp) {
   TranslateAndRun(kGuestCode, &state);
 
   EXPECT_EQ(state.cpu.sp, 0xabu);
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesLogicalImmediateAndX) {
+  // and x3, x1, #0xfffffffffffffffc
+  constexpr std::array<uint32_t, 1> kGuestCode = {0x927e'f423};
+
+  ThreadState state{};
+  state.cpu.x[1] = 0x1234'5678'9abc'def3;
+  TranslateAndRun(kGuestCode, &state);
+
+  EXPECT_EQ(state.cpu.x[3], 0x1234'5678'9abc'def0u);
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteLogicalImmediateAndXMatchesInterpreterExhaustively) {
+  constexpr uint64_t kInput = 0xa55a'f00f'963c'c369;
+  for (uint32_t n = 0; n < 2; ++n) {
+    for (uint32_t immr = 0; immr < 64; ++immr) {
+      for (uint32_t imms = 0; imms < 64; ++imms) {
+        const uint32_t len_source = (n << 6) | (~imms & 0x3f);
+        int32_t len = -1;
+        for (int32_t bit = 6; bit >= 0; --bit) {
+          if ((len_source & (uint32_t{1} << bit)) != 0) {
+            len = bit;
+            break;
+          }
+        }
+        if (len < 1) {
+          continue;
+        }
+        const uint32_t levels = (uint32_t{1} << len) - 1;
+        if ((imms & levels) == levels) {
+          continue;
+        }
+
+        const std::array<uint32_t, 1> guest_code = {0x9200'0001u | (n << 22) | (immr << 16) |
+                                                    (imms << 10)};
+        ThreadState interpreted{};
+        interpreted.cpu.x[0] = kInput;
+        SetInsnAddr(interpreted.cpu, ToGuestAddr(guest_code.data()));
+        InterpretInsn(&interpreted);
+
+        ThreadState translated{};
+        translated.cpu.x[0] = kInput;
+        TranslateAndRun(guest_code, &translated);
+
+        SCOPED_TRACE(testing::Message() << "n=" << n << " immr=" << immr << " imms=" << imms);
+        EXPECT_EQ(translated.cpu.x[1], interpreted.cpu.x[1]);
+      }
+    }
+  }
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteLogicalImmediateAndXMatchesInterpreterForAllRegisters) {
+  // Immediate fields from an AND instruction observed in jkchess.
+  constexpr uint32_t kInsnTemplate = 0x9240'7c00u;
+  for (uint32_t rn = 0; rn < 32; ++rn) {
+    for (uint32_t rd = 0; rd < 32; ++rd) {
+      const std::array<uint32_t, 1> guest_code = {kInsnTemplate | (rn << 5) | rd};
+      ThreadState interpreted{};
+      ThreadState translated{};
+      for (uint32_t reg = 0; reg < 31; ++reg) {
+        const uint64_t value =
+            0xa55a'f00f'963c'c369u ^ (uint64_t{reg} * 0x0101'0101'0101'0101u);
+        interpreted.cpu.x[reg] = value;
+        translated.cpu.x[reg] = value;
+      }
+      interpreted.cpu.sp = 0x1234'5678'9abc'def0u;
+      translated.cpu.sp = interpreted.cpu.sp;
+      SetInsnAddr(interpreted.cpu, ToGuestAddr(guest_code.data()));
+      InterpretInsn(&interpreted);
+      TranslateAndRun(guest_code, &translated);
+
+      SCOPED_TRACE(testing::Message() << "rn=" << rn << " rd=" << rd);
+      for (uint32_t reg = 0; reg < 31; ++reg) {
+        EXPECT_EQ(translated.cpu.x[reg], interpreted.cpu.x[reg]);
+      }
+      EXPECT_EQ(translated.cpu.sp, interpreted.cpu.sp);
+    }
+  }
 }
 
 TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesPcRelativeAddressesAndNop) {
