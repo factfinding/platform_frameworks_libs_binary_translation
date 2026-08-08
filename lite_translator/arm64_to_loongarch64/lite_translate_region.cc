@@ -40,8 +40,7 @@ constexpr int32_t kFlagsOffset = offsetof(ThreadState, cpu) + offsetof(CPUState,
 constexpr int32_t kTlsOffset = offsetof(ThreadState, tls);
 // Logical-immediate operations are enabled independently.  Validate each
 // opcode in production workloads before adding it to this mask.
-constexpr uint32_t kLogicalImmediateOpcMask =
-    (1u << 0) | (1u << 1) | (1u << 3);  // AND, ORR, ANDS
+constexpr uint32_t kLogicalImmediateOpcMask = (1u << 0) | (1u << 1) | (1u << 3);  // AND, ORR, ANDS
 
 constexpr int64_t SignExtend(uint64_t value, uint32_t width) {
   uint64_t sign = uint64_t{1} << (width - 1);
@@ -156,6 +155,47 @@ class LiteTranslator {
       }
       return TranslateSimdLoadStorePair(insn, pc);
     }
+    // Armv8.1 LSE compare-and-swap.  A/R select acquire/release semantics;
+    // byte through doubleword widths share the same LL/SC lowering.
+    if ((insn & 0x3fa0'7c00u) == 0x08a0'7c00u) {
+      if (!enable_guest_memory_) {
+        return false;
+      }
+      return TranslateAtomicMemory(insn, pc, AtomicMemoryOp::kCas);
+    }
+    // The current game profile is dominated by LDADD and SWP.  They differ
+    // only in o3 (bit 15), so keep one audited LL/SC implementation for both.
+    if ((insn & 0x3f20'7c00u) == 0x3820'0000u) {
+      if (!enable_guest_memory_) {
+        return false;
+      }
+      return TranslateAtomicMemory(
+          insn, pc, (insn & 0x8000u) ? AtomicMemoryOp::kSwp : AtomicMemoryOp::kLdadd);
+    }
+    // LDXR/LDAXR, including byte and halfword forms.  Preserve the guest
+    // reservation in ThreadState so a following interpreted STXR can consume
+    // it when the rest of the exclusive sequence is not yet translated.
+    if ((insn & 0x3f7f'7c00u) == 0x085f'7c00u) {
+      if (!enable_guest_memory_) {
+        return false;
+      }
+      return TranslateLoadExclusive(insn, pc);
+    }
+    // STLR[BH] uses Rs==31 in the exclusive/ordered load-store encoding.
+    if ((insn & 0x3fff'fc00u) == 0x089f'fc00u) {
+      if (!enable_guest_memory_) {
+        return false;
+      }
+      return TranslateStoreRelease(insn, pc);
+    }
+    // Rs==31 selects STLR rather than the store-exclusive family.  Leave it
+    // to the interpreter until it has its own release-store lowering.
+    if ((insn & 0x3f60'7c00u) == 0x0800'7c00u && ((insn >> 16) & 31) != 31) {
+      if (!enable_guest_memory_) {
+        return false;
+      }
+      return TranslateStoreExclusive(insn, pc);
+    }
     if ((insn & 0xffff'fc00u) == 0x4cdf'a800u) {
       if (!enable_guest_memory_) {
         return false;
@@ -167,6 +207,36 @@ class LiteTranslator {
         return false;
       }
       return TranslateLd1Two4S(insn, pc, false);
+    }
+    if ((insn & 0xffff'fc00u) == 0x4c9f'a800u) {
+      if (!enable_guest_memory_) {
+        return false;
+      }
+      return TranslateSt1Two4SPostIndex(insn, pc);
+    }
+    if ((insn & 0xffff'fc00u) == 0x4ddf'8400u) {
+      if (!enable_guest_memory_) {
+        return false;
+      }
+      return TranslateLd1D1PostIndex(insn, pc);
+    }
+    if ((insn & 0xffff'fc00u) == 0x4d40'c800u) {
+      if (!enable_guest_memory_) {
+        return false;
+      }
+      return TranslateLd1r4S(insn, pc);
+    }
+    if ((insn & 0xffff'fc00u) == 0x4d00'8000u) {
+      if (!enable_guest_memory_) {
+        return false;
+      }
+      return TranslateSt1S2(insn, pc);
+    }
+    if ((insn & 0xffe0'8400u) == 0x6e00'0400u) {
+      return TranslateInsElement(insn);
+    }
+    if ((insn & 0xffe0'fc00u) == 0x4e00'0400u) {
+      return TranslateDupElement4S(insn);
     }
     // DUP Vd.16B, Wn.  This is the hottest SIMD-copy form in the current
     // Unity workload.  Keep the initial LA64 implementation deliberately
@@ -209,11 +279,36 @@ class LiteTranslator {
     if ((insn & 0xff20'fc00u) == 0x4e20'cc00u) {
       return TranslateFmla4S(insn);
     }
-    if ((insn & 0xff20'fc00u) == 0x6e20'dc00u) {
-      return TranslateFmul4S(insn);
+    // Scalar FP arithmetic is pervasive in Unity startup code.  Use scalar
+    // LA64 operations so inactive SIMD lanes cannot raise spurious FP flags.
+    if ((insn & 0xff20'0c00u) == 0x1e20'0800u) {
+      return TranslateScalarFpBinary(insn);
     }
-    if ((insn & 0xff20'fc00u) == 0x4e20'd400u) {
-      return TranslateFadd4S(insn);
+    if ((insn & 0xffe0'fc07u) == 0x1e20'2000u) {
+      return TranslateFcmpS(insn);
+    }
+    if ((insn & 0xffe0'1fe0u) == 0x1e20'1000u) {
+      return TranslateFmovSImmediate(insn);
+    }
+    if ((insn & 0xffff'fc00u) == 0x1e38'0000u) {
+      return TranslateFcvtzsWS(insn);
+    }
+    // AdvSIMD floating-point add/sub and mul/div.  Q and size select 2S/4S/2D;
+    // half-precision encodings remain in the interpreter.
+    if ((insn & 0xbfa0'fc00u) == 0x0e20'd400u) {
+      return TranslateVectorFpBinary(insn, 2);  // FADD
+    }
+    if ((insn & 0xbfa0'fc00u) == 0x0ea0'd400u) {
+      return TranslateVectorFpBinary(insn, 3);  // FSUB
+    }
+    if ((insn & 0xbf20'fc00u) == 0x2e20'dc00u) {
+      return TranslateVectorFpBinary(insn, 0);  // FMUL
+    }
+    if ((insn & 0xbf20'fc00u) == 0x2e20'fc00u) {
+      return TranslateVectorFpBinary(insn, 1);  // FDIV
+    }
+    if ((insn & 0xffff'fc00u) == 0x6e21'd800u) {
+      return TranslateUcvtf4S(insn);
     }
     if ((insn & 0xffc0'f400u) == 0x4f80'1000u) {
       return TranslateFmla4SByElement(insn);
@@ -242,14 +337,16 @@ class LiteTranslator {
     if ((insn & 0x7fe0'0000u) == 0x1b00'0000u) {
       return TranslateMultiplyAddSub(insn);
     }
+    if ((insn & 0xff60'0000u) == 0x9b20'0000u) {
+      return TranslateMultiplyAddSubLong(insn);
+    }
     if ((insn & 0xffe0'fc00u) == 0x9bc0'7c00u) {
       return TranslateUmulh(insn);
     }
     if ((insn & 0xffe0'fc00u) == 0x9ba0'7c00u) {
       return TranslateUmull(insn);
     }
-    if ((insn & 0xffff'fc00u) == 0x5ac0'1000u ||
-        (insn & 0xffff'fc00u) == 0xdac0'1000u) {
+    if ((insn & 0xffff'fc00u) == 0x5ac0'1000u || (insn & 0xffff'fc00u) == 0xdac0'1000u) {
       return TranslateClz(insn);
     }
     if ((insn & 0xffff'fc00u) == 0x5ac0'0800u) {
@@ -295,6 +392,20 @@ class LiteTranslator {
       uint32_t rt = insn & 31;
       as_.LdD(Assembler::t0, Assembler::s8, kTlsOffset);
       StoreXOrDiscard(rt, Assembler::t0);
+      return true;
+    }
+    // ARM barriers become LoongArch DBAR.  DMB options only narrow the shareability
+    // domain; DBAR 0 is the conservative full-system ordering required here.
+    if ((insn & 0xffff'f0ffu) == 0xd503'30bfu) {
+      as_.Dbar(0);
+      return true;
+    }
+    // Berberis models the guest exclusive monitor in ThreadState.  Generated
+    // LDXR does not leave a host LL reservation live across guest instructions.
+    if ((insn & 0xffff'f0ffu) == 0xd503'305fu) {
+      as_.StD(Assembler::zero,
+              Assembler::s8,
+              offsetof(ThreadState, cpu) + offsetof(CPUState, reservation_address));
       return true;
     }
     // AArch64 HINT instructions are architectural no-ops for binary
@@ -379,6 +490,8 @@ class LiteTranslator {
   bool region_end_reached() const { return region_end_reached_; }
 
  private:
+  enum class AtomicMemoryOp { kCas, kSwp, kLdadd };
+
   static constexpr int32_t XOffset(uint32_t reg) {
     return offsetof(ThreadState, cpu) + offsetof(CPUState, x) + reg * sizeof(uint64_t);
   }
@@ -1017,6 +1130,34 @@ class LiteTranslator {
     return true;
   }
 
+  bool TranslateMultiplyAddSubLong(uint32_t insn) {
+    const bool is_unsigned = ((insn >> 23) & 1) != 0;
+    const bool subtract = ((insn >> 15) & 1) != 0;
+    const uint32_t rm = (insn >> 16) & 31;
+    const uint32_t ra = (insn >> 10) & 31;
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+
+    LoadXOrZero(rn, Assembler::t0);
+    LoadXOrZero(rm, Assembler::t1);
+    if (is_unsigned) {
+      ZeroExtend32(Assembler::t0);
+      ZeroExtend32(Assembler::t1);
+    } else {
+      SignExtend32(Assembler::t0);
+      SignExtend32(Assembler::t1);
+    }
+    as_.MulD(Assembler::t0, Assembler::t0, Assembler::t1);
+    LoadXOrZero(ra, Assembler::t2);
+    if (subtract) {
+      as_.SubD(Assembler::t0, Assembler::t2, Assembler::t0);
+    } else {
+      as_.AddD(Assembler::t0, Assembler::t0, Assembler::t2);
+    }
+    StoreXOrDiscard(rd, Assembler::t0);
+    return true;
+  }
+
   bool TranslateUmulh(uint32_t insn) {
     uint32_t rm = (insn >> 16) & 31;
     uint32_t rn = (insn >> 5) & 31;
@@ -1268,8 +1409,7 @@ class LiteTranslator {
     // The integer register-offset form accepts UXTW, UXTX/LSL, SXTW and
     // SXTX.  Other option encodings are reserved for this instruction class.
     const bool signed_load = opc > 1 && size <= 2;
-    if ((opc > 1 && !signed_load) ||
-        (option != 2 && option != 3 && option != 6 && option != 7)) {
+    if ((opc > 1 && !signed_load) || (option != 2 && option != 3 && option != 6 && option != 7)) {
       return false;
     }
 
@@ -1349,6 +1489,308 @@ class LiteTranslator {
       as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
       StoreXOrSp(rn, Assembler::t0);
     }
+    return true;
+  }
+
+  bool TranslateLoadExclusive(uint32_t insn, GuestAddr pc) {
+    const uint32_t size = insn >> 30;
+    const bool acquire = ((insn >> 15) & 1) != 0;
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rt = insn & 31;
+
+    LoadXOrSp(rn, Assembler::t0);
+    as_.Move(Assembler::t3, Assembler::t0);
+    ApplyTbi(Assembler::t0);
+
+    Assembler::Label* recovery = as_.MakeLabel();
+    Assembler::Label* done = as_.MakeLabel();
+    as_.SetRecoveryPoint(recovery);
+    switch (size) {
+      case 0:
+        as_.LdBU(Assembler::t1, Assembler::t0, 0);
+        break;
+      case 1:
+        as_.LdHU(Assembler::t1, Assembler::t0, 0);
+        break;
+      case 2:
+        as_.LdWU(Assembler::t1, Assembler::t0, 0);
+        break;
+      case 3:
+        as_.LdD(Assembler::t1, Assembler::t0, 0);
+        break;
+    }
+    if (acquire) {
+      as_.Dbar(0x14);
+    }
+    as_.StD(Assembler::t3,
+            Assembler::s8,
+            offsetof(ThreadState, cpu) + offsetof(CPUState, reservation_address));
+    as_.StD(Assembler::t1,
+            Assembler::s8,
+            offsetof(ThreadState, cpu) + offsetof(CPUState, reservation_value));
+    StoreXOrDiscard(rt, Assembler::t1);
+    as_.B(*done);
+    as_.Bind(recovery);
+    ExitGeneratedCode(pc);
+    as_.Bind(done);
+    return true;
+  }
+
+  bool TranslateStoreRelease(uint32_t insn, GuestAddr pc) {
+    const uint32_t size = insn >> 30;
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rt = insn & 31;
+
+    LoadXOrSp(rn, Assembler::t0);
+    ApplyTbi(Assembler::t0);
+    LoadXOrZero(rt, Assembler::t1);
+
+    Assembler::Label* recovery = as_.MakeLabel();
+    Assembler::Label* done = as_.MakeLabel();
+    as_.SetRecoveryPoint(recovery);
+    switch (size) {
+      case 0:
+        as_.StB(Assembler::t1, Assembler::t0, 0);
+        break;
+      case 1:
+        as_.StH(Assembler::t1, Assembler::t0, 0);
+        break;
+      case 2:
+        as_.StW(Assembler::t1, Assembler::t0, 0);
+        break;
+      case 3:
+        as_.StD(Assembler::t1, Assembler::t0, 0);
+        break;
+    }
+    // LoongArch's release barrier hint is emitted after the store, matching
+    // the platform's established atomic lowering (for example Go's loong64
+    // runtime).  It is lighter than a full DBAR 0 in this very hot path.
+    as_.Dbar(0x12);
+    as_.B(*done);
+    as_.Bind(recovery);
+    ExitGeneratedCode(pc);
+    as_.Bind(done);
+    return true;
+  }
+
+  bool TranslateStoreExclusive(uint32_t insn, GuestAddr pc) {
+    const uint32_t size = insn >> 30;
+    if (size < 2) {
+      return false;
+    }
+    const bool release = ((insn >> 15) & 1) != 0;
+    const uint32_t rs = (insn >> 16) & 31;
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rt = insn & 31;
+    constexpr int32_t kReservationAddressOffset =
+        offsetof(ThreadState, cpu) + offsetof(CPUState, reservation_address);
+    constexpr int32_t kReservationValueOffset =
+        offsetof(ThreadState, cpu) + offsetof(CPUState, reservation_value);
+
+    Assembler::Label* retry = as_.MakeLabel();
+    Assembler::Label* fail = as_.MakeLabel();
+    Assembler::Label* success = as_.MakeLabel();
+    Assembler::Label* recovery = as_.MakeLabel();
+    Assembler::Label* done = as_.MakeLabel();
+
+    // Check the architectural reservation before touching memory.  Keep it
+    // intact until the potentially faulting LL/SC completes, so recovery can
+    // re-enter the interpreter at this instruction without swallowing a fault.
+    LoadXOrSp(rn, Assembler::t0);
+    as_.LdD(Assembler::t1, Assembler::s8, kReservationAddressOffset);
+    as_.Bne(Assembler::t0, Assembler::t1, *fail);
+    ApplyTbi(Assembler::t0);
+    as_.LdD(Assembler::t1, Assembler::s8, kReservationValueOffset);
+    LoadXOrZero(rt, Assembler::t2);
+    if (size == 2) {
+      ZeroExtend32(Assembler::t1);
+      ZeroExtend32(Assembler::t2);
+    }
+
+    as_.Bind(retry);
+    as_.SetRecoveryPoint(recovery);
+    if (size == 2) {
+      as_.LlW(Assembler::t4, Assembler::t0);
+      ZeroExtend32(Assembler::t4);
+    } else {
+      as_.LlD(Assembler::t4, Assembler::t0);
+    }
+    as_.Bne(Assembler::t4, Assembler::t1, *fail);
+    as_.Move(Assembler::t3, Assembler::t2);
+    as_.SetRecoveryPoint(recovery);
+    if (size == 2) {
+      as_.ScW(Assembler::t3, Assembler::t0);
+    } else {
+      as_.ScD(Assembler::t3, Assembler::t0);
+    }
+    as_.Beqz(Assembler::t3, *retry);
+    as_.B(*success);
+
+    as_.Bind(fail);
+    as_.StD(Assembler::zero, Assembler::s8, kReservationAddressOffset);
+    as_.AddiD(Assembler::t0, Assembler::zero, 1);
+    StoreXOrDiscard(rs, Assembler::t0);
+    as_.B(*done);
+
+    as_.Bind(success);
+    if (release) {
+      as_.Dbar(0x12);
+    }
+    as_.StD(Assembler::zero, Assembler::s8, kReservationAddressOffset);
+    StoreXOrDiscard(rs, Assembler::zero);
+    as_.B(*done);
+
+    as_.Bind(recovery);
+    ExitGeneratedCode(pc);
+    as_.Bind(done);
+    return true;
+  }
+
+  bool TranslateAtomicMemory(uint32_t insn, GuestAddr pc, AtomicMemoryOp operation) {
+    const uint32_t size = insn >> 30;
+    const bool acquire = operation == AtomicMemoryOp::kCas ? ((insn >> 22) & 1) != 0
+                                                           : ((insn >> 23) & 1) != 0;
+    const bool release = operation == AtomicMemoryOp::kCas ? ((insn >> 15) & 1) != 0
+                                                           : ((insn >> 22) & 1) != 0;
+    const uint32_t rs = (insn >> 16) & 31;
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rt = insn & 31;
+
+    Assembler::Label* retry = as_.MakeLabel();
+    Assembler::Label* compare_failed = as_.MakeLabel();
+    Assembler::Label* success = as_.MakeLabel();
+    Assembler::Label* recovery = as_.MakeLabel();
+    Assembler::Label* done = as_.MakeLabel();
+
+    LoadXOrSp(rn, Assembler::t0);
+    ApplyTbi(Assembler::t0);
+    LoadXOrZero(rs, Assembler::t1);
+    if (operation == AtomicMemoryOp::kCas && size >= 2) {
+      LoadXOrZero(rt, Assembler::t2);
+    }
+
+    // LA64 has native full-barrier atomic exchange/add for W/D.  Besides
+    // avoiding an LL/SC retry loop, these instructions provide the ordering
+    // used by Clang's own __atomic lowering and are essential for pthread and
+    // libc++ synchronization.  B/H still require a containing-word LL/SC.
+    if (size >= 2 && operation != AtomicMemoryOp::kCas) {
+      Assembler::Label* recovery = as_.MakeLabel();
+      Assembler::Label* done = as_.MakeLabel();
+      as_.SetRecoveryPoint(recovery);
+      if (operation == AtomicMemoryOp::kSwp) {
+        size == 2 ? as_.AmswapDbW(Assembler::t5, Assembler::t1, Assembler::t0)
+                  : as_.AmswapDbD(Assembler::t5, Assembler::t1, Assembler::t0);
+      } else {
+        size == 2 ? as_.AmaddDbW(Assembler::t5, Assembler::t1, Assembler::t0)
+                  : as_.AmaddDbD(Assembler::t5, Assembler::t1, Assembler::t0);
+      }
+      if (size == 2) {
+        ZeroExtend32(Assembler::t5);
+      }
+      StoreXOrDiscard(rt, Assembler::t5);
+      as_.B(*done);
+      as_.Bind(recovery);
+      ExitGeneratedCode(pc);
+      as_.Bind(done);
+      return true;
+    }
+
+    if (size < 2) {
+      // LA64 LL/SC operates on W/D values.  For B/H atomics reserve the
+      // naturally containing word, then extract and merge only the selected
+      // field.  Architecturally valid LSE atomics are naturally aligned, so a
+      // halfword never crosses that containing word.
+      as_.Li(Assembler::t7, size == 0 ? 0xffu : 0xffffu);
+      as_.And(Assembler::t1, Assembler::t1, Assembler::t7);
+      as_.Li(Assembler::t3, 3);
+      as_.And(Assembler::t8, Assembler::t0, Assembler::t3);
+      as_.SlliD(Assembler::t8, Assembler::t8, 3);
+      as_.Li(Assembler::t3, UINT64_MAX - 3);
+      as_.And(Assembler::t0, Assembler::t0, Assembler::t3);
+
+      as_.Bind(retry);
+      as_.SetRecoveryPoint(recovery);
+      as_.LlW(Assembler::t4, Assembler::t0);
+      ZeroExtend32(Assembler::t4);
+      as_.SrlW(Assembler::t5, Assembler::t4, Assembler::t8);
+      as_.And(Assembler::t5, Assembler::t5, Assembler::t7);
+      if (operation == AtomicMemoryOp::kCas) {
+        as_.Bne(Assembler::t5, Assembler::t1, *compare_failed);
+        // Mask construction below consumes t2, and SC failure branches back
+        // here.  Reload the architectural desired value on every attempt so
+        // an ABA-style retry cannot store the former mask temporary.
+        LoadXOrZero(rt, Assembler::t6);
+        as_.And(Assembler::t6, Assembler::t6, Assembler::t7);
+      } else if (operation == AtomicMemoryOp::kSwp) {
+        as_.Move(Assembler::t6, Assembler::t1);
+      } else {
+        as_.AddD(Assembler::t6, Assembler::t5, Assembler::t1);
+        as_.And(Assembler::t6, Assembler::t6, Assembler::t7);
+      }
+
+      as_.SllW(Assembler::t6, Assembler::t6, Assembler::t8);
+      as_.SllW(Assembler::t3, Assembler::t7, Assembler::t8);
+      as_.Li(Assembler::t2, UINT64_MAX);
+      as_.Xor(Assembler::t3, Assembler::t3, Assembler::t2);
+      as_.And(Assembler::t3, Assembler::t4, Assembler::t3);
+      as_.Or(Assembler::t3, Assembler::t3, Assembler::t6);
+      as_.SetRecoveryPoint(recovery);
+      as_.ScW(Assembler::t3, Assembler::t0);
+      as_.Beqz(Assembler::t3, *retry);
+    } else {
+      if (size == 2) {
+        ZeroExtend32(Assembler::t1);
+        if (operation == AtomicMemoryOp::kCas) {
+          ZeroExtend32(Assembler::t2);
+        }
+      }
+      as_.Bind(retry);
+      as_.SetRecoveryPoint(recovery);
+      if (size == 2) {
+        as_.LlW(Assembler::t4, Assembler::t0);
+        ZeroExtend32(Assembler::t4);
+      } else {
+        as_.LlD(Assembler::t4, Assembler::t0);
+      }
+      as_.Move(Assembler::t5, Assembler::t4);
+      if (operation == AtomicMemoryOp::kCas) {
+        as_.Bne(Assembler::t5, Assembler::t1, *compare_failed);
+        as_.Move(Assembler::t3, Assembler::t2);
+      } else if (operation == AtomicMemoryOp::kSwp) {
+        as_.Move(Assembler::t3, Assembler::t1);
+      } else {
+        as_.AddD(Assembler::t3, Assembler::t5, Assembler::t1);
+      }
+      as_.SetRecoveryPoint(recovery);
+      if (size == 2) {
+        as_.ScW(Assembler::t3, Assembler::t0);
+      } else {
+        as_.ScD(Assembler::t3, Assembler::t0);
+      }
+      as_.Beqz(Assembler::t3, *retry);
+    }
+
+    as_.B(*success);
+    as_.Bind(compare_failed);
+    if (acquire) {
+      as_.Dbar(0x14);
+    }
+    StoreXOrDiscard(rs, Assembler::t5);
+    as_.B(*done);
+
+    as_.Bind(success);
+    if (release) {
+      as_.Dbar(0x12);
+    }
+    if (acquire) {
+      as_.Dbar(0x14);
+    }
+    StoreXOrDiscard(operation == AtomicMemoryOp::kCas ? rs : rt, Assembler::t5);
+    as_.B(*done);
+
+    as_.Bind(recovery);
+    ExitGeneratedCode(pc);
+    as_.Bind(done);
     return true;
   }
 
@@ -1484,6 +1926,91 @@ class LiteTranslator {
     return true;
   }
 
+  bool TranslateSt1Two4SPostIndex(uint32_t insn, GuestAddr pc) {
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rt = insn & 31;
+    const uint32_t rt2 = (rt + 1) & 31;
+    LoadXOrSp(rn, Assembler::t0);
+    ApplyTbi(Assembler::t0);
+    as_.LdD(Assembler::t1, Assembler::s8, VOffset(rt));
+    as_.LdD(Assembler::t2, Assembler::s8, VOffset(rt) + 8);
+    as_.LdD(Assembler::t3, Assembler::s8, VOffset(rt2));
+    as_.LdD(Assembler::t4, Assembler::s8, VOffset(rt2) + 8);
+    Assembler::Label* recovery = as_.MakeLabel();
+    Assembler::Label* done = as_.MakeLabel();
+    as_.SetRecoveryPoint(recovery);
+    as_.StD(Assembler::t1, Assembler::t0, 0);
+    as_.SetRecoveryPoint(recovery);
+    as_.StD(Assembler::t2, Assembler::t0, 8);
+    as_.SetRecoveryPoint(recovery);
+    as_.StD(Assembler::t3, Assembler::t0, 16);
+    as_.SetRecoveryPoint(recovery);
+    as_.StD(Assembler::t4, Assembler::t0, 24);
+    as_.B(*done);
+    as_.Bind(recovery);
+    ExitGeneratedCode(pc);
+    as_.Bind(done);
+    LoadXOrSp(rn, Assembler::t0);
+    as_.AddiD(Assembler::t0, Assembler::t0, 32);
+    StoreXOrSp(rn, Assembler::t0);
+    return true;
+  }
+
+  bool TranslateLd1D1PostIndex(uint32_t insn, GuestAddr pc) {
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rt = insn & 31;
+    LoadXOrSp(rn, Assembler::t0);
+    ApplyTbi(Assembler::t0);
+    Assembler::Label* recovery = as_.MakeLabel();
+    Assembler::Label* done = as_.MakeLabel();
+    as_.SetRecoveryPoint(recovery);
+    as_.LdD(Assembler::t1, Assembler::t0, 0);
+    as_.StD(Assembler::t1, Assembler::s8, VOffset(rt) + 8);
+    as_.B(*done);
+    as_.Bind(recovery);
+    ExitGeneratedCode(pc);
+    as_.Bind(done);
+    LoadXOrSp(rn, Assembler::t0);
+    as_.AddiD(Assembler::t0, Assembler::t0, 8);
+    StoreXOrSp(rn, Assembler::t0);
+    return true;
+  }
+
+  bool TranslateLd1r4S(uint32_t insn, GuestAddr pc) {
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rt = insn & 31;
+    LoadXOrSp(rn, Assembler::t0);
+    ApplyTbi(Assembler::t0);
+    Assembler::Label* recovery = as_.MakeLabel();
+    Assembler::Label* done = as_.MakeLabel();
+    as_.SetRecoveryPoint(recovery);
+    as_.LdWU(Assembler::t1, Assembler::t0, 0);
+    as_.Vreplgr2vrW(Assembler::vr0, Assembler::t1);
+    StoreV(rt, Assembler::vr0);
+    as_.B(*done);
+    as_.Bind(recovery);
+    ExitGeneratedCode(pc);
+    as_.Bind(done);
+    return true;
+  }
+
+  bool TranslateSt1S2(uint32_t insn, GuestAddr pc) {
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rt = insn & 31;
+    LoadXOrSp(rn, Assembler::t0);
+    ApplyTbi(Assembler::t0);
+    as_.LdWU(Assembler::t1, Assembler::s8, VOffset(rt) + 8);
+    Assembler::Label* recovery = as_.MakeLabel();
+    Assembler::Label* done = as_.MakeLabel();
+    as_.SetRecoveryPoint(recovery);
+    as_.StW(Assembler::t1, Assembler::t0, 0);
+    as_.B(*done);
+    as_.Bind(recovery);
+    ExitGeneratedCode(pc);
+    as_.Bind(done);
+    return true;
+  }
+
   bool TranslateDup16B(uint32_t insn) {
     uint32_t rn = (insn >> 5) & 31;
     uint32_t rd = insn & 31;
@@ -1509,6 +2036,58 @@ class LiteTranslator {
     uint32_t rd = insn & 31;
     LoadV(rn, Assembler::vr1);
     as_.VreplveiW(Assembler::vr0, Assembler::vr1, 0);
+    StoreV(rd, Assembler::vr0);
+    return true;
+  }
+
+  bool TranslateInsElement(uint32_t insn) {
+    const uint32_t imm5 = (insn >> 16) & 31;
+    const uint32_t imm4 = (insn >> 11) & 15;
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    uint32_t element_size;
+    uint32_t dst_index;
+    uint32_t src_index;
+    if (imm5 & 4) {
+      element_size = 4;
+      dst_index = imm5 >> 3;
+      src_index = imm4 >> 2;
+    } else if (imm5 & 8) {
+      element_size = 8;
+      dst_index = imm5 >> 4;
+      src_index = imm4 >> 3;
+    } else {
+      return false;
+    }
+    if (element_size == 4) {
+      as_.LdWU(Assembler::t0, Assembler::s8, VOffset(rn) + src_index * 4);
+      as_.StW(Assembler::t0, Assembler::s8, VOffset(rd) + dst_index * 4);
+    } else {
+      as_.LdD(Assembler::t0, Assembler::s8, VOffset(rn) + src_index * 8);
+      as_.StD(Assembler::t0, Assembler::s8, VOffset(rd) + dst_index * 8);
+    }
+    return true;
+  }
+
+  bool TranslateDupElement4S(uint32_t insn) {
+    const uint32_t imm5 = (insn >> 16) & 31;
+    if ((imm5 & 7) != 4) {
+      return false;
+    }
+    const uint32_t index = imm5 >> 3;
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    LoadV(rn, Assembler::vr1);
+    as_.VreplveiW(Assembler::vr0, Assembler::vr1, index);
+    StoreV(rd, Assembler::vr0);
+    return true;
+  }
+
+  bool TranslateUcvtf4S(uint32_t insn) {
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    LoadV(rn, Assembler::vr1);
+    as_.VffintSWu(Assembler::vr0, Assembler::vr1);
     StoreV(rd, Assembler::vr0);
     return true;
   }
@@ -1598,6 +2177,180 @@ class LiteTranslator {
     LoadV(rm, Assembler::vr2);
     as_.VfmulS(Assembler::vr0, Assembler::vr1, Assembler::vr2);
     StoreV(rd, Assembler::vr0);
+    return true;
+  }
+
+  bool TranslateScalarFpBinary(uint32_t insn) {
+    uint32_t ftype = (insn >> 22) & 3;
+    uint32_t operation = (insn >> 12) & 15;
+    uint32_t rm = (insn >> 16) & 31;
+    uint32_t rn = (insn >> 5) & 31;
+    uint32_t rd = insn & 31;
+    if (ftype > 1 || operation > 3) {
+      return false;
+    }
+
+    LoadV(rn, Assembler::vr1);
+    LoadV(rm, Assembler::vr2);
+    bool is_double = ftype == 1;
+    switch (operation) {
+      case 0:
+        is_double ? as_.FmulD(Assembler::vr0, Assembler::vr1, Assembler::vr2)
+                  : as_.FmulS(Assembler::vr0, Assembler::vr1, Assembler::vr2);
+        break;
+      case 1:
+        is_double ? as_.FdivD(Assembler::vr0, Assembler::vr1, Assembler::vr2)
+                  : as_.FdivS(Assembler::vr0, Assembler::vr1, Assembler::vr2);
+        break;
+      case 2:
+        is_double ? as_.FaddD(Assembler::vr0, Assembler::vr1, Assembler::vr2)
+                  : as_.FaddS(Assembler::vr0, Assembler::vr1, Assembler::vr2);
+        break;
+      case 3:
+        is_double ? as_.FsubD(Assembler::vr0, Assembler::vr1, Assembler::vr2)
+                  : as_.FsubS(Assembler::vr0, Assembler::vr1, Assembler::vr2);
+        break;
+    }
+    as_.Vst(Assembler::vr0, Assembler::s8, VOffset(rd));
+    if (!is_double) {
+      as_.StW(Assembler::zero, Assembler::s8, VOffset(rd) + 4);
+    }
+    as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
+    return true;
+  }
+
+  bool TranslateFcmpS(uint32_t insn) {
+    const uint32_t rm = (insn >> 16) & 31;
+    const uint32_t rn = (insn >> 5) & 31;
+    const bool with_zero = ((insn >> 3) & 1) != 0;
+    Assembler::Label* unordered = as_.MakeLabel();
+    Assembler::Label* equal = as_.MakeLabel();
+    Assembler::Label* less = as_.MakeLabel();
+    Assembler::Label* done = as_.MakeLabel();
+
+    LoadV(rn, Assembler::vr1);
+    if (with_zero) {
+      as_.Movgr2frW(Assembler::vr2, Assembler::zero);
+    } else {
+      LoadV(rm, Assembler::vr2);
+    }
+    as_.FcmpCunS(Assembler::vr1, Assembler::vr2);
+    as_.Movcf2gr(Assembler::t0);
+    as_.Bnez(Assembler::t0, *unordered);
+    as_.FcmpCeqS(Assembler::vr1, Assembler::vr2);
+    as_.Movcf2gr(Assembler::t0);
+    as_.Bnez(Assembler::t0, *equal);
+    as_.FcmpCltS(Assembler::vr1, Assembler::vr2);
+    as_.Movcf2gr(Assembler::t0);
+    as_.Bnez(Assembler::t0, *less);
+
+    as_.Li(Assembler::t0, CPUState::kFlagCarry);
+    as_.B(*done);
+    as_.Bind(less);
+    as_.Li(Assembler::t0, CPUState::kFlagNegative);
+    as_.B(*done);
+    as_.Bind(equal);
+    as_.Li(Assembler::t0, CPUState::kFlagZero | CPUState::kFlagCarry);
+    as_.B(*done);
+    as_.Bind(unordered);
+    as_.Li(Assembler::t0, CPUState::kFlagCarry | CPUState::kFlagOverflow);
+    as_.Bind(done);
+    as_.StW(Assembler::t0, Assembler::s8, kFlagsOffset);
+    return true;
+  }
+
+  bool TranslateFmovSImmediate(uint32_t insn) {
+    const uint32_t imm8 = (insn >> 13) & 0xff;
+    const uint32_t rd = insn & 31;
+    const uint32_t b6 = (imm8 >> 6) & 1;
+    const uint32_t bits = ((imm8 & 0x80) << 24) | ((b6 ^ 1) << 30) |
+                          (b6 ? 0x3e00'0000u : 0) | ((imm8 & 0x3f) << 19);
+    as_.Li(Assembler::t0, bits);
+    as_.StW(Assembler::t0, Assembler::s8, VOffset(rd));
+    as_.StW(Assembler::zero, Assembler::s8, VOffset(rd) + 4);
+    as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
+    return true;
+  }
+
+  bool TranslateFcvtzsWS(uint32_t insn) {
+    uint32_t rn = (insn >> 5) & 31;
+    uint32_t rd = insn & 31;
+    Assembler::Label* fast_path = as_.MakeLabel();
+    Assembler::Label* nan = as_.MakeLabel();
+    Assembler::Label* negative_overflow = as_.MakeLabel();
+    Assembler::Label* done = as_.MakeLabel();
+
+    // ARM FCVTZS saturates finite overflows and infinities, and produces zero
+    // for NaNs.  LA64 FTINTRZ.W.S does not provide those architectural result
+    // guarantees, so classify the IEEE-754 bits before using it for the common
+    // finite range (-2^31, 2^31).
+    as_.LdWU(Assembler::t0, Assembler::s8, VOffset(rn));
+    as_.Li(Assembler::t1, 0x7fff'ffffu);
+    as_.And(Assembler::t2, Assembler::t0, Assembler::t1);
+    as_.Li(Assembler::t1, 0x4f00'0000u);
+    as_.Bltu(Assembler::t2, Assembler::t1, *fast_path);
+
+    as_.Li(Assembler::t1, 0x7f80'0000u);
+    as_.Bltu(Assembler::t1, Assembler::t2, *nan);
+    as_.SrliD(Assembler::t1, Assembler::t0, 31);
+    as_.Bnez(Assembler::t1, *negative_overflow);
+    as_.Li(Assembler::t0, 0x7fff'ffffu);
+    as_.B(*done);
+
+    as_.Bind(negative_overflow);
+    as_.Li(Assembler::t0, 0x8000'0000u);
+    as_.B(*done);
+
+    as_.Bind(nan);
+    as_.Move(Assembler::t0, Assembler::zero);
+    as_.B(*done);
+
+    as_.Bind(fast_path);
+    as_.Movgr2frW(Assembler::vr0, Assembler::t0);
+    as_.FtintrzWS(Assembler::vr0, Assembler::vr0);
+    as_.Movfr2grS(Assembler::t0, Assembler::vr0);
+
+    as_.Bind(done);
+    ZeroExtend32(Assembler::t0);
+    StoreXOrDiscard(rd, Assembler::t0);
+    return true;
+  }
+
+  bool TranslateVectorFpBinary(uint32_t insn, uint32_t operation) {
+    bool is_128_bit = ((insn >> 30) & 1) != 0;
+    bool is_double = ((insn >> 22) & 1) != 0;
+    if (is_double && !is_128_bit) {
+      return false;
+    }
+    uint32_t rm = (insn >> 16) & 31;
+    uint32_t rn = (insn >> 5) & 31;
+    uint32_t rd = insn & 31;
+    LoadV(rn, Assembler::vr1);
+    LoadV(rm, Assembler::vr2);
+    switch (operation) {
+      case 0:
+        is_double ? as_.VfmulD(Assembler::vr0, Assembler::vr1, Assembler::vr2)
+                  : as_.VfmulS(Assembler::vr0, Assembler::vr1, Assembler::vr2);
+        break;
+      case 1:
+        is_double ? as_.VfdivD(Assembler::vr0, Assembler::vr1, Assembler::vr2)
+                  : as_.VfdivS(Assembler::vr0, Assembler::vr1, Assembler::vr2);
+        break;
+      case 2:
+        is_double ? as_.VfaddD(Assembler::vr0, Assembler::vr1, Assembler::vr2)
+                  : as_.VfaddS(Assembler::vr0, Assembler::vr1, Assembler::vr2);
+        break;
+      case 3:
+        is_double ? as_.VfsubD(Assembler::vr0, Assembler::vr1, Assembler::vr2)
+                  : as_.VfsubS(Assembler::vr0, Assembler::vr1, Assembler::vr2);
+        break;
+      default:
+        return false;
+    }
+    StoreV(rd, Assembler::vr0);
+    if (!is_128_bit) {
+      as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
+    }
     return true;
   }
 

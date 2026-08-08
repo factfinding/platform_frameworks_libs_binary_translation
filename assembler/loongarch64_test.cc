@@ -61,15 +61,26 @@ TEST(LoongArch64AssemblerTest, EncodesBootstrapInstructions) {
   assembler.SlliD(Assembler::a0, Assembler::a1, 7);
   assembler.SrliD(Assembler::a0, Assembler::a1, 7);
   assembler.SraiD(Assembler::a0, Assembler::a1, 7);
+  assembler.Dbar(0x14);
+  assembler.LlW(Assembler::a0, Assembler::a1);
+  assembler.ScW(Assembler::a0, Assembler::a1);
+  assembler.LlD(Assembler::a0, Assembler::a1);
+  assembler.ScD(Assembler::a0, Assembler::a1);
+  assembler.AmswapDbW(Assembler::t0, Assembler::t1, Assembler::t2);
+  assembler.AmswapDbD(Assembler::t0, Assembler::t1, Assembler::t2);
+  assembler.AmaddDbW(Assembler::t0, Assembler::t1, Assembler::t2);
+  assembler.AmaddDbD(Assembler::t0, Assembler::t1, Assembler::t2);
 
   // Values are generated independently with LLVM 21 llvm-mc for the
   // loongarch64 target. MachineCode stores words in target little endian.
-  constexpr std::array<uint32_t, 31> kExpected = {
-      0x001098a4, 0x0011b9ac, 0x0014e717, 0x001500a4, 0x001598a4, 0x001db9ac, 0x02ffc0a4,
-      0x142468a4, 0x0399e084, 0x162468a4, 0x03048c84, 0x28c060a4, 0x288050a4, 0x2a8050a4,
-      0x2a0040a4, 0x2a4030a4, 0x29ffe0a4, 0x29bff0a4, 0x297ff8a4, 0x293ffca4, 0x58000885,
-      0x5c000885, 0x68000885, 0x40000880, 0x44000880, 0x50000800, 0x54000800, 0x4c000081,
-      0x00411ca4, 0x00451ca4, 0x00491ca4,
+  constexpr std::array<uint32_t, 40> kExpected = {
+      0x001098a4, 0x0011b9ac, 0x0014e717, 0x001500a4, 0x001598a4, 0x001db9ac,
+      0x02ffc0a4, 0x142468a4, 0x0399e084, 0x162468a4, 0x03048c84, 0x28c060a4,
+      0x288050a4, 0x2a8050a4, 0x2a0040a4, 0x2a4030a4, 0x29ffe0a4, 0x29bff0a4,
+      0x297ff8a4, 0x293ffca4, 0x58000885, 0x5c000885, 0x68000885, 0x40000880,
+      0x44000880, 0x50000800, 0x54000800, 0x4c000081, 0x00411ca4, 0x00451ca4,
+      0x00491ca4, 0x38720014, 0x200000a4, 0x210000a4, 0x220000a4, 0x230000a4,
+      0x386935cc, 0x3869b5cc, 0x386a35cc, 0x386ab5cc,
   };
 
   ASSERT_EQ(code.install_size(), sizeof(kExpected));
@@ -167,21 +178,42 @@ TEST(LoongArch64AssemblerTest, EncodesLsxFloatingPointInstructions) {
   assembler.Vld(Assembler::vr0, Assembler::s8, 0);
   assembler.Vst(Assembler::vr1, Assembler::s8, 16);
   assembler.VfmulS(Assembler::vr2, Assembler::vr3, Assembler::vr4);
+  assembler.VfmulD(Assembler::vr2, Assembler::vr3, Assembler::vr4);
   assembler.VfaddS(Assembler::vr2, Assembler::vr3, Assembler::vr4);
+  assembler.VfaddD(Assembler::vr2, Assembler::vr3, Assembler::vr4);
+  assembler.VfsubS(Assembler::vr2, Assembler::vr3, Assembler::vr4);
+  assembler.VfsubD(Assembler::vr2, Assembler::vr3, Assembler::vr4);
+  assembler.VfdivS(Assembler::vr2, Assembler::vr3, Assembler::vr4);
+  assembler.VfdivD(Assembler::vr2, Assembler::vr3, Assembler::vr4);
+  assembler.VffintSWu(Assembler::vr2, Assembler::vr3);
+  assembler.FmulS(Assembler::vr2, Assembler::vr3, Assembler::vr4);
+  assembler.FmulD(Assembler::vr2, Assembler::vr3, Assembler::vr4);
+  assembler.FdivS(Assembler::vr2, Assembler::vr3, Assembler::vr4);
+  assembler.FdivD(Assembler::vr2, Assembler::vr3, Assembler::vr4);
+  assembler.FaddS(Assembler::vr2, Assembler::vr3, Assembler::vr4);
+  assembler.FaddD(Assembler::vr2, Assembler::vr3, Assembler::vr4);
+  assembler.FsubS(Assembler::vr2, Assembler::vr3, Assembler::vr4);
+  assembler.FsubD(Assembler::vr2, Assembler::vr3, Assembler::vr4);
+  assembler.FtintrzWS(Assembler::vr0, Assembler::vr1);
+  assembler.Movfr2grS(Assembler::t0, Assembler::vr0);
+  assembler.Movgr2frW(Assembler::vr1, Assembler::t1);
+  assembler.FcmpCunS(Assembler::vr1, Assembler::vr2);
+  assembler.FcmpCeqS(Assembler::vr3, Assembler::vr4);
+  assembler.FcmpCltS(Assembler::vr5, Assembler::vr6);
+  assembler.Movcf2gr(Assembler::t0);
   assembler.VfmaddS(Assembler::vr5, Assembler::vr6, Assembler::vr7, Assembler::vr8);
   assembler.Vreplgr2vrW(Assembler::vr1, Assembler::t0);
   assembler.VreplveiW(Assembler::vr2, Assembler::vr3, 0);
   assembler.VreplveiW(Assembler::vr4, Assembler::vr5, 3);
 
   // Generated independently with LLVM's LoongArch assembler and -mlsx.
-  constexpr std::array<uint32_t, 8> kExpected = {0x2c00'03e0,
-                                                  0x2c40'43e1,
-                                                  0x7138'9062,
-                                                  0x7130'9062,
-                                                  0x0914'1cc5,
-                                                  0x729f'0981,
-                                                  0x72f7'e062,
-                                                  0x72f7'eca4};
+  constexpr std::array<uint32_t, 30> kExpected = {
+      0x2c00'03e0, 0x2c40'43e1, 0x7138'9062, 0x7139'1062, 0x7130'9062, 0x7131'1062,
+      0x7132'9062, 0x7133'1062, 0x713a'9062, 0x713b'1062, 0x729e'0462, 0x0104'9062,
+      0x0105'1062,
+      0x0106'9062, 0x0107'1062, 0x0100'9062, 0x0101'1062, 0x0102'9062, 0x0103'1062,
+      0x011a'8420, 0x0114'b40c, 0x0114'a5a1, 0x0c14'0820, 0x0c12'1060, 0x0c11'18a0,
+      0x0114'dc0c, 0x0914'1cc5, 0x729f'0981, 0x72f7'e062, 0x72f7'eca4};
   ASSERT_EQ(code.install_size(), sizeof(kExpected));
   for (size_t i = 0; i < kExpected.size(); ++i) {
     EXPECT_EQ(*code.AddrAs<const uint32_t>(i * sizeof(uint32_t)), kExpected[i]) << i;

@@ -202,6 +202,26 @@ class Assembler : public AssemblerBase {
   void StB(Register rd, Register rj, int32_t imm12) {
     Emit2RI12(0x2900'0000, rd, rj, EncodeSigned(imm12, 12));
   }
+  void Dbar(uint32_t hint) {
+    CHECK_LT(hint, 1u << 15);
+    Emit32(0x3872'0000 | hint);
+  }
+  void LlW(Register rd, Register rj) { Emit32(0x2000'0000 | EncodeRj(rj) | EncodeRd(rd)); }
+  void ScW(Register rd, Register rj) { Emit32(0x2100'0000 | EncodeRj(rj) | EncodeRd(rd)); }
+  void LlD(Register rd, Register rj) { Emit32(0x2200'0000 | EncodeRj(rj) | EncodeRd(rd)); }
+  void ScD(Register rd, Register rj) { Emit32(0x2300'0000 | EncodeRj(rj) | EncodeRd(rd)); }
+  void AmswapDbW(Register rd, Register value, Register address) {
+    Emit3R(0x3869'0000, rd, address, value);
+  }
+  void AmswapDbD(Register rd, Register value, Register address) {
+    Emit3R(0x3869'8000, rd, address, value);
+  }
+  void AmaddDbW(Register rd, Register value, Register address) {
+    Emit3R(0x386a'0000, rd, address, value);
+  }
+  void AmaddDbD(Register rd, Register value, Register address) {
+    Emit3R(0x386a'8000, rd, address, value);
+  }
 
   void Vld(SimdRegister vd, Register rj, int32_t imm12) {
     Emit32(0x2c00'0000 | (EncodeSigned(imm12, 12) << 10) | EncodeRj(rj) | EncodeVd(vd));
@@ -212,9 +232,73 @@ class Assembler : public AssemblerBase {
   void VfmulS(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
     Emit32(0x7138'8000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
   }
+  void VfmulD(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
+    Emit32(0x7139'0000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
+  }
   void VfaddS(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
     Emit32(0x7130'8000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
   }
+  void VfaddD(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
+    Emit32(0x7131'0000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
+  }
+  void VfsubS(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
+    Emit32(0x7132'8000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
+  }
+  void VfsubD(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
+    Emit32(0x7133'0000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
+  }
+  void VfdivS(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
+    Emit32(0x713a'8000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
+  }
+  void VfdivD(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
+    Emit32(0x713b'0000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
+  }
+  void VffintSWu(SimdRegister vd, SimdRegister vj) {
+    Emit32(0x729e'0400 | EncodeVj(vj) | EncodeVd(vd));
+  }
+  void FmulS(SimdRegister fd, SimdRegister fj, SimdRegister fk) {
+    Emit32(0x0104'8000 | EncodeVk(fk) | EncodeVj(fj) | EncodeVd(fd));
+  }
+  void FmulD(SimdRegister fd, SimdRegister fj, SimdRegister fk) {
+    Emit32(0x0105'0000 | EncodeVk(fk) | EncodeVj(fj) | EncodeVd(fd));
+  }
+  void FdivS(SimdRegister fd, SimdRegister fj, SimdRegister fk) {
+    Emit32(0x0106'8000 | EncodeVk(fk) | EncodeVj(fj) | EncodeVd(fd));
+  }
+  void FdivD(SimdRegister fd, SimdRegister fj, SimdRegister fk) {
+    Emit32(0x0107'0000 | EncodeVk(fk) | EncodeVj(fj) | EncodeVd(fd));
+  }
+  void FaddS(SimdRegister fd, SimdRegister fj, SimdRegister fk) {
+    Emit32(0x0100'8000 | EncodeVk(fk) | EncodeVj(fj) | EncodeVd(fd));
+  }
+  void FaddD(SimdRegister fd, SimdRegister fj, SimdRegister fk) {
+    Emit32(0x0101'0000 | EncodeVk(fk) | EncodeVj(fj) | EncodeVd(fd));
+  }
+  void FsubS(SimdRegister fd, SimdRegister fj, SimdRegister fk) {
+    Emit32(0x0102'8000 | EncodeVk(fk) | EncodeVj(fj) | EncodeVd(fd));
+  }
+  void FsubD(SimdRegister fd, SimdRegister fj, SimdRegister fk) {
+    Emit32(0x0103'0000 | EncodeVk(fk) | EncodeVj(fj) | EncodeVd(fd));
+  }
+  void FtintrzWS(SimdRegister fd, SimdRegister fj) {
+    Emit32(0x011a'8400 | EncodeVj(fj) | EncodeVd(fd));
+  }
+  void Movfr2grS(Register rd, SimdRegister fj) {
+    Emit32(0x0114'b400 | EncodeVj(fj) | EncodeRd(rd));
+  }
+  void Movgr2frW(SimdRegister fd, Register rj) {
+    Emit32(0x0114'a400 | EncodeRj(rj) | EncodeVd(fd));
+  }
+  void FcmpCunS(SimdRegister fj, SimdRegister fk) {
+    Emit32(0x0c14'0000 | EncodeVk(fk) | EncodeVj(fj));
+  }
+  void FcmpCeqS(SimdRegister fj, SimdRegister fk) {
+    Emit32(0x0c12'0000 | EncodeVk(fk) | EncodeVj(fj));
+  }
+  void FcmpCltS(SimdRegister fj, SimdRegister fk) {
+    Emit32(0x0c11'0000 | EncodeVk(fk) | EncodeVj(fj));
+  }
+  void Movcf2gr(Register rd) { Emit32(0x0114'dc00 | EncodeRd(rd)); }
   void VfmaddS(SimdRegister vd, SimdRegister vj, SimdRegister vk, SimdRegister va) {
     Emit32(0x0910'0000 | EncodeVa(va) | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
   }
