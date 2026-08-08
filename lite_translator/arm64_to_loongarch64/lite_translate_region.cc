@@ -173,10 +173,14 @@ class LiteTranslator {
     if ((insn & 0xff20'fc00u) == 0x6e20'dc00u) {
       return TranslateFmul4S(insn);
     }
-    // FMUL Vd.4S, Vn.4S, Vm.S[0].  Other indexed lanes remain on the
-    // interpreter path until their split H/L encoding has independent tests.
-    if ((insn & 0xffe0'fc00u) == 0x4f80'9000u) {
-      return TranslateFmul4SByElementZero(insn);
+    if ((insn & 0xff20'fc00u) == 0x4e20'd400u) {
+      return TranslateFadd4S(insn);
+    }
+    if ((insn & 0xffc0'f400u) == 0x4f80'1000u) {
+      return TranslateFmla4SByElement(insn);
+    }
+    if ((insn & 0xffc0'f400u) == 0x4f80'9000u) {
+      return TranslateFmul4SByElement(insn);
     }
     if ((insn & 0xffff'fc00u) == 0x1e20'4000u) {
       return TranslateFmovS(insn);
@@ -630,14 +634,14 @@ class LiteTranslator {
     uint32_t amount = (insn >> 10) & 0x3f;
     uint32_t rn = (insn >> 5) & 31;
     uint32_t rd = insn & 31;
-    if (invert) {
-      return false;
-    }
-
     LoadXOrZero(rn, Assembler::t0);
     LoadXOrZero(rm, Assembler::t1);
     if (!ShiftOperand(Assembler::t1, shift_kind, amount, is_64_bit)) {
       return false;
+    }
+    if (invert) {
+      as_.Li(Assembler::t2, UINT64_MAX);
+      as_.Xor(Assembler::t1, Assembler::t1, Assembler::t2);
     }
     switch (opc) {
       case 0:
@@ -1323,13 +1327,39 @@ class LiteTranslator {
     return true;
   }
 
-  bool TranslateFmul4SByElementZero(uint32_t insn) {
+  bool TranslateFadd4S(uint32_t insn) {
     uint32_t rm = (insn >> 16) & 31;
     uint32_t rn = (insn >> 5) & 31;
     uint32_t rd = insn & 31;
     LoadV(rn, Assembler::vr1);
     LoadV(rm, Assembler::vr2);
-    as_.VreplveiW(Assembler::vr2, Assembler::vr2, 0);
+    as_.VfaddS(Assembler::vr0, Assembler::vr1, Assembler::vr2);
+    StoreV(rd, Assembler::vr0);
+    return true;
+  }
+
+  bool TranslateFmla4SByElement(uint32_t insn) {
+    uint32_t rm = (((insn >> 20) & 1) << 4) | ((insn >> 16) & 15);
+    uint32_t index = (((insn >> 11) & 1) << 1) | ((insn >> 21) & 1);
+    uint32_t rn = (insn >> 5) & 31;
+    uint32_t rd = insn & 31;
+    LoadV(rn, Assembler::vr1);
+    LoadV(rm, Assembler::vr2);
+    LoadV(rd, Assembler::vr0);
+    as_.VreplveiW(Assembler::vr2, Assembler::vr2, index);
+    as_.VfmaddS(Assembler::vr0, Assembler::vr1, Assembler::vr2, Assembler::vr0);
+    StoreV(rd, Assembler::vr0);
+    return true;
+  }
+
+  bool TranslateFmul4SByElement(uint32_t insn) {
+    uint32_t rm = (((insn >> 20) & 1) << 4) | ((insn >> 16) & 15);
+    uint32_t index = (((insn >> 11) & 1) << 1) | ((insn >> 21) & 1);
+    uint32_t rn = (insn >> 5) & 31;
+    uint32_t rd = insn & 31;
+    LoadV(rn, Assembler::vr1);
+    LoadV(rm, Assembler::vr2);
+    as_.VreplveiW(Assembler::vr2, Assembler::vr2, index);
     as_.VfmulS(Assembler::vr0, Assembler::vr1, Assembler::vr2);
     StoreV(rd, Assembler::vr0);
     return true;

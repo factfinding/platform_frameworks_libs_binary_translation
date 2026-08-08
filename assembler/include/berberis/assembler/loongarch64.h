@@ -207,6 +207,9 @@ class Assembler : public AssemblerBase {
   void VfmulS(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
     Emit32(0x7138'8000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
   }
+  void VfaddS(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
+    Emit32(0x7130'8000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
+  }
   void VfmaddS(SimdRegister vd, SimdRegister vj, SimdRegister vk, SimdRegister va) {
     Emit32(0x0910'0000 | EncodeVa(va) | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
   }

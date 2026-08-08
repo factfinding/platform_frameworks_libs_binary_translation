@@ -289,6 +289,30 @@ TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesShiftedIntegerOperations) {
   EXPECT_EQ(state.cpu.x[5], 60u);
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteInvertedLogicalShiftedMatchesInterpreter) {
+  // bic x3, x1, x2; orn w4, wzr, w2 (mvn w4, w2); eon x5, x1, x2;
+  // bics w6, w1, w2
+  constexpr std::array<uint32_t, 4> kGuestCode = {
+      0x8a22'0023, 0x2a22'03e4, 0xca22'0025, 0x6a22'0026};
+  ThreadState interpreted{};
+  interpreted.cpu.x[1] = 0x0123'4567'89ab'cdef;
+  interpreted.cpu.x[2] = 0xfedc'ba98'7654'3210;
+  SetInsnAddr(interpreted.cpu, ToGuestAddr(kGuestCode.data()));
+
+  ThreadState translated{};
+  translated.cpu.x[1] = interpreted.cpu.x[1];
+  translated.cpu.x[2] = interpreted.cpu.x[2];
+  for (size_t i = 0; i < kGuestCode.size(); ++i) {
+    InterpretInsn(&interpreted);
+  }
+  TranslateAndRun(kGuestCode, &translated);
+
+  for (uint32_t rd : {3u, 4u, 5u, 6u}) {
+    EXPECT_EQ(translated.cpu.x[rd], interpreted.cpu.x[rd]) << rd;
+  }
+  EXPECT_EQ(translated.cpu.flags, interpreted.cpu.flags);
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesBitfieldExtracts) {
   // sxth w7, w7; ubfx x2, x1, #8, #8; sbfx x3, x1, #8, #8
   constexpr std::array<uint32_t, 3> kGuestCode = {0x1300'3ce7, 0xd348'3c22, 0x9348'3c23};
@@ -954,7 +978,11 @@ TEST(LoongArch64RuntimeLibraryTest, LiteLsxVectorFloatMatchesInterpreter) {
   // fmla v0.4s, v1.4s, v2.4s
   // fmul v3.4s, v1.4s, v2.4s
   // fmul v4.4s, v1.4s, v2.s[0]
-  constexpr std::array<uint32_t, 3> kGuestCode = {0x4e22'cc20, 0x6e22'dc23, 0x4f82'9024};
+  // fmla v22.4s, v18.4s, v4.s[3]
+  // fmul v17.4s, v5.4s, v0.s[2]
+  // fadd v2.4s, v2.4s, v3.4s
+  constexpr std::array<uint32_t, 6> kGuestCode = {
+      0x4e22'cc20, 0x6e22'dc23, 0x4f82'9024, 0x4fa4'1a56, 0x4f80'98b1, 0x4e23'd442};
   for (uint32_t insn : kGuestCode) {
     const std::array<uint32_t, 1> one_insn = {insn};
     ThreadState interpreted{};
@@ -963,8 +991,16 @@ TEST(LoongArch64RuntimeLibraryTest, LiteLsxVectorFloatMatchesInterpreter) {
       state->cpu.v[0] = MakeUint32x4(0x3f00'0000, 0xbf80'0000, 0x4000'0000, 0xc040'0000);
       state->cpu.v[1] = MakeUint32x4(0x3fc0'0000, 0xc000'0000, 0x4080'0000, 0x3e80'0000);
       state->cpu.v[2] = MakeUint32x4(0x4000'0000, 0x3f00'0000, 0xbf80'0000, 0x4100'0000);
-      state->cpu.v[3] = MakeUint128(UINT64_MAX, UINT64_MAX);
-      state->cpu.v[4] = MakeUint128(UINT64_MAX, UINT64_MAX);
+      state->cpu.v[3] =
+          MakeUint32x4(0x3e80'0000, 0x3f00'0000, 0xbf80'0000, 0x4100'0000);
+      state->cpu.v[4] =
+          MakeUint32x4(0x3f80'0000, 0xc000'0000, 0x4040'0000, 0xbf00'0000);
+      state->cpu.v[5] =
+          MakeUint32x4(0x3f80'0000, 0x4000'0000, 0x4040'0000, 0x4080'0000);
+      state->cpu.v[18] =
+          MakeUint32x4(0x3f00'0000, 0xbf00'0000, 0x40a0'0000, 0xc0c0'0000);
+      state->cpu.v[22] =
+          MakeUint32x4(0x3f80'0000, 0x4000'0000, 0x4040'0000, 0x4080'0000);
     };
     initialize(&interpreted);
     initialize(&translated);
