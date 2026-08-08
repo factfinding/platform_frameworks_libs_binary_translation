@@ -120,6 +120,7 @@ class Assembler : public AssemblerBase {
   void And(Register rd, Register rj, Register rk) { Emit3R(0x0014'8000, rd, rj, rk); }
   void Or(Register rd, Register rj, Register rk) { Emit3R(0x0015'0000, rd, rj, rk); }
   void Xor(Register rd, Register rj, Register rk) { Emit3R(0x0015'8000, rd, rj, rk); }
+  void MulD(Register rd, Register rj, Register rk) { Emit3R(0x001d'8000, rd, rj, rk); }
 
   void AddiD(Register rd, Register rj, int32_t imm12) {
     Emit2RI12(0x02c0'0000, rd, rj, EncodeSigned(imm12, 12));

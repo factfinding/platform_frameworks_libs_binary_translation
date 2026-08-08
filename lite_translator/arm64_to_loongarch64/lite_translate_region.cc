@@ -145,6 +145,9 @@ class LiteTranslator {
     if ((insn & 0x1fe0'0800u) == 0x1a80'0000u) {
       return TranslateConditionalSelect(insn);
     }
+    if ((insn & 0x7fe0'0000u) == 0x1b00'0000u) {
+      return TranslateMultiplyAddSub(insn);
+    }
     if ((insn & 0x7fe0'fc00u) == 0x1ac0'2000u || (insn & 0x7fe0'fc00u) == 0x1ac0'2400u ||
         (insn & 0x7fe0'fc00u) == 0x1ac0'2800u || (insn & 0x7fe0'fc00u) == 0x1ac0'2c00u ||
         (insn & 0x7fe0'fc00u) == 0x1ac0'0800u || (insn & 0x7fe0'fc00u) == 0x1ac0'0c00u) {
@@ -764,6 +767,30 @@ class LiteTranslator {
       }
       default:
         return false;
+    }
+    if (!is_64_bit) {
+      ZeroExtend32(Assembler::t0);
+    }
+    StoreXOrDiscard(rd, Assembler::t0);
+    return true;
+  }
+
+  bool TranslateMultiplyAddSub(uint32_t insn) {
+    const bool is_64_bit = (insn >> 31) != 0;
+    const bool subtract = ((insn >> 15) & 1) != 0;
+    const uint32_t rm = (insn >> 16) & 31;
+    const uint32_t ra = (insn >> 10) & 31;
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+
+    LoadXOrZero(rn, Assembler::t0);
+    LoadXOrZero(rm, Assembler::t1);
+    as_.MulD(Assembler::t0, Assembler::t0, Assembler::t1);
+    LoadXOrZero(ra, Assembler::t2);
+    if (subtract) {
+      as_.SubD(Assembler::t0, Assembler::t2, Assembler::t0);
+    } else {
+      as_.AddD(Assembler::t0, Assembler::t0, Assembler::t2);
     }
     if (!is_64_bit) {
       ZeroExtend32(Assembler::t0);

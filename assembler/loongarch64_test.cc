@@ -35,6 +35,7 @@ TEST(LoongArch64AssemblerTest, EncodesBootstrapInstructions) {
   assembler.And(Assembler::s0, Assembler::s1, Assembler::s2);
   assembler.Or(Assembler::a0, Assembler::a1, Assembler::zero);
   assembler.Xor(Assembler::a0, Assembler::a1, Assembler::a2);
+  assembler.MulD(Assembler::t0, Assembler::t1, Assembler::t2);
   assembler.AddiD(Assembler::a0, Assembler::a1, -16);
   assembler.Lu12iW(Assembler::a0, 0x12345);
   assembler.Ori(Assembler::a0, Assembler::a0, 0x678);
@@ -63,12 +64,12 @@ TEST(LoongArch64AssemblerTest, EncodesBootstrapInstructions) {
 
   // Values are generated independently with LLVM 21 llvm-mc for the
   // loongarch64 target. MachineCode stores words in target little endian.
-  constexpr std::array<uint32_t, 30> kExpected = {
-      0x001098a4, 0x0011b9ac, 0x0014e717, 0x001500a4, 0x001598a4, 0x02ffc0a4,
-      0x142468a4, 0x0399e084, 0x162468a4, 0x03048c84, 0x28c060a4, 0x288050a4,
-      0x2a8050a4, 0x2a0040a4, 0x2a4030a4, 0x29ffe0a4, 0x29bff0a4, 0x297ff8a4,
-      0x293ffca4, 0x58000885, 0x5c000885, 0x68000885, 0x40000880, 0x44000880,
-      0x50000800, 0x54000800, 0x4c000081, 0x00411ca4, 0x00451ca4, 0x00491ca4,
+  constexpr std::array<uint32_t, 31> kExpected = {
+      0x001098a4, 0x0011b9ac, 0x0014e717, 0x001500a4, 0x001598a4, 0x001db9ac, 0x02ffc0a4,
+      0x142468a4, 0x0399e084, 0x162468a4, 0x03048c84, 0x28c060a4, 0x288050a4, 0x2a8050a4,
+      0x2a0040a4, 0x2a4030a4, 0x29ffe0a4, 0x29bff0a4, 0x297ff8a4, 0x293ffca4, 0x58000885,
+      0x5c000885, 0x68000885, 0x40000880, 0x44000880, 0x50000800, 0x54000800, 0x4c000081,
+      0x00411ca4, 0x00451ca4, 0x00491ca4,
   };
 
   ASSERT_EQ(code.install_size(), sizeof(kExpected));

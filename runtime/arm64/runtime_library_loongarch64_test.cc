@@ -379,6 +379,25 @@ TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesVariableShiftsAndDivision) {
   EXPECT_EQ(edge_state.cpu.x[17], UINT32_C(0x8000'0000));
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesMultiplyAddSub) {
+  // mul/madd/msub x[4-6], x0, x1, x2; then the equivalent W operations.
+  constexpr std::array<uint32_t, 6> kGuestCode = {
+      0x9b01'7c04, 0x9b01'0805, 0x9b01'8806, 0x1b01'7c07, 0x1b01'0808, 0x1b01'8809};
+
+  ThreadState state{};
+  state.cpu.x[0] = UINT64_MAX;
+  state.cpu.x[1] = 3;
+  state.cpu.x[2] = 10;
+  TranslateAndRun(kGuestCode, &state);
+
+  EXPECT_EQ(state.cpu.x[4], UINT64_MAX - 2);
+  EXPECT_EQ(state.cpu.x[5], 7u);
+  EXPECT_EQ(state.cpu.x[6], 13u);
+  EXPECT_EQ(state.cpu.x[7], UINT32_MAX - 2);
+  EXPECT_EQ(state.cpu.x[8], 7u);
+  EXPECT_EQ(state.cpu.x[9], 13u);
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesLogicalImmediates) {
   // and w9, w8, #0xff; orr x3, x1, #0xff00; eor x4, x1, #0xff
   constexpr std::array<uint32_t, 3> kGuestCode = {0x1200'1d09, 0xb278'1c23, 0xd240'1c24};
