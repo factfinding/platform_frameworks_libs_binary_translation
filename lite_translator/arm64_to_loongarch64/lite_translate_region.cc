@@ -145,6 +145,18 @@ class LiteTranslator {
       }
       return TranslateLoadStorePair(insn, pc);
     }
+    if ((insn & 0x3e00'0000u) == 0x2c00'0000u) {
+      if (!enable_guest_memory_) {
+        return false;
+      }
+      return TranslateSimdLoadStorePair(insn, pc);
+    }
+    // DUP Vd.16B, Wn.  This is the hottest SIMD-copy form in the current
+    // Unity workload.  Keep the initial LA64 implementation deliberately
+    // narrow until the other lane widths have independent validation.
+    if ((insn & 0xffff'fc00u) == 0x4e01'0c00u) {
+      return TranslateDup16B(insn);
+    }
     if ((insn & 0x1fe0'0800u) == 0x1a80'0000u) {
       return TranslateConditionalSelect(insn);
     }
@@ -269,6 +281,10 @@ class LiteTranslator {
  private:
   static constexpr int32_t XOffset(uint32_t reg) {
     return offsetof(ThreadState, cpu) + offsetof(CPUState, x) + reg * sizeof(uint64_t);
+  }
+
+  static constexpr int32_t VOffset(uint32_t reg) {
+    return offsetof(ThreadState, cpu) + offsetof(CPUState, v) + reg * sizeof(__uint128_t);
   }
 
   void LoadXOrZero(uint32_t reg, Register dst) {
@@ -874,11 +890,21 @@ class LiteTranslator {
   }
 
   bool TranslateLoadStoreUnsignedImmediate(uint32_t insn, GuestAddr pc) {
-    // Bit 26 selects the SIMD&FP register bank.  The top-level class mask is
-    // shared with integer loads/stores, but this bootstrap backend only
-    // synchronizes general-purpose registers in CPUState.
     if ((insn & 0x0400'0000u) != 0) {
-      return false;
+      uint32_t size = insn >> 30;
+      uint32_t opc = (insn >> 22) & 3;
+      if (size != 0 || (opc != 2 && opc != 3)) {
+        return false;
+      }
+      uint32_t imm12 = (insn >> 10) & 0xfff;
+      uint32_t rn = (insn >> 5) & 31;
+      uint32_t rt = insn & 31;
+      LoadXOrSp(rn, Assembler::t0);
+      as_.Li(Assembler::t1, static_cast<uint64_t>(imm12) << 4);
+      as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
+      ApplyTbi(Assembler::t0);
+      EmitSimd128LoadStore(opc == 2, rt, pc);
+      return true;
     }
     uint32_t size = insn >> 30;
     uint32_t opc = (insn >> 22) & 3;
@@ -900,7 +926,31 @@ class LiteTranslator {
 
   bool TranslateLoadStoreIndexed(uint32_t insn, GuestAddr pc) {
     if ((insn & 0x0400'0000u) != 0) {
-      return false;
+      uint32_t size = insn >> 30;
+      uint32_t opc = (insn >> 22) & 3;
+      int64_t offset = SignExtend((insn >> 12) & 0x1ff, 9);
+      uint32_t mode = (insn >> 10) & 3;
+      uint32_t rn = (insn >> 5) & 31;
+      uint32_t rt = insn & 31;
+      bool writeback = mode == 1 || mode == 3;
+      if (size != 0 || (opc != 2 && opc != 3) || mode == 2) {
+        return false;
+      }
+
+      LoadXOrSp(rn, Assembler::t0);
+      if (mode == 0 || mode == 3) {
+        as_.Li(Assembler::t1, offset);
+        as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
+      }
+      ApplyTbi(Assembler::t0);
+      EmitSimd128LoadStore(opc == 2, rt, pc);
+      if (writeback) {
+        LoadXOrSp(rn, Assembler::t0);
+        as_.Li(Assembler::t1, offset);
+        as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
+        StoreXOrSp(rn, Assembler::t0);
+      }
+      return true;
     }
     uint32_t size = insn >> 30;
     uint32_t opc = (insn >> 22) & 3;
@@ -932,7 +982,32 @@ class LiteTranslator {
 
   bool TranslateLoadStoreRegisterOffset(uint32_t insn, GuestAddr pc) {
     if ((insn & 0x0400'0000u) != 0) {
-      return false;
+      uint32_t size = insn >> 30;
+      uint32_t opc = (insn >> 22) & 3;
+      uint32_t rm = (insn >> 16) & 31;
+      uint32_t option = (insn >> 13) & 7;
+      bool scaled = ((insn >> 12) & 1) != 0;
+      uint32_t rn = (insn >> 5) & 31;
+      uint32_t rt = insn & 31;
+      if (size != 0 || (opc != 2 && opc != 3) ||
+          (option != 2 && option != 3 && option != 6 && option != 7)) {
+        return false;
+      }
+
+      LoadXOrSp(rn, Assembler::t0);
+      LoadXOrZero(rm, Assembler::t1);
+      if (option == 2) {
+        ZeroExtend32(Assembler::t1);
+      } else if (option == 6) {
+        SignExtend32(Assembler::t1);
+      }
+      if (scaled) {
+        as_.SlliD(Assembler::t1, Assembler::t1, 4);
+      }
+      as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
+      ApplyTbi(Assembler::t0);
+      EmitSimd128LoadStore(opc == 2, rt, pc);
+      return true;
     }
     uint32_t size = insn >> 30;
     uint32_t opc = (insn >> 22) & 3;
@@ -1025,6 +1100,104 @@ class LiteTranslator {
       StoreXOrSp(rn, Assembler::t0);
     }
     return true;
+  }
+
+  bool TranslateSimdLoadStorePair(uint32_t insn, GuestAddr pc) {
+    uint32_t opc = insn >> 30;
+    uint32_t mode = (insn >> 23) & 3;
+    bool load = ((insn >> 22) & 1) != 0;
+    int64_t imm7 = SignExtend((insn >> 15) & 0x7f, 7);
+    uint32_t rt2 = (insn >> 10) & 31;
+    uint32_t rn = (insn >> 5) & 31;
+    uint32_t rt = insn & 31;
+    if (opc != 2 || mode == 0 || (load && rt == rt2)) {
+      return false;
+    }
+    int64_t offset = imm7 * 16;
+
+    LoadXOrSp(rn, Assembler::t0);
+    if (mode != 1) {
+      as_.Li(Assembler::t1, offset);
+      as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
+    }
+    ApplyTbi(Assembler::t0);
+    Assembler::Label* recovery = as_.MakeLabel();
+    Assembler::Label* done = as_.MakeLabel();
+    if (load) {
+      as_.SetRecoveryPoint(recovery);
+      as_.LdD(Assembler::t1, Assembler::t0, 0);
+      as_.SetRecoveryPoint(recovery);
+      as_.LdD(Assembler::t2, Assembler::t0, 8);
+      as_.SetRecoveryPoint(recovery);
+      as_.LdD(Assembler::t3, Assembler::t0, 16);
+      as_.SetRecoveryPoint(recovery);
+      as_.LdD(Assembler::t4, Assembler::t0, 24);
+      as_.StD(Assembler::t1, Assembler::s8, VOffset(rt));
+      as_.StD(Assembler::t2, Assembler::s8, VOffset(rt) + 8);
+      as_.StD(Assembler::t3, Assembler::s8, VOffset(rt2));
+      as_.StD(Assembler::t4, Assembler::s8, VOffset(rt2) + 8);
+    } else {
+      as_.LdD(Assembler::t1, Assembler::s8, VOffset(rt));
+      as_.LdD(Assembler::t2, Assembler::s8, VOffset(rt) + 8);
+      as_.LdD(Assembler::t3, Assembler::s8, VOffset(rt2));
+      as_.LdD(Assembler::t4, Assembler::s8, VOffset(rt2) + 8);
+      as_.SetRecoveryPoint(recovery);
+      as_.StD(Assembler::t1, Assembler::t0, 0);
+      as_.SetRecoveryPoint(recovery);
+      as_.StD(Assembler::t2, Assembler::t0, 8);
+      as_.SetRecoveryPoint(recovery);
+      as_.StD(Assembler::t3, Assembler::t0, 16);
+      as_.SetRecoveryPoint(recovery);
+      as_.StD(Assembler::t4, Assembler::t0, 24);
+    }
+    as_.B(*done);
+    as_.Bind(recovery);
+    ExitGeneratedCode(pc);
+    as_.Bind(done);
+    if (mode == 1 || mode == 3) {
+      LoadXOrSp(rn, Assembler::t0);
+      as_.Li(Assembler::t1, offset);
+      as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
+      StoreXOrSp(rn, Assembler::t0);
+    }
+    return true;
+  }
+
+  bool TranslateDup16B(uint32_t insn) {
+    uint32_t rn = (insn >> 5) & 31;
+    uint32_t rd = insn & 31;
+    LoadXOrZero(rn, Assembler::t0);
+    as_.Li(Assembler::t1, 0xff);
+    as_.And(Assembler::t0, Assembler::t0, Assembler::t1);
+    as_.Li(Assembler::t1, 0x0101'0101'0101'0101ULL);
+    as_.MulD(Assembler::t0, Assembler::t0, Assembler::t1);
+    as_.StD(Assembler::t0, Assembler::s8, VOffset(rd));
+    as_.StD(Assembler::t0, Assembler::s8, VOffset(rd) + 8);
+    return true;
+  }
+
+  void EmitSimd128LoadStore(bool is_store, uint32_t rt, GuestAddr pc) {
+    Assembler::Label* recovery = as_.MakeLabel();
+    Assembler::Label* done = as_.MakeLabel();
+    if (!is_store) {
+      as_.SetRecoveryPoint(recovery);
+      as_.LdD(Assembler::t1, Assembler::t0, 0);
+      as_.SetRecoveryPoint(recovery);
+      as_.LdD(Assembler::t2, Assembler::t0, 8);
+      as_.StD(Assembler::t1, Assembler::s8, VOffset(rt));
+      as_.StD(Assembler::t2, Assembler::s8, VOffset(rt) + 8);
+    } else {
+      as_.LdD(Assembler::t1, Assembler::s8, VOffset(rt));
+      as_.LdD(Assembler::t2, Assembler::s8, VOffset(rt) + 8);
+      as_.SetRecoveryPoint(recovery);
+      as_.StD(Assembler::t1, Assembler::t0, 0);
+      as_.SetRecoveryPoint(recovery);
+      as_.StD(Assembler::t2, Assembler::t0, 8);
+    }
+    as_.B(*done);
+    as_.Bind(recovery);
+    ExitGeneratedCode(pc);
+    as_.Bind(done);
   }
 
   void EmitLoadStore(uint32_t size, uint32_t opc, uint32_t rt, GuestAddr pc) {

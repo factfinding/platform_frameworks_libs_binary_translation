@@ -78,6 +78,10 @@ void TranslateAndRun(const std::array<uint32_t, kSize>& guest_code, ThreadState*
   berberis_RunGeneratedCode(state, AsHostCode(exec.GetHostCodeAddr()));
 }
 
+constexpr __uint128_t MakeUint128(uint64_t low, uint64_t high) {
+  return static_cast<__uint128_t>(low) | (static_cast<__uint128_t>(high) << 64);
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesMoveWideAndAddSubImmediate) {
   // movz x0, #0x1234; add x1, x0, #5; movk x1, #0xabcd, lsl #16;
   // sub w2, w1, #1
@@ -815,6 +819,8 @@ TEST(LoongArch64RuntimeLibraryTest, GuestMemoryCanBeKeptInInterpreter) {
 }
 
 TEST(LoongArch64RuntimeLibraryTest, LiteRejectsSimdLoadsAndStores) {
+  // Scalar SIMD/FP memory remains in the interpreter.  Q-register memory is
+  // covered independently below.
   // ldr d0, [x1]; str d2, [x3]; ldr d4, [x5], #8; str d6, [x7, #-8]!
   constexpr std::array<uint32_t, 4> kGuestCode = {
       0xfd40'0020, 0xfd00'0062, 0xfc40'84a4, 0xfc1f'8ce6};
@@ -831,6 +837,66 @@ TEST(LoongArch64RuntimeLibraryTest, LiteRejectsSimdLoadsAndStores) {
     EXPECT_FALSE(success) << std::hex << insn;
     EXPECT_EQ(stop_pc, start_pc) << std::hex << insn;
   }
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesSimd128LoadsAndStores) {
+  // ldr q1, [x0, #16]; str q1, [x0, #32]
+  // ldr q2, [x0, x3]; str q2, [x0, x4, lsl #4]
+  constexpr std::array<uint32_t, 4> kGuestCode = {
+      0x3dc0'0401, 0x3d80'0801, 0x3ce3'6802, 0x3ca4'7802};
+  std::array<uint64_t, 8> memory = {
+      0x0123'4567'89ab'cdef,
+      0xfedc'ba98'7654'3210,
+      0x1122'3344'5566'7788,
+      0x99aa'bbcc'ddee'ff00,
+      0,
+      0,
+      0,
+      0,
+  };
+
+  ThreadState state{};
+  state.cpu.x[0] = ToGuestAddr(memory.data());
+  state.cpu.x[3] = 0;
+  state.cpu.x[4] = 3;
+  TranslateAndRun(kGuestCode, &state);
+
+  EXPECT_EQ(state.cpu.v[1], MakeUint128(memory[2], memory[3]));
+  EXPECT_EQ(memory[4], memory[2]);
+  EXPECT_EQ(memory[5], memory[3]);
+  EXPECT_EQ(state.cpu.v[2], MakeUint128(memory[0], memory[1]));
+  EXPECT_EQ(memory[6], memory[0]);
+  EXPECT_EQ(memory[7], memory[1]);
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesSimd128Pairs) {
+  // stp q0, q1, [x2]; ldp q3, q4, [x2]
+  constexpr std::array<uint32_t, 2> kGuestCode = {0xad00'0440, 0xad40'1043};
+  std::array<uint64_t, 4> memory{};
+
+  ThreadState state{};
+  state.cpu.x[2] = ToGuestAddr(memory.data());
+  state.cpu.v[0] = MakeUint128(0x0123'4567'89ab'cdef, 0xfedc'ba98'7654'3210);
+  state.cpu.v[1] = MakeUint128(0x1122'3344'5566'7788, 0x99aa'bbcc'ddee'ff00);
+  TranslateAndRun(kGuestCode, &state);
+
+  EXPECT_EQ(state.cpu.v[3], state.cpu.v[0]);
+  EXPECT_EQ(state.cpu.v[4], state.cpu.v[1]);
+  EXPECT_EQ(memory[0], 0x0123'4567'89ab'cdefu);
+  EXPECT_EQ(memory[1], 0xfedc'ba98'7654'3210u);
+  EXPECT_EQ(memory[2], 0x1122'3344'5566'7788u);
+  EXPECT_EQ(memory[3], 0x99aa'bbcc'ddee'ff00u);
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesDup16B) {
+  // dup v0.16b, w1
+  constexpr std::array<uint32_t, 1> kGuestCode = {0x4e01'0c20};
+  ThreadState state{};
+  state.cpu.x[1] = 0x1234'5678'9abc'de5a;
+
+  TranslateAndRun(kGuestCode, &state);
+
+  EXPECT_EQ(state.cpu.v[0], MakeUint128(0x5a5a'5a5a'5a5a'5a5a, 0x5a5a'5a5a'5a5a'5a5a));
 }
 
 TEST(LoongArch64RuntimeLibraryTest, LiteRejectsConstrainedUnpredictableLoadPair) {
