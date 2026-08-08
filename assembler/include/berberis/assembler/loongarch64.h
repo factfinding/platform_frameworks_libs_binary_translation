@@ -40,6 +40,18 @@ class Register {
   uint8_t num_;
 };
 
+class SimdRegister {
+ public:
+  constexpr bool operator==(const SimdRegister& other) const { return num_ == other.num_; }
+  constexpr bool operator!=(const SimdRegister& other) const { return num_ != other.num_; }
+  constexpr uint8_t GetPhysicalIndex() const { return num_; }
+
+ private:
+  friend class Assembler;
+  explicit constexpr SimdRegister(uint8_t num) : num_(num) {}
+  uint8_t num_;
+};
+
 // Minimal LA64 assembler used to bootstrap the ARM64-to-LoongArch64 lite JIT.
 // Keep encoders explicit until the supported instruction set is large enough
 // to justify extending the generated assembler tables.
@@ -79,6 +91,19 @@ class Assembler : public AssemblerBase {
   BERBERIS_DEFINE_LOONGARCH_REGISTER(r30, 30);
   BERBERIS_DEFINE_LOONGARCH_REGISTER(r31, 31);
 #undef BERBERIS_DEFINE_LOONGARCH_REGISTER
+
+#define BERBERIS_DEFINE_LOONGARCH_SIMD_REGISTER(name, number) \
+  static constexpr SimdRegister name{number}
+  BERBERIS_DEFINE_LOONGARCH_SIMD_REGISTER(vr0, 0);
+  BERBERIS_DEFINE_LOONGARCH_SIMD_REGISTER(vr1, 1);
+  BERBERIS_DEFINE_LOONGARCH_SIMD_REGISTER(vr2, 2);
+  BERBERIS_DEFINE_LOONGARCH_SIMD_REGISTER(vr3, 3);
+  BERBERIS_DEFINE_LOONGARCH_SIMD_REGISTER(vr4, 4);
+  BERBERIS_DEFINE_LOONGARCH_SIMD_REGISTER(vr5, 5);
+  BERBERIS_DEFINE_LOONGARCH_SIMD_REGISTER(vr6, 6);
+  BERBERIS_DEFINE_LOONGARCH_SIMD_REGISTER(vr7, 7);
+  BERBERIS_DEFINE_LOONGARCH_SIMD_REGISTER(vr8, 8);
+#undef BERBERIS_DEFINE_LOONGARCH_SIMD_REGISTER
 
   // LoongArch ELF psABI aliases.
   static constexpr Register zero = r0;
@@ -171,6 +196,26 @@ class Assembler : public AssemblerBase {
   }
   void StB(Register rd, Register rj, int32_t imm12) {
     Emit2RI12(0x2900'0000, rd, rj, EncodeSigned(imm12, 12));
+  }
+
+  void Vld(SimdRegister vd, Register rj, int32_t imm12) {
+    Emit32(0x2c00'0000 | (EncodeSigned(imm12, 12) << 10) | EncodeRj(rj) | EncodeVd(vd));
+  }
+  void Vst(SimdRegister vd, Register rj, int32_t imm12) {
+    Emit32(0x2c40'0000 | (EncodeSigned(imm12, 12) << 10) | EncodeRj(rj) | EncodeVd(vd));
+  }
+  void VfmulS(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
+    Emit32(0x7138'8000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
+  }
+  void VfmaddS(SimdRegister vd, SimdRegister vj, SimdRegister vk, SimdRegister va) {
+    Emit32(0x0910'0000 | EncodeVa(va) | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
+  }
+  void Vreplgr2vrW(SimdRegister vd, Register rj) {
+    Emit32(0x729f'0800 | EncodeRj(rj) | EncodeVd(vd));
+  }
+  void VreplveiW(SimdRegister vd, SimdRegister vj, uint32_t index) {
+    CHECK_LT(index, 4u);
+    Emit32(0x72f7'e000 | (index << 10) | EncodeVj(vj) | EncodeVd(vd));
   }
 
   void SlliD(Register rd, Register rj, uint32_t shift) { Emit2RI6(0x0041'0000, rd, rj, shift); }
@@ -279,6 +324,10 @@ class Assembler : public AssemblerBase {
   static uint32_t EncodeRd(Register rd) { return rd.num_; }
   static uint32_t EncodeRj(Register rj) { return static_cast<uint32_t>(rj.num_) << 5; }
   static uint32_t EncodeRk(Register rk) { return static_cast<uint32_t>(rk.num_) << 10; }
+  static uint32_t EncodeVd(SimdRegister vd) { return vd.num_; }
+  static uint32_t EncodeVj(SimdRegister vj) { return static_cast<uint32_t>(vj.num_) << 5; }
+  static uint32_t EncodeVk(SimdRegister vk) { return static_cast<uint32_t>(vk.num_) << 10; }
+  static uint32_t EncodeVa(SimdRegister va) { return static_cast<uint32_t>(va.num_) << 15; }
 
   static uint32_t EncodeSigned(int32_t value, uint32_t width) {
     int32_t min = -(1 << (width - 1));

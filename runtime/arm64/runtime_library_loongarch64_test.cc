@@ -82,6 +82,11 @@ constexpr __uint128_t MakeUint128(uint64_t low, uint64_t high) {
   return static_cast<__uint128_t>(low) | (static_cast<__uint128_t>(high) << 64);
 }
 
+constexpr __uint128_t MakeUint32x4(uint32_t lane0, uint32_t lane1, uint32_t lane2, uint32_t lane3) {
+  return static_cast<__uint128_t>(lane0) | (static_cast<__uint128_t>(lane1) << 32) |
+         (static_cast<__uint128_t>(lane2) << 64) | (static_cast<__uint128_t>(lane3) << 96);
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesMoveWideAndAddSubImmediate) {
   // movz x0, #0x1234; add x1, x0, #5; movk x1, #0xabcd, lsl #16;
   // sub w2, w1, #1
@@ -864,8 +869,8 @@ TEST(LoongArch64RuntimeLibraryTest, GuestMemoryCanBeKeptInInterpreter) {
 }
 
 TEST(LoongArch64RuntimeLibraryTest, LiteRejectsSimdLoadsAndStores) {
-  // Scalar SIMD/FP memory remains in the interpreter.  Q-register memory is
-  // covered independently below.
+  // Scalar D-register memory remains in the interpreter.  S- and Q-register
+  // memory are covered independently below.
   // ldr d0, [x1]; str d2, [x3]; ldr d4, [x5], #8; str d6, [x7, #-8]!
   constexpr std::array<uint32_t, 4> kGuestCode = {
       0xfd40'0020, 0xfd00'0062, 0xfc40'84a4, 0xfc1f'8ce6};
@@ -882,6 +887,64 @@ TEST(LoongArch64RuntimeLibraryTest, LiteRejectsSimdLoadsAndStores) {
     EXPECT_FALSE(success) << std::hex << insn;
     EXPECT_EQ(stop_pc, start_pc) << std::hex << insn;
   }
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesSimd32LoadsAndStores) {
+  // ldr s9, [x10, w11, sxtw #2]; str s9, [x10, #4]
+  constexpr std::array<uint32_t, 2> kGuestCode = {0xbc6b'd949, 0xbd00'0549};
+  std::array<uint32_t, 4> memory = {0x1111'1111, 0, 0x4049'0fdb, 0x4444'4444};
+
+  ThreadState state{};
+  state.cpu.x[10] = ToGuestAddr(memory.data());
+  state.cpu.x[11] = 2;
+  state.cpu.v[9] = MakeUint128(UINT64_MAX, UINT64_MAX);
+  TranslateAndRun(kGuestCode, &state);
+
+  EXPECT_EQ(state.cpu.v[9], static_cast<__uint128_t>(memory[2]));
+  EXPECT_EQ(memory[1], memory[2]);
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteLsxVectorFloatMatchesInterpreter) {
+  // fmla v0.4s, v1.4s, v2.4s
+  // fmul v3.4s, v1.4s, v2.4s
+  // fmul v4.4s, v1.4s, v2.s[0]
+  constexpr std::array<uint32_t, 3> kGuestCode = {0x4e22'cc20, 0x6e22'dc23, 0x4f82'9024};
+  for (uint32_t insn : kGuestCode) {
+    const std::array<uint32_t, 1> one_insn = {insn};
+    ThreadState interpreted{};
+    ThreadState translated{};
+    auto initialize = [](ThreadState* state) {
+      state->cpu.v[0] = MakeUint32x4(0x3f00'0000, 0xbf80'0000, 0x4000'0000, 0xc040'0000);
+      state->cpu.v[1] = MakeUint32x4(0x3fc0'0000, 0xc000'0000, 0x4080'0000, 0x3e80'0000);
+      state->cpu.v[2] = MakeUint32x4(0x4000'0000, 0x3f00'0000, 0xbf80'0000, 0x4100'0000);
+      state->cpu.v[3] = MakeUint128(UINT64_MAX, UINT64_MAX);
+      state->cpu.v[4] = MakeUint128(UINT64_MAX, UINT64_MAX);
+    };
+    initialize(&interpreted);
+    initialize(&translated);
+    SetInsnAddr(interpreted.cpu, ToGuestAddr(one_insn.data()));
+
+    InterpretInsn(&interpreted);
+    TranslateAndRun(one_insn, &translated);
+
+    uint32_t rd = insn & 31;
+    SCOPED_TRACE(testing::Message() << "insn=" << std::hex << insn);
+    EXPECT_EQ(translated.cpu.v[rd], interpreted.cpu.v[rd]);
+  }
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesFmovSAndDup4S) {
+  // fmov s5, s6; dup v7.4s, w8
+  constexpr std::array<uint32_t, 2> kGuestCode = {0x1e20'40c5, 0x4e04'0d07};
+  ThreadState state{};
+  state.cpu.v[5] = MakeUint128(UINT64_MAX, UINT64_MAX);
+  state.cpu.v[6] = MakeUint32x4(0x4049'0fdb, 0x1111'1111, 0x2222'2222, 0x3333'3333);
+  state.cpu.x[8] = 0x0123'4567'89ab'cdef;
+
+  TranslateAndRun(kGuestCode, &state);
+
+  EXPECT_EQ(state.cpu.v[5], static_cast<__uint128_t>(0x4049'0fdb));
+  EXPECT_EQ(state.cpu.v[7], MakeUint32x4(0x89ab'cdef, 0x89ab'cdef, 0x89ab'cdef, 0x89ab'cdef));
 }
 
 TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesSimd128LoadsAndStores) {

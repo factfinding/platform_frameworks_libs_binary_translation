@@ -129,6 +129,27 @@ TEST(LoongArch64AssemblerTest, EncodesVariableShiftsAndDivision) {
   }
 }
 
+TEST(LoongArch64AssemblerTest, EncodesLsxFloatingPointInstructions) {
+  MachineCode code;
+  Assembler assembler(&code);
+
+  assembler.Vld(Assembler::vr0, Assembler::s8, 0);
+  assembler.Vst(Assembler::vr1, Assembler::s8, 16);
+  assembler.VfmulS(Assembler::vr2, Assembler::vr3, Assembler::vr4);
+  assembler.VfmaddS(Assembler::vr5, Assembler::vr6, Assembler::vr7, Assembler::vr8);
+  assembler.Vreplgr2vrW(Assembler::vr1, Assembler::t0);
+  assembler.VreplveiW(Assembler::vr2, Assembler::vr3, 0);
+  assembler.VreplveiW(Assembler::vr4, Assembler::vr5, 3);
+
+  // Generated independently with LLVM's LoongArch assembler and -mlsx.
+  constexpr std::array<uint32_t, 7> kExpected = {
+      0x2c00'03e0, 0x2c40'43e1, 0x7138'9062, 0x0914'1cc5, 0x729f'0981, 0x72f7'e062, 0x72f7'eca4};
+  ASSERT_EQ(code.install_size(), sizeof(kExpected));
+  for (size_t i = 0; i < kExpected.size(); ++i) {
+    EXPECT_EQ(*code.AddrAs<const uint32_t>(i * sizeof(uint32_t)), kExpected[i]) << i;
+  }
+}
+
 TEST(LoongArch64AssemblerTest, Materializes64BitImmediate) {
   MachineCode code;
   Assembler assembler(&code);
