@@ -125,6 +125,16 @@ class LiteTranslator {
     if ((insn & 0x1f00'0000u) == 0x1000'0000u) {
       return TranslatePcRelativeAddress(insn, pc);
     }
+    // Armv8.5 MTE tag loads/stores. Android code uses these instructions even
+    // when the host has no MTE backing. Keep their data and writeback effects
+    // in Lite JIT so a tag operation does not split an otherwise translatable
+    // memory-heavy region.
+    if ((insn & 0xff20'0000u) == 0xd920'0000u) {
+      if (!enable_guest_memory_) {
+        return false;
+      }
+      return TranslateMteLoadStore(insn, pc);
+    }
     if ((insn & 0x3b00'0000u) == 0x3900'0000u) {
       if (!enable_guest_memory_) {
         return false;
@@ -1287,6 +1297,79 @@ class LiteTranslator {
     as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
     ApplyTbi(Assembler::t0);
     EmitLoadStore(size, opc, rt, pc);
+    return true;
+  }
+
+  bool TranslateMteLoadStore(uint32_t insn, GuestAddr pc) {
+    const uint32_t opc = (insn >> 22) & 3;
+    const int64_t offset = SignExtend((insn >> 12) & 0x1ff, 9) * 16;
+    const uint32_t mode = (insn >> 10) & 3;
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rt = insn & 31;
+    const bool writeback = mode == 1 || mode == 3;
+
+    // Preserve the tagged architectural base. Post-index accesses the old
+    // base; offset and pre-index forms access base + immediate.
+    LoadXOrSp(rn, Assembler::t0);
+    as_.Move(Assembler::t1, Assembler::t0);
+    if (mode != 1) {
+      as_.Li(Assembler::t2, offset);
+      as_.AddD(Assembler::t1, Assembler::t1, Assembler::t2);
+    }
+
+    const bool is_ldg = opc == 1 && mode == 0;
+    const bool is_stzg = opc == 1 && mode != 0;
+    const bool is_stz2g = opc == 3 && mode != 0;
+    const bool is_ldgm = opc == 3 && mode == 0;
+
+    if (is_ldg) {
+      // No MTE backing means the loaded allocation tag is zero. LDG only
+      // replaces Rt[59:56], preserving every other bit of Rt.
+      if (rt != 31) {
+        LoadXOrZero(rt, Assembler::t2);
+        as_.Li(Assembler::t3, ~UINT64_C(0x0f00'0000'0000'0000));
+        as_.And(Assembler::t2, Assembler::t2, Assembler::t3);
+        StoreXOrDiscard(rt, Assembler::t2);
+      }
+    } else if (is_ldgm) {
+      // All packed tags read as zero without MTE backing.
+      StoreXOrDiscard(rt, Assembler::zero);
+    } else if (is_stzg || is_stz2g) {
+      // Tag-and-zero forms retain their data side effect. Align to the tag
+      // granule, strip TBI only from the effective host address, and attach a
+      // recovery entry to every store. Architectural writeback happens only
+      // after all stores succeed.
+      const uint64_t alignment_mask = is_stz2g ? ~UINT64_C(0x1f) : ~UINT64_C(0x0f);
+      as_.Li(Assembler::t2, alignment_mask);
+      as_.And(Assembler::t1, Assembler::t1, Assembler::t2);
+      ApplyTbi(Assembler::t1);
+
+      Assembler::Label* recovery = as_.MakeLabel();
+      Assembler::Label* done = as_.MakeLabel();
+      const uint32_t byte_count = is_stz2g ? 32 : 16;
+      for (uint32_t byte_offset = 0; byte_offset < byte_count; byte_offset += 8) {
+        as_.SetRecoveryPoint(recovery);
+        as_.StD(Assembler::zero, Assembler::t1, byte_offset);
+      }
+      if (writeback) {
+        as_.Li(Assembler::t2, offset);
+        as_.AddD(Assembler::t0, Assembler::t0, Assembler::t2);
+        StoreXOrSp(rn, Assembler::t0);
+      }
+      as_.B(*done);
+      as_.Bind(recovery);
+      ExitGeneratedCode(pc);
+      as_.Bind(done);
+      return true;
+    }
+    // STG/ST2G/STGM/STZGM are tag-only operations and become NOPs without
+    // MTE backing. Their pre/post-index forms still update the base register.
+
+    if (writeback) {
+      as_.Li(Assembler::t2, offset);
+      as_.AddD(Assembler::t0, Assembler::t0, Assembler::t2);
+      StoreXOrSp(rn, Assembler::t0);
+    }
     return true;
   }
 

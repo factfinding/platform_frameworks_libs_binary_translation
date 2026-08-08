@@ -997,6 +997,71 @@ TEST(LoongArch64RuntimeLibraryTest, LiteMemoryInstructionsHaveRecoveryPoints) {
   }
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesMteTagLoadsAndWriteback) {
+  // ldg x0, [x1, #16]; stg x2, [x3], #16; st2g x4, [x5, #-32]!
+  constexpr std::array<uint32_t, 3> kGuestCode = {
+      0xd960'1020, 0xd920'1462, 0xd9bf'eca4};
+  alignas(32) std::array<uint8_t, 64> memory{};
+  constexpr uint64_t kTag = UINT64_C(0xab00'0000'0000'0000);
+
+  ThreadState state{};
+  state.cpu.x[0] = UINT64_C(0xffff'ffff'ffff'ffff);
+  state.cpu.x[1] = ToGuestAddr(memory.data()) | kTag;
+  state.cpu.x[2] = UINT64_C(0x1200'0000'0000'0000);
+  state.cpu.x[3] = ToGuestAddr(memory.data()) | kTag;
+  state.cpu.x[4] = UINT64_C(0x3400'0000'0000'0000);
+  state.cpu.x[5] = ToGuestAddr(memory.data() + 32) | kTag;
+
+  TranslateAndRun(kGuestCode, &state);
+
+  EXPECT_EQ(state.cpu.x[0], UINT64_C(0xf0ff'ffff'ffff'ffff));
+  EXPECT_EQ(state.cpu.x[1], ToGuestAddr(memory.data()) | kTag);
+  EXPECT_EQ(state.cpu.x[3], ToGuestAddr(memory.data() + 16) | kTag);
+  EXPECT_EQ(state.cpu.x[5], ToGuestAddr(memory.data()) | kTag);
+  EXPECT_EQ(GetInsnAddr(state.cpu), ToGuestAddr(kGuestCode.data() + kGuestCode.size()));
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesMteTagAndZero) {
+  // stzg x0, [x1, #16]; stz2g x0, [x2], #16
+  constexpr std::array<uint32_t, 2> kGuestCode = {0xd960'1820, 0xd9e0'1440};
+  alignas(32) std::array<uint8_t, 96> memory;
+  memory.fill(0xa5);
+  constexpr uint64_t kTag = UINT64_C(0xcd00'0000'0000'0000);
+
+  ThreadState state{};
+  state.cpu.x[1] = ToGuestAddr(memory.data()) | kTag;
+  state.cpu.x[2] = ToGuestAddr(memory.data() + 32) | kTag;
+  TranslateAndRun(kGuestCode, &state);
+
+  for (size_t i = 0; i < 16; ++i) {
+    EXPECT_EQ(memory[i], 0xa5u);
+    EXPECT_EQ(memory[16 + i], 0u);
+  }
+  for (size_t i = 32; i < 64; ++i) {
+    EXPECT_EQ(memory[i], 0u);
+  }
+  EXPECT_EQ(memory[64], 0xa5u);
+  EXPECT_EQ(state.cpu.x[1], ToGuestAddr(memory.data()) | kTag);
+  EXPECT_EQ(state.cpu.x[2], ToGuestAddr(memory.data() + 48) | kTag);
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteMteZeroStoresHaveRecoveryPoints) {
+  // stzg x0, [x1]; stz2g x0, [x2]
+  constexpr std::array<uint32_t, 2> kGuestCode = {0xd960'0820, 0xd9e0'0840};
+  GuestAddr start_pc = ToGuestAddr(kGuestCode.data());
+  MachineCode code;
+  LiteTranslateParams params;
+  params.end_pc = start_pc + sizeof(kGuestCode);
+  params.allow_dispatch = false;
+
+  auto [success, stop_pc] = TryLiteTranslateRegion(start_pc, &code, params);
+  ASSERT_TRUE(success);
+  EXPECT_EQ(stop_pc, params.end_pc);
+
+  ScopedExecRegion exec(&code);
+  EXPECT_EQ(exec.recovery_map().size(), 6u);
+}
+
 TEST(LoongArch64RuntimeLibraryTest, GuestMemoryCanBeKeptInInterpreter) {
   // ldr x1, [x0]
   constexpr std::array<uint32_t, 1> kGuestCode = {0xf940'0001};
