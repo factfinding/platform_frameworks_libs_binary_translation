@@ -1074,6 +1074,43 @@ TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesFmovFromGeneralRegisters) {
   EXPECT_EQ(state.cpu.v[0], static_cast<__uint128_t>(0x0123'4567'89ab'cdef));
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesLd1Two4SPostIndex) {
+  // ld1 {v16.4s, v17.4s}, [x7], #32
+  constexpr std::array<uint32_t, 1> kGuestCode = {0x4cdf'a8f0};
+  constexpr uint64_t kTag = 0xab00'0000'0000'0000ULL;
+  std::array<uint64_t, 4> memory = {
+      0x0123'4567'89ab'cdef,
+      0xfedc'ba98'7654'3210,
+      0x1122'3344'5566'7788,
+      0x99aa'bbcc'ddee'ff00,
+  };
+  ThreadState state{};
+  state.cpu.x[7] = ToGuestAddr(memory.data()) | kTag;
+
+  TranslateAndRun(kGuestCode, &state);
+
+  EXPECT_EQ(state.cpu.v[16], MakeUint128(memory[0], memory[1]));
+  EXPECT_EQ(state.cpu.v[17], MakeUint128(memory[2], memory[3]));
+  EXPECT_EQ(state.cpu.x[7], (ToGuestAddr(memory.data()) | kTag) + 32);
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteLd1Two4SHasRecoveryPoints) {
+  // ld1 {v16.4s, v17.4s}, [x7], #32
+  constexpr std::array<uint32_t, 1> kGuestCode = {0x4cdf'a8f0};
+  GuestAddr start_pc = ToGuestAddr(kGuestCode.data());
+  MachineCode code;
+  LiteTranslateParams params;
+  params.end_pc = start_pc + sizeof(kGuestCode);
+  params.allow_dispatch = false;
+
+  auto [success, stop_pc] = TryLiteTranslateRegion(start_pc, &code, params);
+  ASSERT_TRUE(success);
+  EXPECT_EQ(stop_pc, params.end_pc);
+
+  ScopedExecRegion exec(&code);
+  EXPECT_EQ(exec.recovery_map().size(), 4u);
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesSimd128LoadsAndStores) {
   // ldr q1, [x0, #16]; str q1, [x0, #32]
   // ldr q2, [x0, x3]; str q2, [x0, x4, lsl #4]

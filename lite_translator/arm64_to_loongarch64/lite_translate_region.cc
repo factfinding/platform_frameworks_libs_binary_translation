@@ -156,6 +156,12 @@ class LiteTranslator {
       }
       return TranslateSimdLoadStorePair(insn, pc);
     }
+    if ((insn & 0xffff'fc00u) == 0x4cdf'a800u) {
+      if (!enable_guest_memory_) {
+        return false;
+      }
+      return TranslateLd1Two4SPostIndex(insn, pc);
+    }
     // DUP Vd.16B, Wn.  This is the hottest SIMD-copy form in the current
     // Unity workload.  Keep the initial LA64 implementation deliberately
     // narrow until the other lane widths have independent validation.
@@ -1323,6 +1329,36 @@ class LiteTranslator {
       as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
       StoreXOrSp(rn, Assembler::t0);
     }
+    return true;
+  }
+
+  bool TranslateLd1Two4SPostIndex(uint32_t insn, GuestAddr pc) {
+    uint32_t rn = (insn >> 5) & 31;
+    uint32_t rt = insn & 31;
+    uint32_t rt2 = (rt + 1) & 31;
+    LoadXOrSp(rn, Assembler::t0);
+    ApplyTbi(Assembler::t0);
+    Assembler::Label* recovery = as_.MakeLabel();
+    Assembler::Label* done = as_.MakeLabel();
+    as_.SetRecoveryPoint(recovery);
+    as_.LdD(Assembler::t1, Assembler::t0, 0);
+    as_.SetRecoveryPoint(recovery);
+    as_.LdD(Assembler::t2, Assembler::t0, 8);
+    as_.SetRecoveryPoint(recovery);
+    as_.LdD(Assembler::t3, Assembler::t0, 16);
+    as_.SetRecoveryPoint(recovery);
+    as_.LdD(Assembler::t4, Assembler::t0, 24);
+    as_.StD(Assembler::t1, Assembler::s8, VOffset(rt));
+    as_.StD(Assembler::t2, Assembler::s8, VOffset(rt) + 8);
+    as_.StD(Assembler::t3, Assembler::s8, VOffset(rt2));
+    as_.StD(Assembler::t4, Assembler::s8, VOffset(rt2) + 8);
+    as_.B(*done);
+    as_.Bind(recovery);
+    ExitGeneratedCode(pc);
+    as_.Bind(done);
+    LoadXOrSp(rn, Assembler::t0);
+    as_.AddiD(Assembler::t0, Assembler::t0, 32);
+    StoreXOrSp(rn, Assembler::t0);
     return true;
   }
 
