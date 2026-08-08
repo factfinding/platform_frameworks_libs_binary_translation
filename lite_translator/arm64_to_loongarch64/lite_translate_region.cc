@@ -722,11 +722,21 @@ class LiteTranslator {
     }
 
     if (immr > imms) {
-      if (opc != 2 || immr != imms + 1) {
-        return false;
-      }
+      // SBFIZ/UBFIZ are the wrapping SBFM/UBFM forms.  Extract the low
+      // imms+1 source bits, extend them according to the opcode, then insert
+      // at data_size-immr.  LSL is simply the UBFIZ case where those two
+      // widths consume the full destination.
+      uint32_t field_width = imms + 1;
+      uint32_t destination_lsb = data_size - immr;
+      uint64_t mask = field_width == 64 ? UINT64_MAX : (uint64_t{1} << field_width) - 1;
       LoadXOrZero(rn, Assembler::t0);
-      as_.SlliD(Assembler::t0, Assembler::t0, data_size - immr);
+      as_.Li(Assembler::t1, mask);
+      as_.And(Assembler::t0, Assembler::t0, Assembler::t1);
+      if (opc == 0) {
+        as_.SlliD(Assembler::t0, Assembler::t0, 64 - field_width);
+        as_.SraiD(Assembler::t0, Assembler::t0, 64 - field_width);
+      }
+      as_.SlliD(Assembler::t0, Assembler::t0, destination_lsb);
       if (!is_64_bit) {
         ZeroExtend32(Assembler::t0);
       }

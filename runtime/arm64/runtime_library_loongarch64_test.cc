@@ -318,6 +318,40 @@ TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesBitfieldInserts) {
   EXPECT_EQ(state.cpu.x[5], 0x0123'4567'89ab'6677u);
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteWrappingBitfieldsMatchInterpreter) {
+  // Exercise every wrapping SBFM/UBFM immediate pair for W and X forms,
+  // including the hot `sbfiz x3, x2, #3, #32` encoding from jkchess.
+  constexpr std::array<uint64_t, 5> kInputs = {
+      0, 1, UINT64_MAX, 0x8000'0000'0000'0001, 0xa55a'f00f'963c'c369};
+  for (uint32_t is_64_bit = 0; is_64_bit < 2; ++is_64_bit) {
+    uint32_t data_size = is_64_bit ? 64 : 32;
+    for (uint32_t opc : {0u, 2u}) {
+      for (uint32_t immr = 1; immr < data_size; ++immr) {
+        for (uint32_t imms = 0; imms < immr; ++imms) {
+          const std::array<uint32_t, 1> guest_code = {
+              0x1300'0001u | (is_64_bit << 31) | (opc << 29) | (is_64_bit << 22) |
+              (immr << 16) | (imms << 10)};
+          for (uint64_t input : kInputs) {
+            ThreadState interpreted{};
+            interpreted.cpu.x[0] = input;
+            SetInsnAddr(interpreted.cpu, ToGuestAddr(guest_code.data()));
+            InterpretInsn(&interpreted);
+
+            ThreadState translated{};
+            translated.cpu.x[0] = input;
+            TranslateAndRun(guest_code, &translated);
+
+            SCOPED_TRACE(testing::Message()
+                         << "sf=" << is_64_bit << " opc=" << opc << " immr=" << immr
+                         << " imms=" << imms << " input=" << input);
+            EXPECT_EQ(translated.cpu.x[1], interpreted.cpu.x[1]);
+          }
+        }
+      }
+    }
+  }
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesLslImmediateAndExtendedAddSub) {
   // lsl x2, x1, #5; lsl w3, w4, #7;
   // add x5, x6, w7, uxtb #3; sub x8, x9, w10, sxtw #2;
