@@ -293,6 +293,26 @@ TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesBitfieldExtracts) {
   EXPECT_EQ(state.cpu.x[3], UINT64_C(0xffff'ffff'ffff'ff80));
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesBitfieldInserts) {
+  // bfi w2, w1, #8, #8; bfxil w3, w1, #4, #8;
+  // bfi x4, x1, #40, #8; bfxil x5, x1, #8, #16
+  constexpr std::array<uint32_t, 4> kGuestCode = {
+      0x3318'1c22, 0x3304'2c23, 0xb358'1c24, 0xb348'5c25};
+
+  ThreadState state{};
+  state.cpu.x[1] = 0x1122'3344'5566'77ab;
+  state.cpu.x[2] = 0xffff'ffff'aabb'ccdd;
+  state.cpu.x[3] = 0xffff'ffff'aabb'ccdd;
+  state.cpu.x[4] = 0xff00'ff00'ff00'ff00;
+  state.cpu.x[5] = 0x0123'4567'89ab'cdef;
+  TranslateAndRun(kGuestCode, &state);
+
+  EXPECT_EQ(state.cpu.x[2], 0xaabb'abddu);
+  EXPECT_EQ(state.cpu.x[3], 0xaabb'cc7au);
+  EXPECT_EQ(state.cpu.x[4], 0xff00'ab00'ff00'ff00u);
+  EXPECT_EQ(state.cpu.x[5], 0x0123'4567'89ab'6677u);
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesLslImmediateAndExtendedAddSub) {
   // lsl x2, x1, #5; lsl w3, w4, #7;
   // add x5, x6, w7, uxtb #3; sub x8, x9, w10, sxtw #2;

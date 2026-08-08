@@ -645,11 +645,44 @@ class LiteTranslator {
     uint32_t rn = (insn >> 5) & 31;
     uint32_t rd = insn & 31;
     uint32_t data_size = is_64_bit ? 64 : 32;
-    // BFM needs the old destination value.  Of the wrapping forms, handle the
-    // UBFM encoding used by the LSL alias; leave general BFM/SBFIZ/UBFIZ forms
-    // in the interpreter until their insert semantics are implemented.
-    if (opc > 2 || opc == 1 || n != is_64_bit || immr >= data_size || imms >= data_size) {
+    if (opc > 2 || n != is_64_bit || immr >= data_size || imms >= data_size) {
       return false;
+    }
+
+    if (opc == 1) {  // BFM / BFI / BFXIL
+      uint32_t field_width;
+      uint32_t destination_lsb;
+      if (immr > imms) {
+        field_width = imms + 1;
+        destination_lsb = data_size - immr;
+      } else {
+        field_width = imms - immr + 1;
+        destination_lsb = 0;
+      }
+      const uint64_t field_mask = field_width == 64 ? UINT64_MAX : (uint64_t{1} << field_width) - 1;
+      const uint64_t destination_mask = field_mask << destination_lsb;
+
+      LoadXOrZero(rd, Assembler::t0);
+      LoadXOrZero(rn, Assembler::t1);
+      if (immr > imms) {
+        as_.Li(Assembler::t2, field_mask);
+        as_.And(Assembler::t1, Assembler::t1, Assembler::t2);
+        as_.SlliD(Assembler::t1, Assembler::t1, destination_lsb);
+      } else {
+        if (immr != 0) {
+          as_.SrliD(Assembler::t1, Assembler::t1, immr);
+        }
+        as_.Li(Assembler::t2, field_mask);
+        as_.And(Assembler::t1, Assembler::t1, Assembler::t2);
+      }
+      as_.Li(Assembler::t2, ~destination_mask);
+      as_.And(Assembler::t0, Assembler::t0, Assembler::t2);
+      as_.Or(Assembler::t0, Assembler::t0, Assembler::t1);
+      if (!is_64_bit) {
+        ZeroExtend32(Assembler::t0);
+      }
+      StoreXOrDiscard(rd, Assembler::t0);
+      return true;
     }
 
     if (immr > imms) {
