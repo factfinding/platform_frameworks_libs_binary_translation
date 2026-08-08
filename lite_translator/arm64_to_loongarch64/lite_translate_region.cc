@@ -325,6 +325,12 @@ class LiteTranslator {
     if ((insn & 0xffff'fc00u) == 0x9e67'0000u) {
       return TranslateFmovDFromX(insn);
     }
+    if ((insn & 0xffff'fc00u) == 0x1e26'0000u) {
+      return TranslateFmovWFromS(insn);
+    }
+    if ((insn & 0xffff'fc00u) == 0x9e66'0000u) {
+      return TranslateFmovXFromD(insn);
+    }
     if ((insn & 0xffff'fc00u) == 0x4e04'0c00u) {
       return TranslateDup4S(insn);
     }
@@ -2409,6 +2415,22 @@ class LiteTranslator {
     as_.StW(Assembler::t0, Assembler::s8, VOffset(rd));
     as_.StW(Assembler::zero, Assembler::s8, VOffset(rd) + 4);
     as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
+    return true;
+  }
+
+  bool TranslateFmovWFromS(uint32_t insn) {
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    as_.LdWU(Assembler::t0, Assembler::s8, VOffset(rn));
+    StoreXOrDiscard(rd, Assembler::t0);
+    return true;
+  }
+
+  bool TranslateFmovXFromD(uint32_t insn) {
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    as_.LdD(Assembler::t0, Assembler::s8, VOffset(rn));
+    StoreXOrDiscard(rd, Assembler::t0);
     return true;
   }
 

@@ -1207,6 +1207,37 @@ TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesFmovFromGeneralRegisters) {
   EXPECT_EQ(state.cpu.v[0], static_cast<__uint128_t>(0x0123'4567'89ab'cdef));
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesFmovToGeneralRegisters) {
+  // fmov w3, s14; fmov x0, d10; fmov xzr, d11
+  constexpr std::array<uint32_t, 3> kGuestCode = {
+      0x1e26'01c3,
+      0x9e66'0140,
+      0x9e66'017f,
+  };
+  ThreadState interpreted{};
+  ThreadState translated{};
+  auto initialize = [](ThreadState* state) {
+    state->cpu.x[0] = UINT64_MAX;
+    state->cpu.x[3] = UINT64_MAX;
+    state->cpu.v[10] = MakeUint128(0x0123'4567'89ab'cdef, 0xfedc'ba98'7654'3210);
+    state->cpu.v[11] = MakeUint128(0x1111'2222'3333'4444, 0x5555'6666'7777'8888);
+    state->cpu.v[14] = MakeUint128(0xaaaa'bbbb'89ab'cdef, 0x9999'8888'7777'6666);
+  };
+  initialize(&interpreted);
+  initialize(&translated);
+  SetInsnAddr(interpreted.cpu, ToGuestAddr(kGuestCode.data()));
+
+  for (size_t i = 0; i < kGuestCode.size(); ++i) {
+    InterpretInsn(&interpreted);
+  }
+  TranslateAndRun(kGuestCode, &translated);
+
+  EXPECT_EQ(translated.cpu.x[0], interpreted.cpu.x[0]);
+  EXPECT_EQ(translated.cpu.x[3], interpreted.cpu.x[3]);
+  EXPECT_EQ(translated.cpu.v[10], interpreted.cpu.v[10]);
+  EXPECT_EQ(translated.cpu.v[14], interpreted.cpu.v[14]);
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesLd1Two4SPostIndex) {
   // ld1 {v16.4s, v17.4s}, [x7], #32
   constexpr std::array<uint32_t, 1> kGuestCode = {0x4cdf'a8f0};
