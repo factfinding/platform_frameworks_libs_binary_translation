@@ -1074,6 +1074,48 @@ TEST(LoongArch64RuntimeLibraryTest, LiteLsxVectorFloatMatchesInterpreter) {
   }
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteVectorBitOperationsMatchInterpreter) {
+  // fabs v3.4s, v6.4s; dup v0.4s, v3.s[0]; dup v1.2d, x8
+  // ext v0.16b, v0.16b, v0.16b, #8
+  // and v4.16b, v4.16b, v1.16b; orr v8.16b, v0.16b, v0.16b
+  // eor v1.16b, v2.16b, v1.16b; movi d0, #0; movi v0.16b, #1
+  constexpr std::array<uint32_t, 9> kGuestCode = {0x4ea0'f8c3,
+                                                   0x4e04'0460,
+                                                   0x4e08'0d01,
+                                                   0x6e00'4000,
+                                                   0x4e21'1c84,
+                                                   0x4ea0'1c08,
+                                                   0x6e21'1c41,
+                                                   0x2f00'e400,
+                                                   0x4f00'e420};
+  for (uint32_t insn : kGuestCode) {
+    const std::array<uint32_t, 1> one_insn = {insn};
+    ThreadState interpreted{};
+    ThreadState translated{};
+    auto initialize = [](ThreadState* state) {
+      state->cpu.x[8] = 0x0123'4567'89ab'cdef;
+      state->cpu.v[0] = MakeUint128(0x0011'2233'4455'6677, 0x8899'aabb'ccdd'eeff);
+      state->cpu.v[1] = MakeUint128(0x0f0f'f0f0'55aa'aa55, 0xffff'0000'ffff'0000);
+      state->cpu.v[2] = MakeUint128(0x3333'cccc'5a5a'a5a5, 0x0123'4567'89ab'cdef);
+      state->cpu.v[3] = MakeUint32x4(0x8123'4567, 0x1111'1111, 0x2222'2222, 0x3333'3333);
+      state->cpu.v[4] = MakeUint128(0xffff'0000'ffff'0000, 0xaaaa'5555'aaaa'5555);
+      // Include -0, a negative quiet NaN, -inf, and a normal negative value.
+      state->cpu.v[6] = MakeUint32x4(0x8000'0000, 0xffc1'2345, 0xff80'0000, 0xc049'0fdb);
+      state->cpu.v[8] = MakeUint128(UINT64_MAX, UINT64_MAX);
+    };
+    initialize(&interpreted);
+    initialize(&translated);
+    SetInsnAddr(interpreted.cpu, ToGuestAddr(one_insn.data()));
+
+    InterpretInsn(&interpreted);
+    TranslateAndRun(one_insn, &translated);
+
+    uint32_t rd = insn & 31;
+    SCOPED_TRACE(testing::Message() << "insn=" << std::hex << insn);
+    EXPECT_EQ(translated.cpu.v[rd], interpreted.cpu.v[rd]);
+  }
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesFmovSAndDup4S) {
   // fmov s5, s6; dup v7.4s, w8
   constexpr std::array<uint32_t, 2> kGuestCode = {0x1e20'40c5, 0x4e04'0d07};

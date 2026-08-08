@@ -174,10 +174,37 @@ class LiteTranslator {
     if ((insn & 0xffff'fc00u) == 0x4e01'0c00u) {
       return TranslateDup16B(insn);
     }
+    if ((insn & 0xffff'fc00u) == 0x4e04'0400u) {
+      return TranslateDup4SFromElement(insn);
+    }
+    if ((insn & 0xffff'fc00u) == 0x4e08'0c00u) {
+      return TranslateDup2D(insn);
+    }
+    if ((insn & 0xffe0'fc00u) == 0x6e00'4000u) {
+      return TranslateExt8(insn);
+    }
+    if ((insn & 0xffe0'fc00u) == 0x4e20'1c00u) {
+      return TranslateVectorLogical(insn, 0);
+    }
+    if ((insn & 0xffe0'fc00u) == 0x4ea0'1c00u) {
+      return TranslateVectorLogical(insn, 1);
+    }
+    if ((insn & 0xffe0'fc00u) == 0x6e20'1c00u) {
+      return TranslateVectorLogical(insn, 2);
+    }
+    if ((insn & 0xffff'fc00u) == 0x4ea0'f800u) {
+      return TranslateFabs4S(insn);
+    }
     // MOVI Vd.2D, #0.  Compilers use this reserved modified-immediate form
     // as the canonical full-width vector clear.
     if ((insn & 0xffff'ffe0u) == 0x6f00'e400u) {
       return TranslateMovi2DZero(insn);
+    }
+    if ((insn & 0xffff'ffe0u) == 0x2f00'e400u) {
+      return TranslateMovi2DZero(insn);
+    }
+    if ((insn & 0xffff'ffe0u) == 0x4f00'e420u) {
+      return TranslateMovi16BOne(insn);
     }
     if ((insn & 0xff20'fc00u) == 0x4e20'cc00u) {
       return TranslateFmla4S(insn);
@@ -1474,6 +1501,80 @@ class LiteTranslator {
     uint32_t rd = insn & 31;
     as_.StD(Assembler::zero, Assembler::s8, VOffset(rd));
     as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
+    return true;
+  }
+
+  bool TranslateDup4SFromElement(uint32_t insn) {
+    uint32_t rn = (insn >> 5) & 31;
+    uint32_t rd = insn & 31;
+    LoadV(rn, Assembler::vr1);
+    as_.VreplveiW(Assembler::vr0, Assembler::vr1, 0);
+    StoreV(rd, Assembler::vr0);
+    return true;
+  }
+
+  bool TranslateDup2D(uint32_t insn) {
+    uint32_t rn = (insn >> 5) & 31;
+    uint32_t rd = insn & 31;
+    LoadXOrZero(rn, Assembler::t0);
+    as_.StD(Assembler::t0, Assembler::s8, VOffset(rd));
+    as_.StD(Assembler::t0, Assembler::s8, VOffset(rd) + 8);
+    return true;
+  }
+
+  bool TranslateExt8(uint32_t insn) {
+    uint32_t rm = (insn >> 16) & 31;
+    uint32_t rn = (insn >> 5) & 31;
+    uint32_t rd = insn & 31;
+    as_.LdD(Assembler::t0, Assembler::s8, VOffset(rn) + 8);
+    as_.LdD(Assembler::t1, Assembler::s8, VOffset(rm));
+    as_.StD(Assembler::t0, Assembler::s8, VOffset(rd));
+    as_.StD(Assembler::t1, Assembler::s8, VOffset(rd) + 8);
+    return true;
+  }
+
+  bool TranslateVectorLogical(uint32_t insn, uint32_t operation) {
+    uint32_t rm = (insn >> 16) & 31;
+    uint32_t rn = (insn >> 5) & 31;
+    uint32_t rd = insn & 31;
+    as_.LdD(Assembler::t0, Assembler::s8, VOffset(rn));
+    as_.LdD(Assembler::t1, Assembler::s8, VOffset(rn) + 8);
+    as_.LdD(Assembler::t2, Assembler::s8, VOffset(rm));
+    as_.LdD(Assembler::t3, Assembler::s8, VOffset(rm) + 8);
+    if (operation == 0) {
+      as_.And(Assembler::t0, Assembler::t0, Assembler::t2);
+      as_.And(Assembler::t1, Assembler::t1, Assembler::t3);
+    } else if (operation == 1) {
+      as_.Or(Assembler::t0, Assembler::t0, Assembler::t2);
+      as_.Or(Assembler::t1, Assembler::t1, Assembler::t3);
+    } else {
+      as_.Xor(Assembler::t0, Assembler::t0, Assembler::t2);
+      as_.Xor(Assembler::t1, Assembler::t1, Assembler::t3);
+    }
+    as_.StD(Assembler::t0, Assembler::s8, VOffset(rd));
+    as_.StD(Assembler::t1, Assembler::s8, VOffset(rd) + 8);
+    return true;
+  }
+
+  bool TranslateFabs4S(uint32_t insn) {
+    uint32_t rn = (insn >> 5) & 31;
+    uint32_t rd = insn & 31;
+    constexpr uint64_t kClearFloatSign = 0x7fff'ffff'7fff'ffffULL;
+    as_.LdD(Assembler::t0, Assembler::s8, VOffset(rn));
+    as_.LdD(Assembler::t1, Assembler::s8, VOffset(rn) + 8);
+    as_.Li(Assembler::t2, kClearFloatSign);
+    as_.And(Assembler::t0, Assembler::t0, Assembler::t2);
+    as_.And(Assembler::t1, Assembler::t1, Assembler::t2);
+    as_.StD(Assembler::t0, Assembler::s8, VOffset(rd));
+    as_.StD(Assembler::t1, Assembler::s8, VOffset(rd) + 8);
+    return true;
+  }
+
+  bool TranslateMovi16BOne(uint32_t insn) {
+    uint32_t rd = insn & 31;
+    as_.Li(Assembler::t0, 0x0101'0101'0101'0101ULL);
+    as_.StD(Assembler::t0, Assembler::s8, VOffset(rd));
+    as_.StD(Assembler::t0, Assembler::s8, VOffset(rd) + 8);
     return true;
   }
 
