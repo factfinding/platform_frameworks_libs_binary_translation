@@ -146,6 +146,8 @@ class Assembler : public AssemblerBase {
   void Or(Register rd, Register rj, Register rk) { Emit3R(0x0015'0000, rd, rj, rk); }
   void Xor(Register rd, Register rj, Register rk) { Emit3R(0x0015'8000, rd, rj, rk); }
   void MulD(Register rd, Register rj, Register rk) { Emit3R(0x001d'8000, rd, rj, rk); }
+  void MulhDU(Register rd, Register rj, Register rk) { Emit3R(0x001e'8000, rd, rj, rk); }
+  void RevbD(Register rd, Register rj) { Emit2R(0x0000'3c00, rd, rj); }
 
   void AddiD(Register rd, Register rj, int32_t imm12) {
     Emit2RI12(0x02c0'0000, rd, rj, EncodeSigned(imm12, 12));
@@ -369,6 +371,10 @@ class Assembler : public AssemblerBase {
 
   void Emit3R(uint32_t opcode, Register rd, Register rj, Register rk) {
     Emit32(opcode | EncodeRk(rk) | EncodeRj(rj) | EncodeRd(rd));
+  }
+
+  void Emit2R(uint32_t opcode, Register rd, Register rj) {
+    Emit32(opcode | EncodeRj(rj) | EncodeRd(rd));
   }
   void Emit2RI12(uint32_t opcode, Register rd, Register rj, uint32_t imm12) {
     Emit32(opcode | (imm12 << 10) | EncodeRj(rj) | EncodeRd(rd));

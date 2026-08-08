@@ -517,6 +517,28 @@ TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesMultiplyAddSub) {
   EXPECT_EQ(state.cpu.x[9], 13u);
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesUmulhAndRev64) {
+  // umulh x14, x13, x23; rev x6, x6
+  constexpr std::array<uint32_t, 2> kGuestCode = {0x9bd7'7dae, 0xdac0'0cc6};
+  ThreadState interpreted{};
+  interpreted.cpu.x[6] = 0x0123'4567'89ab'cdef;
+  interpreted.cpu.x[13] = 0xfedc'ba98'7654'3210;
+  interpreted.cpu.x[23] = 0x89ab'cdef'0123'4567;
+  SetInsnAddr(interpreted.cpu, ToGuestAddr(kGuestCode.data()));
+
+  ThreadState translated{};
+  translated.cpu.x[6] = interpreted.cpu.x[6];
+  translated.cpu.x[13] = interpreted.cpu.x[13];
+  translated.cpu.x[23] = interpreted.cpu.x[23];
+  for (size_t i = 0; i < kGuestCode.size(); ++i) {
+    InterpretInsn(&interpreted);
+  }
+  TranslateAndRun(kGuestCode, &translated);
+
+  EXPECT_EQ(translated.cpu.x[14], interpreted.cpu.x[14]);
+  EXPECT_EQ(translated.cpu.x[6], interpreted.cpu.x[6]);
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesLogicalImmediateAnd) {
   // and w9, w8, #0xff
   constexpr std::array<uint32_t, 1> kGuestCode = {0x1200'1d09};
@@ -938,25 +960,30 @@ TEST(LoongArch64RuntimeLibraryTest, GuestMemoryCanBeKeptInInterpreter) {
   EXPECT_EQ(stop_pc, start_pc);
 }
 
-TEST(LoongArch64RuntimeLibraryTest, LiteRejectsSimdLoadsAndStores) {
-  // Scalar D-register memory remains in the interpreter.  S- and Q-register
-  // memory are covered independently below.
+TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesSimd64LoadsAndStores) {
   // ldr d0, [x1]; str d2, [x3]; ldr d4, [x5], #8; str d6, [x7, #-8]!
   constexpr std::array<uint32_t, 4> kGuestCode = {
       0xfd40'0020, 0xfd00'0062, 0xfc40'84a4, 0xfc1f'8ce6};
+  std::array<uint64_t, 5> memory = {
+      0x0123'4567'89ab'cdef, 0, 0x1122'3344'5566'7788, 0, 0};
 
-  for (const uint32_t& insn : kGuestCode) {
-    GuestAddr start_pc = ToGuestAddr(&insn);
-    MachineCode code;
-    LiteTranslateParams params;
-    params.end_pc = start_pc + sizeof(insn);
-    params.allow_dispatch = false;
+  ThreadState state{};
+  state.cpu.x[1] = ToGuestAddr(memory.data());
+  state.cpu.x[3] = ToGuestAddr(memory.data() + 1);
+  state.cpu.x[5] = ToGuestAddr(memory.data() + 2);
+  state.cpu.x[7] = ToGuestAddr(memory.data() + 4);
+  state.cpu.v[0] = MakeUint128(UINT64_MAX, UINT64_MAX);
+  state.cpu.v[2] = MakeUint128(0xaabb'ccdd'eeff'0011, UINT64_MAX);
+  state.cpu.v[4] = MakeUint128(UINT64_MAX, UINT64_MAX);
+  state.cpu.v[6] = MakeUint128(0x99aa'bbcc'ddee'ff00, UINT64_MAX);
+  TranslateAndRun(kGuestCode, &state);
 
-    auto [success, stop_pc] = TryLiteTranslateRegion(start_pc, &code, params);
-
-    EXPECT_FALSE(success) << std::hex << insn;
-    EXPECT_EQ(stop_pc, start_pc) << std::hex << insn;
-  }
+  EXPECT_EQ(state.cpu.v[0], static_cast<__uint128_t>(0x0123'4567'89ab'cdef));
+  EXPECT_EQ(memory[1], 0xaabb'ccdd'eeff'0011u);
+  EXPECT_EQ(state.cpu.v[4], static_cast<__uint128_t>(0x1122'3344'5566'7788));
+  EXPECT_EQ(state.cpu.x[5], ToGuestAddr(memory.data() + 3));
+  EXPECT_EQ(memory[3], 0x99aa'bbcc'ddee'ff00u);
+  EXPECT_EQ(state.cpu.x[7], ToGuestAddr(memory.data() + 3));
 }
 
 TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesSimd32LoadsAndStores) {
@@ -981,8 +1008,12 @@ TEST(LoongArch64RuntimeLibraryTest, LiteLsxVectorFloatMatchesInterpreter) {
   // fmla v22.4s, v18.4s, v4.s[3]
   // fmul v17.4s, v5.4s, v0.s[2]
   // fadd v2.4s, v2.4s, v3.4s
-  constexpr std::array<uint32_t, 6> kGuestCode = {
-      0x4e22'cc20, 0x6e22'dc23, 0x4f82'9024, 0x4fa4'1a56, 0x4f80'98b1, 0x4e23'd442};
+  constexpr std::array<uint32_t, 6> kGuestCode = {0x4e22'cc20,
+                                                   0x6e22'dc23,
+                                                   0x4f82'9024,
+                                                   0x4fa4'1a56,
+                                                   0x4f80'98b1,
+                                                   0x4e23'd442};
   for (uint32_t insn : kGuestCode) {
     const std::array<uint32_t, 1> one_insn = {insn};
     ThreadState interpreted{};
@@ -1027,6 +1058,20 @@ TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesFmovSAndDup4S) {
 
   EXPECT_EQ(state.cpu.v[5], static_cast<__uint128_t>(0x4049'0fdb));
   EXPECT_EQ(state.cpu.v[7], MakeUint32x4(0x89ab'cdef, 0x89ab'cdef, 0x89ab'cdef, 0x89ab'cdef));
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesFmovFromGeneralRegisters) {
+  // fmov s1, wzr; fmov d0, x15
+  constexpr std::array<uint32_t, 2> kGuestCode = {0x1e27'03e1, 0x9e67'01e0};
+  ThreadState state{};
+  state.cpu.x[15] = 0x0123'4567'89ab'cdef;
+  state.cpu.v[0] = MakeUint128(UINT64_MAX, UINT64_MAX);
+  state.cpu.v[1] = MakeUint128(UINT64_MAX, UINT64_MAX);
+
+  TranslateAndRun(kGuestCode, &state);
+
+  EXPECT_EQ(state.cpu.v[1], static_cast<__uint128_t>(0));
+  EXPECT_EQ(state.cpu.v[0], static_cast<__uint128_t>(0x0123'4567'89ab'cdef));
 }
 
 TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesSimd128LoadsAndStores) {

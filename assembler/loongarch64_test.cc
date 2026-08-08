@@ -129,6 +129,21 @@ TEST(LoongArch64AssemblerTest, EncodesVariableShiftsAndDivision) {
   }
 }
 
+TEST(LoongArch64AssemblerTest, EncodesMultiplyHighAndByteReverse) {
+  MachineCode code;
+  Assembler assembler(&code);
+
+  assembler.MulhDU(Assembler::t0, Assembler::t1, Assembler::t2);
+  assembler.RevbD(Assembler::t0, Assembler::t1);
+
+  // Generated independently with LLVM's LoongArch assembler.
+  constexpr std::array<uint32_t, 2> kExpected = {0x001e'b9ac, 0x0000'3dac};
+  ASSERT_EQ(code.install_size(), sizeof(kExpected));
+  for (size_t i = 0; i < kExpected.size(); ++i) {
+    EXPECT_EQ(*code.AddrAs<const uint32_t>(i * sizeof(uint32_t)), kExpected[i]) << i;
+  }
+}
+
 TEST(LoongArch64AssemblerTest, EncodesLsxFloatingPointInstructions) {
   MachineCode code;
   Assembler assembler(&code);

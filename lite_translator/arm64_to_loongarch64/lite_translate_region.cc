@@ -185,6 +185,12 @@ class LiteTranslator {
     if ((insn & 0xffff'fc00u) == 0x1e20'4000u) {
       return TranslateFmovS(insn);
     }
+    if ((insn & 0xffff'fc00u) == 0x1e27'0000u) {
+      return TranslateFmovSFromW(insn);
+    }
+    if ((insn & 0xffff'fc00u) == 0x9e67'0000u) {
+      return TranslateFmovDFromX(insn);
+    }
     if ((insn & 0xffff'fc00u) == 0x4e04'0c00u) {
       return TranslateDup4S(insn);
     }
@@ -196,6 +202,12 @@ class LiteTranslator {
     }
     if ((insn & 0x7fe0'0000u) == 0x1b00'0000u) {
       return TranslateMultiplyAddSub(insn);
+    }
+    if ((insn & 0xffe0'fc00u) == 0x9bc0'7c00u) {
+      return TranslateUmulh(insn);
+    }
+    if ((insn & 0xffff'fc00u) == 0xdac0'0c00u) {
+      return TranslateRev64(insn);
     }
     if ((insn & 0x7fe0'fc00u) == 0x1ac0'2000u || (insn & 0x7fe0'fc00u) == 0x1ac0'2400u ||
         (insn & 0x7fe0'fc00u) == 0x1ac0'2800u || (insn & 0x7fe0'fc00u) == 0x1ac0'2c00u ||
@@ -956,6 +968,26 @@ class LiteTranslator {
     return true;
   }
 
+  bool TranslateUmulh(uint32_t insn) {
+    uint32_t rm = (insn >> 16) & 31;
+    uint32_t rn = (insn >> 5) & 31;
+    uint32_t rd = insn & 31;
+    LoadXOrZero(rn, Assembler::t0);
+    LoadXOrZero(rm, Assembler::t1);
+    as_.MulhDU(Assembler::t0, Assembler::t0, Assembler::t1);
+    StoreXOrDiscard(rd, Assembler::t0);
+    return true;
+  }
+
+  bool TranslateRev64(uint32_t insn) {
+    uint32_t rn = (insn >> 5) & 31;
+    uint32_t rd = insn & 31;
+    LoadXOrZero(rn, Assembler::t0);
+    as_.RevbD(Assembler::t0, Assembler::t0);
+    StoreXOrDiscard(rd, Assembler::t0);
+    return true;
+  }
+
   void ComputeLogicalFlags(Register result, uint32_t width) {
     as_.SrliD(Assembler::t3, result, width - 1);
     as_.SlliD(Assembler::t3, Assembler::t3, 3);
@@ -987,19 +1019,23 @@ class LiteTranslator {
       uint32_t size = insn >> 30;
       uint32_t opc = (insn >> 22) & 3;
       bool is_simd32 = size == 2 && opc <= 1;
+      bool is_simd64 = size == 3 && opc <= 1;
       bool is_simd128 = size == 0 && (opc == 2 || opc == 3);
-      if (!is_simd32 && !is_simd128) {
+      if (!is_simd32 && !is_simd64 && !is_simd128) {
         return false;
       }
       uint32_t imm12 = (insn >> 10) & 0xfff;
       uint32_t rn = (insn >> 5) & 31;
       uint32_t rt = insn & 31;
       LoadXOrSp(rn, Assembler::t0);
-      as_.Li(Assembler::t1, static_cast<uint64_t>(imm12) << (is_simd32 ? 2 : 4));
+      uint32_t scale = is_simd32 ? 2 : (is_simd64 ? 3 : 4);
+      as_.Li(Assembler::t1, static_cast<uint64_t>(imm12) << scale);
       as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
       ApplyTbi(Assembler::t0);
       if (is_simd32) {
         EmitSimd32LoadStore(opc == 0, rt, pc);
+      } else if (is_simd64) {
+        EmitSimd64LoadStore(opc == 0, rt, pc);
       } else {
         EmitSimd128LoadStore(opc == 2, rt, pc);
       }
@@ -1036,8 +1072,9 @@ class LiteTranslator {
       uint32_t rt = insn & 31;
       bool writeback = mode == 1 || mode == 3;
       bool is_simd32 = size == 2 && opc <= 1;
+      bool is_simd64 = size == 3 && opc <= 1;
       bool is_simd128 = size == 0 && (opc == 2 || opc == 3);
-      if ((!is_simd32 && !is_simd128) || mode == 2) {
+      if ((!is_simd32 && !is_simd64 && !is_simd128) || mode == 2) {
         return false;
       }
 
@@ -1049,6 +1086,8 @@ class LiteTranslator {
       ApplyTbi(Assembler::t0);
       if (is_simd32) {
         EmitSimd32LoadStore(opc == 0, rt, pc);
+      } else if (is_simd64) {
+        EmitSimd64LoadStore(opc == 0, rt, pc);
       } else {
         EmitSimd128LoadStore(opc == 2, rt, pc);
       }
@@ -1101,8 +1140,9 @@ class LiteTranslator {
       uint32_t rn = (insn >> 5) & 31;
       uint32_t rt = insn & 31;
       bool is_simd32 = size == 2 && opc <= 1;
+      bool is_simd64 = size == 3 && opc <= 1;
       bool is_simd128 = size == 0 && (opc == 2 || opc == 3);
-      if ((!is_simd32 && !is_simd128) ||
+      if ((!is_simd32 && !is_simd64 && !is_simd128) ||
           (option != 2 && option != 3 && option != 6 && option != 7)) {
         return false;
       }
@@ -1115,12 +1155,14 @@ class LiteTranslator {
         SignExtend32(Assembler::t1);
       }
       if (scaled) {
-        as_.SlliD(Assembler::t1, Assembler::t1, is_simd32 ? 2 : 4);
+        as_.SlliD(Assembler::t1, Assembler::t1, is_simd32 ? 2 : (is_simd64 ? 3 : 4));
       }
       as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
       ApplyTbi(Assembler::t0);
       if (is_simd32) {
         EmitSimd32LoadStore(opc == 0, rt, pc);
+      } else if (is_simd64) {
+        EmitSimd64LoadStore(opc == 0, rt, pc);
       } else {
         EmitSimd128LoadStore(opc == 2, rt, pc);
       }
@@ -1375,6 +1417,25 @@ class LiteTranslator {
     return true;
   }
 
+  bool TranslateFmovSFromW(uint32_t insn) {
+    uint32_t rn = (insn >> 5) & 31;
+    uint32_t rd = insn & 31;
+    LoadXOrZero(rn, Assembler::t0);
+    as_.StW(Assembler::t0, Assembler::s8, VOffset(rd));
+    as_.StW(Assembler::zero, Assembler::s8, VOffset(rd) + 4);
+    as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
+    return true;
+  }
+
+  bool TranslateFmovDFromX(uint32_t insn) {
+    uint32_t rn = (insn >> 5) & 31;
+    uint32_t rd = insn & 31;
+    LoadXOrZero(rn, Assembler::t0);
+    as_.StD(Assembler::t0, Assembler::s8, VOffset(rd));
+    as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
+    return true;
+  }
+
   bool TranslateDup4S(uint32_t insn) {
     uint32_t rn = (insn >> 5) & 31;
     uint32_t rd = insn & 31;
@@ -1397,6 +1458,25 @@ class LiteTranslator {
       as_.LdWU(Assembler::t1, Assembler::s8, VOffset(rt));
       as_.SetRecoveryPoint(recovery);
       as_.StW(Assembler::t1, Assembler::t0, 0);
+    }
+    as_.B(*done);
+    as_.Bind(recovery);
+    ExitGeneratedCode(pc);
+    as_.Bind(done);
+  }
+
+  void EmitSimd64LoadStore(bool is_store, uint32_t rt, GuestAddr pc) {
+    Assembler::Label* recovery = as_.MakeLabel();
+    Assembler::Label* done = as_.MakeLabel();
+    if (!is_store) {
+      as_.SetRecoveryPoint(recovery);
+      as_.LdD(Assembler::t1, Assembler::t0, 0);
+      as_.StD(Assembler::t1, Assembler::s8, VOffset(rt));
+      as_.StD(Assembler::zero, Assembler::s8, VOffset(rt) + 8);
+    } else {
+      as_.LdD(Assembler::t1, Assembler::s8, VOffset(rt));
+      as_.SetRecoveryPoint(recovery);
+      as_.StD(Assembler::t1, Assembler::t0, 0);
     }
     as_.B(*done);
     as_.Bind(recovery);
