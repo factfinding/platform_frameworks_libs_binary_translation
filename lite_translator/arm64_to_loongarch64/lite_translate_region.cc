@@ -220,12 +220,6 @@ class LiteTranslator {
       }
       return TranslateLd1D1PostIndex(insn, pc);
     }
-    if ((insn & 0xffff'fc00u) == 0x4d40'c800u) {
-      if (!enable_guest_memory_) {
-        return false;
-      }
-      return TranslateLd1r4S(insn, pc);
-    }
     if ((insn & 0xffff'fc00u) == 0x4d00'8000u) {
       if (!enable_guest_memory_) {
         return false;
@@ -1979,24 +1973,6 @@ class LiteTranslator {
     LoadXOrSp(rn, Assembler::t0);
     as_.AddiD(Assembler::t0, Assembler::t0, 8);
     StoreXOrSp(rn, Assembler::t0);
-    return true;
-  }
-
-  bool TranslateLd1r4S(uint32_t insn, GuestAddr pc) {
-    const uint32_t rn = (insn >> 5) & 31;
-    const uint32_t rt = insn & 31;
-    LoadXOrSp(rn, Assembler::t0);
-    ApplyTbi(Assembler::t0);
-    Assembler::Label* recovery = as_.MakeLabel();
-    Assembler::Label* done = as_.MakeLabel();
-    as_.SetRecoveryPoint(recovery);
-    as_.LdWU(Assembler::t1, Assembler::t0, 0);
-    as_.Vreplgr2vrW(Assembler::vr0, Assembler::t1);
-    StoreV(rt, Assembler::vr0);
-    as_.B(*done);
-    as_.Bind(recovery);
-    ExitGeneratedCode(pc);
-    as_.Bind(done);
     return true;
   }
 

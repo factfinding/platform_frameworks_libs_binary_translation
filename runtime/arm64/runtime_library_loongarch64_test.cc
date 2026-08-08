@@ -1776,10 +1776,9 @@ TEST(LoongArch64RuntimeLibraryTest, LiteUcvtf4SMatchesInterpreter) {
 }
 
 TEST(LoongArch64RuntimeLibraryTest, LiteHotStructMemoryMatchesInterpreter) {
-  constexpr std::array<uint32_t, 4> kGuestCode = {
+  constexpr std::array<uint32_t, 3> kGuestCode = {
       0x4c9f'a820,  // st1 {v0.4s,v1.4s},[x1],#32
       0x4ddf'8464,  // ld1 {v4.d}[1],[x3],#8
-      0x4d40'c930,  // ld1r {v16.4s},[x9]
       0x4d00'8121,  // st1 {v1.s}[2],[x9]
   };
 
