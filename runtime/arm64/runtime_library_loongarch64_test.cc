@@ -899,6 +899,17 @@ TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesDup16B) {
   EXPECT_EQ(state.cpu.v[0], MakeUint128(0x5a5a'5a5a'5a5a'5a5a, 0x5a5a'5a5a'5a5a'5a5a));
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesMovi2DZero) {
+  // movi v5.2d, #0
+  constexpr std::array<uint32_t, 1> kGuestCode = {0x6f00'e405};
+  ThreadState state{};
+  state.cpu.v[5] = MakeUint128(0x0123'4567'89ab'cdef, 0xfedc'ba98'7654'3210);
+
+  TranslateAndRun(kGuestCode, &state);
+
+  EXPECT_EQ(state.cpu.v[5], static_cast<__uint128_t>(0));
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteRejectsConstrainedUnpredictableLoadPair) {
   // ldp x1, x1, [x0] has overlapping destination registers and is
   // CONSTRAINED UNPREDICTABLE.  Do not assign an arbitrary JIT meaning to it.

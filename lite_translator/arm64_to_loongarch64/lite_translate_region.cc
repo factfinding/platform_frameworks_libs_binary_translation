@@ -157,6 +157,11 @@ class LiteTranslator {
     if ((insn & 0xffff'fc00u) == 0x4e01'0c00u) {
       return TranslateDup16B(insn);
     }
+    // MOVI Vd.2D, #0.  Compilers use this reserved modified-immediate form
+    // as the canonical full-width vector clear.
+    if ((insn & 0xffff'ffe0u) == 0x6f00'e400u) {
+      return TranslateMovi2DZero(insn);
+    }
     if ((insn & 0x1fe0'0800u) == 0x1a80'0000u) {
       return TranslateConditionalSelect(insn);
     }
@@ -1173,6 +1178,13 @@ class LiteTranslator {
     as_.MulD(Assembler::t0, Assembler::t0, Assembler::t1);
     as_.StD(Assembler::t0, Assembler::s8, VOffset(rd));
     as_.StD(Assembler::t0, Assembler::s8, VOffset(rd) + 8);
+    return true;
+  }
+
+  bool TranslateMovi2DZero(uint32_t insn) {
+    uint32_t rd = insn & 31;
+    as_.StD(Assembler::zero, Assembler::s8, VOffset(rd));
+    as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
     return true;
   }
 
