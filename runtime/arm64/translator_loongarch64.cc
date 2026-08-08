@@ -47,6 +47,30 @@ enum class TranslationMode {
 TranslationMode g_translation_mode = TranslationMode::kInterpretOnly;
 uint64_t g_jit_successes;
 uint64_t g_jit_fallbacks;
+// A failed translation attempt is followed by one adaptive interpreter batch
+// on the same host thread. Isolated unsupported instructions should hand the
+// next PC back to the translator immediately, while runs of unsupported code
+// need progressively more interpretation to amortize failed translation.
+thread_local uint32_t g_consecutive_jit_fallbacks;
+thread_local int g_next_interpreter_batch_size;
+
+constexpr int kDefaultJitInterpreterBatchSize = 16;
+constexpr uint32_t kMaxJitFallbackBackoffShift = 4;
+
+constexpr int GetJitFallbackBatchSize(uint32_t consecutive_fallbacks) {
+  uint32_t shift = consecutive_fallbacks == 0 ? 0 : consecutive_fallbacks - 1;
+  if (shift > kMaxJitFallbackBackoffShift) {
+    shift = kMaxJitFallbackBackoffShift;
+  }
+  return 1 << shift;
+}
+
+static_assert(GetJitFallbackBatchSize(1) == 1);
+static_assert(GetJitFallbackBatchSize(2) == 2);
+static_assert(GetJitFallbackBatchSize(3) == 4);
+static_assert(GetJitFallbackBatchSize(4) == 8);
+static_assert(GetJitFallbackBatchSize(5) == 16);
+static_assert(GetJitFallbackBatchSize(100) == 16);
 
 // InterpretBatch amortizes dispatch overhead over as many as 500 guest
 // instructions.  Sampling its entry instruction is therefore cheap while
@@ -143,6 +167,8 @@ void TranslateRegion(GuestAddr pc) {
   if (g_translation_mode == TranslationMode::kLiteTranslateOrInterpret) {
     auto [success, piece, size] = TryLiteTranslateAndInstallRegion(pc);
     if (success) {
+      g_consecutive_jit_fallbacks = 0;
+      g_next_interpreter_batch_size = 0;
       ++g_jit_successes;
       if (g_jit_successes <= 20 || g_jit_successes % 1000 == 0) {
         TRACE_AND_ALOGD("berberis-la64: JIT #%lu pc=0x%lx insns=%lu",
@@ -155,12 +181,18 @@ void TranslateRegion(GuestAddr pc) {
     }
   }
   if (g_translation_mode == TranslationMode::kLiteTranslateOrInterpret) {
+    if (g_consecutive_jit_fallbacks < kMaxJitFallbackBackoffShift + 1) {
+      ++g_consecutive_jit_fallbacks;
+    }
+    g_next_interpreter_batch_size =
+        GetJitFallbackBatchSize(g_consecutive_jit_fallbacks);
     ++g_jit_fallbacks;
     if (g_jit_fallbacks <= 20 || g_jit_fallbacks % 1000 == 0) {
-      TRACE_AND_ALOGD("berberis-la64: fallback #%lu pc=0x%lx insn=0x%08x",
+      TRACE_AND_ALOGD("berberis-la64: fallback #%lu pc=0x%lx insn=0x%08x batch=%d",
                       static_cast<unsigned long>(g_jit_fallbacks),
                       static_cast<unsigned long>(pc),
-                      *ToHostAddr<const uint32_t>(pc));
+                      *ToHostAddr<const uint32_t>(pc),
+                      g_next_interpreter_batch_size);
     }
   }
   cache->SetTranslatedAndUnlock(
@@ -188,7 +220,16 @@ extern "C" __attribute__((used, __visibility__("hidden"))) void berberis_HandleI
       g_translation_mode == TranslationMode::kLiteTranslateOrInterpret
           ? InterpreterCacheLookupMode::kAll
           : InterpreterCacheLookupMode::kNonSequentialOnly;
-  InterpretBatch(state, 500, TranslationCache::GetInstance(), lookup_mode);
+  int max_insns = 500;
+  if (g_translation_mode == TranslationMode::kLiteTranslateOrInterpret) {
+    max_insns = g_next_interpreter_batch_size != 0 ? g_next_interpreter_batch_size
+                                                   : kDefaultJitInterpreterBatchSize;
+    // Consume the one-shot response to the most recent translation failure.
+    // Re-entering an already cached interpreter block uses the bounded default
+    // instead of remaining stuck at a one-instruction batch indefinitely.
+    g_next_interpreter_batch_size = 0;
+  }
+  InterpretBatch(state, max_insns, TranslationCache::GetInstance(), lookup_mode);
 }
 
 extern "C" __attribute__((used, __visibility__("hidden"))) const void* berberis_GetDispatchAddress(
