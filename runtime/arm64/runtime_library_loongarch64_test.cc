@@ -601,6 +601,69 @@ TEST(LoongArch64RuntimeLibraryTest, LiteLogicalImmediateOrrMatchesInterpreterFor
   }
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesLogicalImmediateAndsAndTst) {
+  // ands x3, x1, #0xfffffffffffffffc
+  constexpr std::array<uint32_t, 1> kAndsCode = {0xf27e'f423};
+  ThreadState ands_state{};
+  ands_state.cpu.x[1] = 0x8000'0000'0000'0003u;
+  ands_state.cpu.flags = 0xf;
+  TranslateAndRun(kAndsCode, &ands_state);
+  EXPECT_EQ(ands_state.cpu.x[3], 0x8000'0000'0000'0000u);
+  EXPECT_EQ(ands_state.cpu.flags, 8u);  // N
+
+  // tst w8, #0xc000
+  constexpr std::array<uint32_t, 1> kTstCode = {0x7212'051f};
+  ThreadState tst_state{};
+  tst_state.cpu.x[8] = 0x1234u;
+  tst_state.cpu.sp = 0x1234'5678'9abc'def0u;
+  tst_state.cpu.flags = 0xf;
+  TranslateAndRun(kTstCode, &tst_state);
+  EXPECT_EQ(tst_state.cpu.sp, 0x1234'5678'9abc'def0u);
+  EXPECT_EQ(tst_state.cpu.flags, 4u);  // Z
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteLogicalImmediateAndsXMatchesInterpreterExhaustively) {
+  constexpr uint64_t kInput = 0xa55a'f00f'963c'c369;
+  for (uint32_t n = 0; n < 2; ++n) {
+    for (uint32_t immr = 0; immr < 64; ++immr) {
+      for (uint32_t imms = 0; imms < 64; ++imms) {
+        const uint32_t len_source = (n << 6) | (~imms & 0x3f);
+        int32_t len = -1;
+        for (int32_t bit = 6; bit >= 0; --bit) {
+          if ((len_source & (uint32_t{1} << bit)) != 0) {
+            len = bit;
+            break;
+          }
+        }
+        if (len < 1) {
+          continue;
+        }
+        const uint32_t levels = (uint32_t{1} << len) - 1;
+        if ((imms & levels) == levels) {
+          continue;
+        }
+
+        const std::array<uint32_t, 1> guest_code = {0xf200'0001u | (n << 22) | (immr << 16) |
+                                                    (imms << 10)};
+        ThreadState interpreted{};
+        interpreted.cpu.x[0] = kInput;
+        interpreted.cpu.flags = 0xf;
+        SetInsnAddr(interpreted.cpu, ToGuestAddr(guest_code.data()));
+        InterpretInsn(&interpreted);
+
+        ThreadState translated{};
+        translated.cpu.x[0] = kInput;
+        translated.cpu.flags = 0xf;
+        TranslateAndRun(guest_code, &translated);
+
+        SCOPED_TRACE(testing::Message() << "n=" << n << " immr=" << immr << " imms=" << imms);
+        EXPECT_EQ(translated.cpu.x[1], interpreted.cpu.x[1]);
+        EXPECT_EQ(translated.cpu.flags, interpreted.cpu.flags);
+      }
+    }
+  }
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesPcRelativeAddressesAndNop) {
   // adr x6, +8; adrp x7, current page; nop
   constexpr std::array<uint32_t, 3> kGuestCode = {0x1000'0046, 0x9000'0007, 0xd503'201f};
