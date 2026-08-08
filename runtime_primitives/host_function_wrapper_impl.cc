@@ -88,14 +88,21 @@ void RunHostCallFromGuest(ThreadState* state) {
 #if defined(__loongarch__)
   CPUState& cpu = GetCPUState(*state);
   const GuestAddr pc = GetInsnAddr(cpu);
-  HostCallData call;
-  {
+  // A wrapped function has a process-lifetime-stable trampoline mapping, and
+  // native-heavy code commonly calls the same function repeatedly (strlen is
+  // a prominent Unity startup example).  Avoid taking the global registration
+  // lock and walking std::map on every call.  Keep the cache thread-local so a
+  // callback that enters guest code on another thread cannot race with it.
+  thread_local GuestAddr cached_pc = 0;
+  thread_local HostCallData cached_call{};
+  if (pc != cached_pc) {
     std::lock_guard<std::mutex> lock(g_host_calls_mutex);
     auto it = g_host_calls.find(pc);
     CHECK(it != g_host_calls.end());
-    call = it->second;
+    cached_call = it->second;
+    cached_pc = pc;
   }
-  call.trampoline(call.func, state);
+  cached_call.trampoline(cached_call.func, state);
   SetInsnAddr(cpu, GetLinkRegister(cpu));
 #else
   UNUSED(state);
