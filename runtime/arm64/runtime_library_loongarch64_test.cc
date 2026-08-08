@@ -1038,6 +1038,32 @@ TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesLoadSignedWord) {
   EXPECT_EQ(state.cpu.x[0], ToGuestAddr(memory.data() + 1));
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesSignedByteAndHalfwordLoads) {
+  // ldrsb x1, [x0, #1]; ldrsb w2, [x0, #2]
+  // ldrsh x3, [x0, x4]; ldrsh w5, [x0, x4]
+  // ldrsb w22, [x21], #8
+  constexpr std::array<uint32_t, 5> kGuestCode = {
+      0x3980'0401, 0x39c0'0802, 0x78a4'6803, 0x78e4'6805, 0x38c0'86b6};
+  std::array<uint8_t, 16> memory{};
+  memory[1] = 0x80;
+  memory[2] = 0xfe;
+  memory[4] = 0x34;
+  memory[5] = 0x80;
+
+  ThreadState state{};
+  state.cpu.x[0] = ToGuestAddr(memory.data());
+  state.cpu.x[4] = 4;
+  state.cpu.x[21] = ToGuestAddr(memory.data() + 1);
+  TranslateAndRun(kGuestCode, &state);
+
+  EXPECT_EQ(state.cpu.x[1], UINT64_C(0xffff'ffff'ffff'ff80));
+  EXPECT_EQ(state.cpu.x[2], UINT64_C(0xffff'fffe));
+  EXPECT_EQ(state.cpu.x[3], UINT64_C(0xffff'ffff'ffff'8034));
+  EXPECT_EQ(state.cpu.x[5], UINT64_C(0xffff'8034));
+  EXPECT_EQ(state.cpu.x[22], UINT64_C(0xffff'ff80));
+  EXPECT_EQ(state.cpu.x[21], ToGuestAddr(memory.data() + 9));
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteIndexedMemoryPreservesPointerTagOnWriteback) {
   // str x1, [x0, #-8]!; ldr x2, [x0], #8
   constexpr std::array<uint32_t, 2> kGuestCode = {0xf81f'8c01, 0xf840'8402};

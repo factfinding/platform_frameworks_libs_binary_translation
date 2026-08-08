@@ -935,8 +935,8 @@ class LiteTranslator {
     uint32_t imm12 = (insn >> 10) & 0xfff;
     uint32_t rn = (insn >> 5) & 31;
     uint32_t rt = insn & 31;
-    const bool ldrsw = size == 2 && opc == 2;
-    if (opc > 1 && !ldrsw) {
+    const bool signed_load = opc > 1 && size <= 2;
+    if (opc > 1 && !signed_load) {
       return false;
     }
 
@@ -983,8 +983,8 @@ class LiteTranslator {
     uint32_t rn = (insn >> 5) & 31;
     uint32_t rt = insn & 31;
     bool writeback = mode == 1 || mode == 3;
-    const bool ldrsw = size == 2 && opc == 2;
-    if ((opc > 1 && !ldrsw) || mode == 2 || (writeback && rn != 31 && rn == rt)) {
+    const bool signed_load = opc > 1 && size <= 2;
+    if ((opc > 1 && !signed_load) || mode == 2 || (writeback && rn != 31 && rn == rt)) {
       return false;
     }
 
@@ -1042,8 +1042,9 @@ class LiteTranslator {
     uint32_t rt = insn & 31;
     // The integer register-offset form accepts UXTW, UXTX/LSL, SXTW and
     // SXTX.  Other option encodings are reserved for this instruction class.
-    const bool ldrsw = size == 2 && opc == 2;
-    if ((opc > 1 && !ldrsw) || (option != 2 && option != 3 && option != 6 && option != 7)) {
+    const bool signed_load = opc > 1 && size <= 2;
+    if ((opc > 1 && !signed_load) ||
+        (option != 2 && option != 3 && option != 6 && option != 7)) {
       return false;
     }
 
@@ -1236,9 +1237,27 @@ class LiteTranslator {
     Assembler::Label* done = as_.MakeLabel();
     if (opc != 0) {
       as_.SetRecoveryPoint(recovery);
-      if (opc == 2) {
-        // Callers only admit LDRSW for opc == 2.
-        as_.LdW(Assembler::t1, Assembler::t0, 0);
+      if (opc >= 2) {
+        switch (size) {
+          case 0:
+            as_.LdBU(Assembler::t1, Assembler::t0, 0);
+            as_.SlliD(Assembler::t1, Assembler::t1, 56);
+            as_.SraiD(Assembler::t1, Assembler::t1, 56);
+            break;
+          case 1:
+            as_.LdHU(Assembler::t1, Assembler::t0, 0);
+            as_.SlliD(Assembler::t1, Assembler::t1, 48);
+            as_.SraiD(Assembler::t1, Assembler::t1, 48);
+            break;
+          case 2:
+            as_.LdW(Assembler::t1, Assembler::t0, 0);
+            break;
+        }
+        if (opc == 3) {
+          // LDRSB/LDRSH to a W register sign-extends within 32 bits, then
+          // applies normal W-register upper-half zeroing.
+          ZeroExtend32(Assembler::t1);
+        }
       } else {
         switch (size) {
           case 0:
