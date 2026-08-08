@@ -746,6 +746,17 @@ TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesRegisterBranches) {
   EXPECT_EQ(GetInsnAddr(ret_state.cpu), ToGuestAddr(kRetCode.data() + 2));
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesReadTpidrEl0) {
+  // mrs x19, tpidr_el0
+  constexpr std::array<uint32_t, 1> kGuestCode = {0xd53b'd053};
+  ThreadState state{};
+  state.tls = 0x0123'4567'89ab'cdef;
+
+  TranslateAndRun(kGuestCode, &state);
+
+  EXPECT_EQ(state.cpu.x[19], state.tls);
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesUnsignedImmediateLoadsAndStores) {
   // ldr x2, [x0, #8]; str x2, [x0, #16];
   // ldr w3, [x0, #4]; str w3, [x0]

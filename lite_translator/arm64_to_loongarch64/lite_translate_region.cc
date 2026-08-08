@@ -36,6 +36,7 @@ using Register = loongarch64::Register;
 
 constexpr int32_t kSpOffset = offsetof(ThreadState, cpu) + offsetof(CPUState, sp);
 constexpr int32_t kFlagsOffset = offsetof(ThreadState, cpu) + offsetof(CPUState, flags);
+constexpr int32_t kTlsOffset = offsetof(ThreadState, tls);
 // Logical-immediate operations are enabled independently.  Validate each
 // opcode in production workloads before adding it to this mask.
 constexpr uint32_t kLogicalImmediateOpcMask =
@@ -200,6 +201,14 @@ class LiteTranslator {
         (insn & 0xffff'fc1fu) == 0xd65f'0000u) {
       TranslateBranchRegister(insn, pc);
       region_end_reached_ = true;
+      return true;
+    }
+    // MRS Xt, TPIDR_EL0 reads the guest thread pointer, which Berberis keeps
+    // explicitly in ThreadState instead of the host's architectural TP.
+    if ((insn & 0xffff'ffe0u) == 0xd53b'd040u) {
+      uint32_t rt = insn & 31;
+      as_.LdD(Assembler::t0, Assembler::s8, kTlsOffset);
+      StoreXOrDiscard(rt, Assembler::t0);
       return true;
     }
     // AArch64 HINT instructions are architectural no-ops for binary
