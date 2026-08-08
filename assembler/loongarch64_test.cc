@@ -144,6 +144,22 @@ TEST(LoongArch64AssemblerTest, EncodesMultiplyHighAndByteReverse) {
   }
 }
 
+TEST(LoongArch64AssemblerTest, EncodesCountLeadingZerosAndWordReverse) {
+  MachineCode code;
+  Assembler assembler(&code);
+
+  assembler.ClzW(Assembler::t0, Assembler::t1);
+  assembler.ClzD(Assembler::t0, Assembler::t1);
+  assembler.Revb2W(Assembler::t0, Assembler::t1);
+
+  // Generated independently with LLVM's LoongArch assembler.
+  constexpr std::array<uint32_t, 3> kExpected = {0x0000'15ac, 0x0000'25ac, 0x0000'39ac};
+  ASSERT_EQ(code.install_size(), sizeof(kExpected));
+  for (size_t i = 0; i < kExpected.size(); ++i) {
+    EXPECT_EQ(*code.AddrAs<const uint32_t>(i * sizeof(uint32_t)), kExpected[i]) << i;
+  }
+}
+
 TEST(LoongArch64AssemblerTest, EncodesLsxFloatingPointInstructions) {
   MachineCode code;
   Assembler assembler(&code);

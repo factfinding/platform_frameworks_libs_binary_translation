@@ -160,7 +160,13 @@ class LiteTranslator {
       if (!enable_guest_memory_) {
         return false;
       }
-      return TranslateLd1Two4SPostIndex(insn, pc);
+      return TranslateLd1Two4S(insn, pc, true);
+    }
+    if ((insn & 0xffff'fc00u) == 0x4c40'a800u) {
+      if (!enable_guest_memory_) {
+        return false;
+      }
+      return TranslateLd1Two4S(insn, pc, false);
     }
     // DUP Vd.16B, Wn.  This is the hottest SIMD-copy form in the current
     // Unity workload.  Keep the initial LA64 implementation deliberately
@@ -211,6 +217,16 @@ class LiteTranslator {
     }
     if ((insn & 0xffe0'fc00u) == 0x9bc0'7c00u) {
       return TranslateUmulh(insn);
+    }
+    if ((insn & 0xffe0'fc00u) == 0x9ba0'7c00u) {
+      return TranslateUmull(insn);
+    }
+    if ((insn & 0xffff'fc00u) == 0x5ac0'1000u ||
+        (insn & 0xffff'fc00u) == 0xdac0'1000u) {
+      return TranslateClz(insn);
+    }
+    if ((insn & 0xffff'fc00u) == 0x5ac0'0800u) {
+      return TranslateRev32(insn);
     }
     if ((insn & 0xffff'fc00u) == 0xdac0'0c00u) {
       return TranslateRev64(insn);
@@ -985,6 +1001,44 @@ class LiteTranslator {
     return true;
   }
 
+  bool TranslateUmull(uint32_t insn) {
+    uint32_t rm = (insn >> 16) & 31;
+    uint32_t rn = (insn >> 5) & 31;
+    uint32_t rd = insn & 31;
+    LoadXOrZero(rn, Assembler::t0);
+    LoadXOrZero(rm, Assembler::t1);
+    ZeroExtend32(Assembler::t0);
+    ZeroExtend32(Assembler::t1);
+    as_.MulD(Assembler::t0, Assembler::t0, Assembler::t1);
+    StoreXOrDiscard(rd, Assembler::t0);
+    return true;
+  }
+
+  bool TranslateClz(uint32_t insn) {
+    bool is_64_bit = (insn >> 31) != 0;
+    uint32_t rn = (insn >> 5) & 31;
+    uint32_t rd = insn & 31;
+    LoadXOrZero(rn, Assembler::t0);
+    if (is_64_bit) {
+      as_.ClzD(Assembler::t0, Assembler::t0);
+    } else {
+      as_.ClzW(Assembler::t0, Assembler::t0);
+      ZeroExtend32(Assembler::t0);
+    }
+    StoreXOrDiscard(rd, Assembler::t0);
+    return true;
+  }
+
+  bool TranslateRev32(uint32_t insn) {
+    uint32_t rn = (insn >> 5) & 31;
+    uint32_t rd = insn & 31;
+    LoadXOrZero(rn, Assembler::t0);
+    as_.Revb2W(Assembler::t0, Assembler::t0);
+    ZeroExtend32(Assembler::t0);
+    StoreXOrDiscard(rd, Assembler::t0);
+    return true;
+  }
+
   bool TranslateRev64(uint32_t insn) {
     uint32_t rn = (insn >> 5) & 31;
     uint32_t rd = insn & 31;
@@ -1279,10 +1333,11 @@ class LiteTranslator {
     uint32_t rt2 = (insn >> 10) & 31;
     uint32_t rn = (insn >> 5) & 31;
     uint32_t rt = insn & 31;
-    if (opc != 2 || mode == 0 || (load && rt == rt2)) {
+    if (opc > 2 || mode == 0 || (load && rt == rt2)) {
       return false;
     }
-    int64_t offset = imm7 * 16;
+    uint32_t element_size = 4u << opc;
+    int64_t offset = imm7 * element_size;
 
     LoadXOrSp(rn, Assembler::t0);
     if (mode != 1) {
@@ -1293,31 +1348,69 @@ class LiteTranslator {
     Assembler::Label* recovery = as_.MakeLabel();
     Assembler::Label* done = as_.MakeLabel();
     if (load) {
-      as_.SetRecoveryPoint(recovery);
-      as_.LdD(Assembler::t1, Assembler::t0, 0);
-      as_.SetRecoveryPoint(recovery);
-      as_.LdD(Assembler::t2, Assembler::t0, 8);
-      as_.SetRecoveryPoint(recovery);
-      as_.LdD(Assembler::t3, Assembler::t0, 16);
-      as_.SetRecoveryPoint(recovery);
-      as_.LdD(Assembler::t4, Assembler::t0, 24);
-      as_.StD(Assembler::t1, Assembler::s8, VOffset(rt));
-      as_.StD(Assembler::t2, Assembler::s8, VOffset(rt) + 8);
-      as_.StD(Assembler::t3, Assembler::s8, VOffset(rt2));
-      as_.StD(Assembler::t4, Assembler::s8, VOffset(rt2) + 8);
+      if (element_size == 16) {
+        as_.SetRecoveryPoint(recovery);
+        as_.LdD(Assembler::t1, Assembler::t0, 0);
+        as_.SetRecoveryPoint(recovery);
+        as_.LdD(Assembler::t2, Assembler::t0, 8);
+        as_.SetRecoveryPoint(recovery);
+        as_.LdD(Assembler::t3, Assembler::t0, 16);
+        as_.SetRecoveryPoint(recovery);
+        as_.LdD(Assembler::t4, Assembler::t0, 24);
+        as_.StD(Assembler::t1, Assembler::s8, VOffset(rt));
+        as_.StD(Assembler::t2, Assembler::s8, VOffset(rt) + 8);
+        as_.StD(Assembler::t3, Assembler::s8, VOffset(rt2));
+        as_.StD(Assembler::t4, Assembler::s8, VOffset(rt2) + 8);
+      } else if (element_size == 8) {
+        as_.SetRecoveryPoint(recovery);
+        as_.LdD(Assembler::t1, Assembler::t0, 0);
+        as_.SetRecoveryPoint(recovery);
+        as_.LdD(Assembler::t2, Assembler::t0, 8);
+        as_.StD(Assembler::t1, Assembler::s8, VOffset(rt));
+        as_.StD(Assembler::zero, Assembler::s8, VOffset(rt) + 8);
+        as_.StD(Assembler::t2, Assembler::s8, VOffset(rt2));
+        as_.StD(Assembler::zero, Assembler::s8, VOffset(rt2) + 8);
+      } else {
+        as_.SetRecoveryPoint(recovery);
+        as_.LdWU(Assembler::t1, Assembler::t0, 0);
+        as_.SetRecoveryPoint(recovery);
+        as_.LdWU(Assembler::t2, Assembler::t0, 4);
+        as_.StW(Assembler::t1, Assembler::s8, VOffset(rt));
+        as_.StW(Assembler::zero, Assembler::s8, VOffset(rt) + 4);
+        as_.StD(Assembler::zero, Assembler::s8, VOffset(rt) + 8);
+        as_.StW(Assembler::t2, Assembler::s8, VOffset(rt2));
+        as_.StW(Assembler::zero, Assembler::s8, VOffset(rt2) + 4);
+        as_.StD(Assembler::zero, Assembler::s8, VOffset(rt2) + 8);
+      }
     } else {
-      as_.LdD(Assembler::t1, Assembler::s8, VOffset(rt));
-      as_.LdD(Assembler::t2, Assembler::s8, VOffset(rt) + 8);
-      as_.LdD(Assembler::t3, Assembler::s8, VOffset(rt2));
-      as_.LdD(Assembler::t4, Assembler::s8, VOffset(rt2) + 8);
-      as_.SetRecoveryPoint(recovery);
-      as_.StD(Assembler::t1, Assembler::t0, 0);
-      as_.SetRecoveryPoint(recovery);
-      as_.StD(Assembler::t2, Assembler::t0, 8);
-      as_.SetRecoveryPoint(recovery);
-      as_.StD(Assembler::t3, Assembler::t0, 16);
-      as_.SetRecoveryPoint(recovery);
-      as_.StD(Assembler::t4, Assembler::t0, 24);
+      if (element_size == 16) {
+        as_.LdD(Assembler::t1, Assembler::s8, VOffset(rt));
+        as_.LdD(Assembler::t2, Assembler::s8, VOffset(rt) + 8);
+        as_.LdD(Assembler::t3, Assembler::s8, VOffset(rt2));
+        as_.LdD(Assembler::t4, Assembler::s8, VOffset(rt2) + 8);
+        as_.SetRecoveryPoint(recovery);
+        as_.StD(Assembler::t1, Assembler::t0, 0);
+        as_.SetRecoveryPoint(recovery);
+        as_.StD(Assembler::t2, Assembler::t0, 8);
+        as_.SetRecoveryPoint(recovery);
+        as_.StD(Assembler::t3, Assembler::t0, 16);
+        as_.SetRecoveryPoint(recovery);
+        as_.StD(Assembler::t4, Assembler::t0, 24);
+      } else if (element_size == 8) {
+        as_.LdD(Assembler::t1, Assembler::s8, VOffset(rt));
+        as_.LdD(Assembler::t2, Assembler::s8, VOffset(rt2));
+        as_.SetRecoveryPoint(recovery);
+        as_.StD(Assembler::t1, Assembler::t0, 0);
+        as_.SetRecoveryPoint(recovery);
+        as_.StD(Assembler::t2, Assembler::t0, 8);
+      } else {
+        as_.LdWU(Assembler::t1, Assembler::s8, VOffset(rt));
+        as_.LdWU(Assembler::t2, Assembler::s8, VOffset(rt2));
+        as_.SetRecoveryPoint(recovery);
+        as_.StW(Assembler::t1, Assembler::t0, 0);
+        as_.SetRecoveryPoint(recovery);
+        as_.StW(Assembler::t2, Assembler::t0, 4);
+      }
     }
     as_.B(*done);
     as_.Bind(recovery);
@@ -1332,7 +1425,7 @@ class LiteTranslator {
     return true;
   }
 
-  bool TranslateLd1Two4SPostIndex(uint32_t insn, GuestAddr pc) {
+  bool TranslateLd1Two4S(uint32_t insn, GuestAddr pc, bool post_index) {
     uint32_t rn = (insn >> 5) & 31;
     uint32_t rt = insn & 31;
     uint32_t rt2 = (rt + 1) & 31;
@@ -1356,9 +1449,11 @@ class LiteTranslator {
     as_.Bind(recovery);
     ExitGeneratedCode(pc);
     as_.Bind(done);
-    LoadXOrSp(rn, Assembler::t0);
-    as_.AddiD(Assembler::t0, Assembler::t0, 32);
-    StoreXOrSp(rn, Assembler::t0);
+    if (post_index) {
+      LoadXOrSp(rn, Assembler::t0);
+      as_.AddiD(Assembler::t0, Assembler::t0, 32);
+      StoreXOrSp(rn, Assembler::t0);
+    }
     return true;
   }
 

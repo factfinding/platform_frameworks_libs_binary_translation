@@ -147,6 +147,9 @@ class Assembler : public AssemblerBase {
   void Xor(Register rd, Register rj, Register rk) { Emit3R(0x0015'8000, rd, rj, rk); }
   void MulD(Register rd, Register rj, Register rk) { Emit3R(0x001d'8000, rd, rj, rk); }
   void MulhDU(Register rd, Register rj, Register rk) { Emit3R(0x001e'8000, rd, rj, rk); }
+  void ClzW(Register rd, Register rj) { Emit2R(0x0000'1400, rd, rj); }
+  void ClzD(Register rd, Register rj) { Emit2R(0x0000'2400, rd, rj); }
+  void Revb2W(Register rd, Register rj) { Emit2R(0x0000'3800, rd, rj); }
   void RevbD(Register rd, Register rj) { Emit2R(0x0000'3c00, rd, rj); }
 
   void AddiD(Register rd, Register rj, int32_t imm12) {
