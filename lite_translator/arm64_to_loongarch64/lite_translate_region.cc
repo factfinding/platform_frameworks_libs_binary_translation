@@ -179,7 +179,9 @@ class LiteTranslator {
       region_end_reached_ = true;
       return true;
     }
-    if (insn == 0xd503'201f) {  // NOP
+    // AArch64 HINT instructions are architectural no-ops for binary
+    // translation.  This includes NOP, YIELD/WFE/WFI, PAC/AUT hints and BTI.
+    if ((insn & 0xffff'f01fu) == 0xd503'201fu) {
       return true;
     }
     return false;

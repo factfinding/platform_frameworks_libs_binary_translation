@@ -442,6 +442,19 @@ TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesPcRelativeAddressesAndNop) {
   EXPECT_EQ(state.cpu.x[7], ToGuestAddr(kGuestCode.data() + 1) & ~GuestAddr{0xfff});
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesArchitecturalHints) {
+  // nop; yield; wfe; bti c; paciasp; autiasp
+  constexpr std::array<uint32_t, 6> kGuestCode = {
+      0xd503'201f, 0xd503'203f, 0xd503'205f, 0xd503'245f, 0xd503'233f, 0xd503'23bf};
+
+  ThreadState state{};
+  state.cpu.x[30] = 0x1234'5678'9abc'def0;
+  TranslateAndRun(kGuestCode, &state);
+
+  EXPECT_EQ(state.cpu.x[30], 0x1234'5678'9abc'def0u);
+  EXPECT_EQ(GetInsnAddr(state.cpu), ToGuestAddr(kGuestCode.data() + kGuestCode.size()));
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesRegisterBranches) {
   constexpr std::array<uint32_t, 3> kBrCode = {0xd61f'00a0, 0xd503'201f, 0xd503'201f};
   ThreadState br_state{};
