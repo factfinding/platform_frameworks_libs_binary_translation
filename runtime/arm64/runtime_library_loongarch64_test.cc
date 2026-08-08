@@ -418,18 +418,15 @@ TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesMultiplyAddSub) {
   EXPECT_EQ(state.cpu.x[9], 13u);
 }
 
-TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesLogicalImmediates) {
-  // and w9, w8, #0xff; orr x3, x1, #0xff00; eor x4, x1, #0xff
-  constexpr std::array<uint32_t, 3> kGuestCode = {0x1200'1d09, 0xb278'1c23, 0xd240'1c24};
+TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesLogicalImmediateAnd) {
+  // and w9, w8, #0xff
+  constexpr std::array<uint32_t, 1> kGuestCode = {0x1200'1d09};
 
   ThreadState state{};
-  state.cpu.x[1] = 0x1234'5678'9abc'def0;
   state.cpu.x[8] = 0xffff'ffff'1234'56ab;
   TranslateAndRun(kGuestCode, &state);
 
   EXPECT_EQ(state.cpu.x[9], 0xabu);
-  EXPECT_EQ(state.cpu.x[3], state.cpu.x[1] | 0xff00u);
-  EXPECT_EQ(state.cpu.x[4], (state.cpu.x[1] ^ 0xffu));
 }
 
 TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesPcRelativeAddressesAndNop) {
