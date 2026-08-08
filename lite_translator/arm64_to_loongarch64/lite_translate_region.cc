@@ -120,6 +120,9 @@ class LiteTranslator {
     if ((insn & 0x1f80'0000u) == 0x1300'0000u) {
       return TranslateBitfieldExtract(insn);
     }
+    if ((insn & 0x1f80'0000u) == 0x1380'0000u) {
+      return TranslateExtract(insn);
+    }
     if ((insn & 0x1f00'0000u) == 0x1000'0000u) {
       return TranslatePcRelativeAddress(insn, pc);
     }
@@ -799,6 +802,46 @@ class LiteTranslator {
     return true;
   }
 
+  bool TranslateExtract(uint32_t insn) {
+    bool is_64_bit = (insn >> 31) != 0;
+    bool n = ((insn >> 22) & 1) != 0;
+    uint32_t rm = (insn >> 16) & 31;
+    uint32_t lsb = (insn >> 10) & 0x3f;
+    uint32_t rn = (insn >> 5) & 31;
+    uint32_t rd = insn & 31;
+    uint32_t width = is_64_bit ? 64 : 32;
+    if (n != is_64_bit || lsb >= width) {
+      return false;
+    }
+
+    LoadXOrZero(rm, Assembler::t0);
+    if (rn == rm && lsb != 0) {
+      as_.Li(Assembler::t1, lsb);
+      if (is_64_bit) {
+        as_.RotrD(Assembler::t0, Assembler::t0, Assembler::t1);
+      } else {
+        as_.RotrW(Assembler::t0, Assembler::t0, Assembler::t1);
+      }
+    } else if (lsb != 0) {
+      LoadXOrZero(rn, Assembler::t1);
+      if (is_64_bit) {
+        as_.SrliD(Assembler::t0, Assembler::t0, lsb);
+        as_.SlliD(Assembler::t1, Assembler::t1, width - lsb);
+      } else {
+        ZeroExtend32(Assembler::t0);
+        ZeroExtend32(Assembler::t1);
+        as_.SrliD(Assembler::t0, Assembler::t0, lsb);
+        as_.SlliD(Assembler::t1, Assembler::t1, width - lsb);
+      }
+      as_.Or(Assembler::t0, Assembler::t0, Assembler::t1);
+    }
+    if (!is_64_bit) {
+      ZeroExtend32(Assembler::t0);
+    }
+    StoreXOrDiscard(rd, Assembler::t0);
+    return true;
+  }
+
   bool TranslateDataProcessingTwoSource(uint32_t insn) {
     bool is_64_bit = (insn >> 31) != 0;
     uint32_t opcode = insn & 0x7fe0'fc00u;
@@ -963,6 +1006,9 @@ class LiteTranslator {
     uint32_t imm12 = (insn >> 10) & 0xfff;
     uint32_t rn = (insn >> 5) & 31;
     uint32_t rt = insn & 31;
+    if (size == 3 && opc == 2) {
+      return true;
+    }
     const bool signed_load = opc > 1 && size <= 2;
     if (opc > 1 && !signed_load) {
       return false;
@@ -1017,6 +1063,9 @@ class LiteTranslator {
     uint32_t rn = (insn >> 5) & 31;
     uint32_t rt = insn & 31;
     bool writeback = mode == 1 || mode == 3;
+    if (size == 3 && opc == 2) {
+      return mode == 0;
+    }
     const bool signed_load = opc > 1 && size <= 2;
     if ((opc > 1 && !signed_load) || mode == 2 || (writeback && rn != 31 && rn == rt)) {
       return false;
@@ -1080,6 +1129,9 @@ class LiteTranslator {
     bool scaled = ((insn >> 12) & 1) != 0;
     uint32_t rn = (insn >> 5) & 31;
     uint32_t rt = insn & 31;
+    if (size == 3 && opc == 2) {
+      return true;
+    }
     // The integer register-offset form accepts UXTW, UXTX/LSL, SXTW and
     // SXTX.  Other option encodings are reserved for this instruction class.
     const bool signed_load = opc > 1 && size <= 2;

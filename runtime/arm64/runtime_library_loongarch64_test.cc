@@ -357,6 +357,37 @@ TEST(LoongArch64RuntimeLibraryTest, LiteWrappingBitfieldsMatchInterpreter) {
   }
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteExtractAndRorMatchInterpreter) {
+  constexpr std::array<uint64_t, 3> kInputs = {
+      0x0123'4567'89ab'cdef, 0xfedc'ba98'7654'3210, UINT64_MAX};
+  for (uint32_t is_64_bit = 0; is_64_bit < 2; ++is_64_bit) {
+    uint32_t width = is_64_bit ? 64 : 32;
+    for (uint32_t same_source = 0; same_source < 2; ++same_source) {
+      uint32_t rm = same_source ? 1 : 2;
+      for (uint32_t lsb = 0; lsb < width; ++lsb) {
+        const std::array<uint32_t, 1> guest_code = {0x1380'0023u | (is_64_bit << 31) |
+                                                    (is_64_bit << 22) | (rm << 16) | (lsb << 10)};
+        for (uint64_t input : kInputs) {
+          ThreadState interpreted{};
+          interpreted.cpu.x[1] = input;
+          interpreted.cpu.x[2] = 0xa55a'f00f'963c'c369;
+          SetInsnAddr(interpreted.cpu, ToGuestAddr(guest_code.data()));
+
+          ThreadState translated{};
+          translated.cpu.x[1] = interpreted.cpu.x[1];
+          translated.cpu.x[2] = interpreted.cpu.x[2];
+          InterpretInsn(&interpreted);
+          TranslateAndRun(guest_code, &translated);
+
+          SCOPED_TRACE(testing::Message() << "sf=" << is_64_bit << " same_source=" << same_source
+                                          << " lsb=" << lsb << " input=" << input);
+          EXPECT_EQ(translated.cpu.x[3], interpreted.cpu.x[3]);
+        }
+      }
+    }
+  }
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesLslImmediateAndExtendedAddSub) {
   // lsl x2, x1, #5; lsl w3, w4, #7;
   // add x5, x6, w7, uxtb #3; sub x8, x9, w10, sxtw #2;
@@ -776,6 +807,21 @@ TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesUnsignedImmediateLoadsAndStore
   EXPECT_EQ(state.cpu.x[3], 0x1122'3344u);
   EXPECT_EQ(memory[0], 0x1122'3344'1122'3344u);
   EXPECT_EQ(memory[2], 0xaabb'ccdd'eeff'0011u);
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteTreatsPrfumAsPrefetchHint) {
+  // prfum pldl1strm, [x20, #-112].  It must neither access memory nor treat
+  // the prefetch operation encoded in Rt as a destination register.
+  constexpr std::array<uint32_t, 1> kGuestCode = {0xf899'0281};
+  ThreadState state{};
+  state.cpu.x[1] = 0x0123'4567'89ab'cdef;
+  state.cpu.x[20] = 1;
+
+  TranslateAndRun(kGuestCode, &state);
+
+  EXPECT_EQ(state.cpu.x[1], 0x0123'4567'89ab'cdefu);
+  EXPECT_EQ(state.cpu.x[20], 1u);
+  EXPECT_EQ(GetInsnAddr(state.cpu), ToGuestAddr(kGuestCode.data() + 1));
 }
 
 TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesByteAndHalfwordMemory) {
