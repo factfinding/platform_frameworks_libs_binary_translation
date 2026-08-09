@@ -208,19 +208,22 @@ TEST(LoongArch64AssemblerTest, EncodesLsxFloatingPointInstructions) {
   assembler.VmsubW(Assembler::vr6, Assembler::vr7, Assembler::vr8);
   assembler.VbsrlV(Assembler::vr0, Assembler::vr1, 8);
   assembler.VsllwilWH(Assembler::vr2, Assembler::vr3, 15);
+  assembler.VssrarniHW(Assembler::vr0, Assembler::vr1, 12);
+  assembler.VpickevD(Assembler::vr3, Assembler::vr4, Assembler::vr5);
   assembler.Vreplgr2vrW(Assembler::vr1, Assembler::t0);
   assembler.VreplveiW(Assembler::vr2, Assembler::vr3, 0);
   assembler.VreplveiW(Assembler::vr4, Assembler::vr5, 3);
 
   // Generated independently with LLVM's LoongArch assembler and -mlsx.
-  constexpr std::array<uint32_t, 36> kExpected = {
+  constexpr std::array<uint32_t, 38> kExpected = {
       0x2c00'03e0, 0x2c40'43e1, 0x7138'9062, 0x7139'1062, 0x7130'9062, 0x7131'1062,
       0x7132'9062, 0x7133'1062, 0x713a'9062, 0x713b'1062, 0x729e'0462, 0x0104'9062,
       0x0105'1062,
       0x0106'9062, 0x0107'1062, 0x0100'9062, 0x0101'1062, 0x0102'9062, 0x0103'1062,
       0x011a'8420, 0x0114'b40c, 0x0114'a5a1, 0x0c14'0820, 0x0c12'1060, 0x0c11'18a0,
       0x0114'dc0c, 0x0914'1cc5, 0x7127'1cc5, 0x7085'0820, 0x70a9'1483, 0x70ab'20e6,
-      0x728e'a020, 0x7308'7c62, 0x729f'0981, 0x72f7'e062, 0x72f7'eca4};
+      0x728e'a020, 0x7308'7c62, 0x7368'b020, 0x711f'9483, 0x729f'0981, 0x72f7'e062,
+      0x72f7'eca4};
   ASSERT_EQ(code.install_size(), sizeof(kExpected));
   for (size_t i = 0; i < kExpected.size(); ++i) {
     EXPECT_EQ(*code.AddrAs<const uint32_t>(i * sizeof(uint32_t)), kExpected[i]) << i;

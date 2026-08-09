@@ -293,6 +293,13 @@ class LiteTranslator {
         (((insn >> 19) & 0xeu) == 0x2u)) {
       return TranslateSshll4S(insn);
     }
+    // SQRSHRN/SQRSHRN2 Vd.4H/8H, Vn.4S, #shift.  LSX performs the same
+    // rounding signed-saturating narrow; the Q form additionally preserves
+    // Vd's low 64 bits and inserts the narrowed lanes into the high half.
+    if ((insn & 0xbf80'fc00u) == 0x0f00'9c00u &&
+        (((insn >> 19) & 0xeu) == 0x2u)) {
+      return TranslateSqrshrn4H(insn);
+    }
     if ((insn & 0xffff'fc00u) == 0x4ea0'f800u) {
       return TranslateFabs4S(insn);
     }
@@ -2337,6 +2344,24 @@ class LiteTranslator {
       as_.VbsrlV(Assembler::vr1, Assembler::vr1, 8);
     }
     as_.VsllwilWH(Assembler::vr0, Assembler::vr1, shift);
+    StoreV(rd, Assembler::vr0);
+    return true;
+  }
+
+  bool TranslateSqrshrn4H(uint32_t insn) {
+    const uint32_t immh_immb = (insn >> 16) & 0x7f;
+    const uint32_t shift = 32 - immh_immb;
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    LoadV(rn, Assembler::vr1);
+    as_.VxorV(Assembler::vr0, Assembler::vr0, Assembler::vr0);
+    as_.VssrarniHW(Assembler::vr0, Assembler::vr1, shift);
+    if ((insn & 0x4000'0000u) != 0) {
+      // vpickev.d places its third operand's low 64 bits below its second
+      // operand's low 64 bits: {narrowed, old_vd.low64} in ARM lane order.
+      LoadV(rd, Assembler::vr2);
+      as_.VpickevD(Assembler::vr0, Assembler::vr0, Assembler::vr2);
+    }
     StoreV(rd, Assembler::vr0);
     return true;
   }

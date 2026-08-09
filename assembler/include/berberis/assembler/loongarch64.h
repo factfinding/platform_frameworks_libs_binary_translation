@@ -322,6 +322,13 @@ class Assembler : public AssemblerBase {
     CHECK_LT(shift, 16u);
     Emit32(0x7308'4000 | (shift << 10) | EncodeVj(vj) | EncodeVd(vd));
   }
+  void VssrarniHW(SimdRegister vd, SimdRegister vj, uint32_t shift) {
+    CHECK_LT(shift, 32u);
+    Emit32(0x7368'8000 | (shift << 10) | EncodeVj(vj) | EncodeVd(vd));
+  }
+  void VpickevD(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
+    Emit32(0x711f'8000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
+  }
   void Vreplgr2vrW(SimdRegister vd, Register rj) {
     Emit32(0x729f'0800 | EncodeRj(rj) | EncodeVd(vd));
   }
