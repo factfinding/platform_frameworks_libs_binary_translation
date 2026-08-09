@@ -1874,10 +1874,69 @@ TEST(LoongArch64RuntimeLibraryTest, LiteUcvtf4SMatchesInterpreter) {
   }
 }
 
+TEST(LoongArch64RuntimeLibraryTest, UnityInsGeneralToLiteVectorHandoffMatchesInterpreter) {
+  // Real libunity sequence observed immediately after LD1R during the original
+  // rendering-corruption diagnosis.
+  // INS (general) is intentionally interpreter-only; verify that handing its
+  // partially constructed vector to the Lite AND/UCVTF/FMUL chain preserves
+  // all lanes exactly.
+  constexpr std::array<uint32_t, 4> kInterpretedPrefix = {
+      0x4e04'0ff2,  // dup v18.4s,wzr
+      0x4e04'1ef2,  // mov v18.s[0],w23
+      0x4e0c'1f12,  // mov v18.s[1],w24
+      0x4e14'1ed2,  // mov v18.s[2],w22
+  };
+  constexpr std::array<uint32_t, 5> kLiteSuffix = {
+      0x4e31'1e51,  // and v17.16b,v18.16b,v17.16b
+      0x0b15'06b5,  // add w21,w21,w21,lsl #1
+      0x6e21'da31,  // ucvtf v17.4s,v17.4s
+      0x2a1f'03f3,  // mov w19,wzr
+      0x6e31'de10,  // fmul v16.4s,v16.4s,v17.4s
+  };
+  constexpr std::array<uint32_t, 9> kFullSequence = {
+      kInterpretedPrefix[0], kInterpretedPrefix[1], kInterpretedPrefix[2],
+      kInterpretedPrefix[3], kLiteSuffix[0],        kLiteSuffix[1],
+      kLiteSuffix[2],        kLiteSuffix[3],        kLiteSuffix[4],
+  };
+
+  auto initialize = [](ThreadState* state) {
+    state->cpu.x[21] = 0x34;
+    state->cpu.x[22] = 0x1020'3040;
+    state->cpu.x[23] = 0x5060'7080;
+    state->cpu.x[24] = 0x90a0'b0c0;
+    state->cpu.x[19] = UINT64_MAX;
+    state->cpu.v[16] = MakeUint32x4(0x3f80'0000, 0x4000'0000, 0x4040'0000, 0x4080'0000);
+    state->cpu.v[17] = MakeUint32x4(0x0000'00ff, 0x0000'ffff, 0x00ff'ffff, 0xffff'ffff);
+    state->cpu.v[18] = MakeUint128(UINT64_MAX, UINT64_MAX);
+  };
+
+  ThreadState interpreted{};
+  initialize(&interpreted);
+  SetInsnAddr(interpreted.cpu, ToGuestAddr(kFullSequence.data()));
+  for (size_t i = 0; i < kFullSequence.size(); ++i) {
+    InterpretInsn(&interpreted);
+  }
+
+  ThreadState mixed{};
+  initialize(&mixed);
+  SetInsnAddr(mixed.cpu, ToGuestAddr(kInterpretedPrefix.data()));
+  for (size_t i = 0; i < kInterpretedPrefix.size(); ++i) {
+    InterpretInsn(&mixed);
+  }
+  TranslateAndRun(kLiteSuffix, &mixed);
+
+  EXPECT_EQ(mixed.cpu.x[19], interpreted.cpu.x[19]);
+  EXPECT_EQ(mixed.cpu.x[21], interpreted.cpu.x[21]);
+  EXPECT_EQ(mixed.cpu.v[16], interpreted.cpu.v[16]);
+  EXPECT_EQ(mixed.cpu.v[17], interpreted.cpu.v[17]);
+  EXPECT_EQ(mixed.cpu.v[18], interpreted.cpu.v[18]);
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteHotStructMemoryMatchesInterpreter) {
-  constexpr std::array<uint32_t, 3> kGuestCode = {
+  constexpr std::array<uint32_t, 4> kGuestCode = {
       0x4c9f'a820,  // st1 {v0.4s,v1.4s},[x1],#32
       0x4ddf'8464,  // ld1 {v4.d}[1],[x3],#8
+      0x4d40'c930,  // ld1r {v16.4s},[x9]
       0x4d00'8121,  // st1 {v1.s}[2],[x9]
   };
 
