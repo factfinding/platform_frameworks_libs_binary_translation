@@ -1219,6 +1219,45 @@ TEST(LoongArch64RuntimeLibraryTest, LiteIntegerMulMlaMls4SMatchInterpreter) {
   }
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteIntegerAddSub4SMatchInterpreter) {
+  constexpr std::array<uint32_t, 6> kGuestCode = {
+      0x4ea2'8420,  // add v0.4s, v1.4s, v2.4s
+      0x6ea2'8420,  // sub v0.4s, v1.4s, v2.4s
+      0x4ea2'8421,  // add v1.4s, v1.4s, v2.4s (rd == rn)
+      0x6ea2'8421,  // sub v1.4s, v1.4s, v2.4s (rd == rn)
+      0x4ea2'8422,  // add v2.4s, v1.4s, v2.4s (rd == rm)
+      0x6ea2'8422,  // sub v2.4s, v1.4s, v2.4s (rd == rm)
+  };
+  constexpr std::array<std::array<__uint128_t, 2>, 3> kInputs = {{
+      {MakeUint32x4(0, 1, 0xffff'ffff, 0x8000'0000),
+       MakeUint32x4(0, 0xffff'ffff, 1, 0x8000'0000)},
+      {MakeUint32x4(0x7fff'ffff, 0x8000'0000, 0xdead'beef, 0x1234'5678),
+       MakeUint32x4(1, 1, 0x2152'4111, 0xedcb'a988)},
+      {MakeUint32x4(0xffff'fff0, 0x0000'0010, 0xaaaa'5555, 0x5555'aaaa),
+       MakeUint32x4(0x0000'0020, 0xffff'ffe0, 0x5555'aaaa, 0xaaaa'5555)},
+  }};
+
+  for (uint32_t insn : kGuestCode) {
+    for (const auto& input : kInputs) {
+      const std::array<uint32_t, 1> one_insn = {insn};
+      ThreadState interpreted{};
+      ThreadState translated{};
+      interpreted.cpu.v[1] = input[0];
+      interpreted.cpu.v[2] = input[1];
+      translated.cpu.v[1] = input[0];
+      translated.cpu.v[2] = input[1];
+      SetInsnAddr(interpreted.cpu, ToGuestAddr(one_insn.data()));
+
+      InterpretInsn(&interpreted);
+      TranslateAndRun(one_insn, &translated);
+
+      const uint32_t rd = insn & 31;
+      SCOPED_TRACE(testing::Message() << "insn=" << std::hex << insn);
+      EXPECT_EQ(translated.cpu.v[rd], interpreted.cpu.v[rd]);
+    }
+  }
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteSshll4SMatchesInterpreter) {
   constexpr std::array<uint32_t, 6> kGuestCode = {
       0x0f10'a420,  // sshll v0.4s, v1.4h, #0

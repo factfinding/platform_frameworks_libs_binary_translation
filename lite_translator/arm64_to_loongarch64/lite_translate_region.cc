@@ -278,6 +278,12 @@ class LiteTranslator {
     if ((insn & 0xffe0'fc00u) == 0x6e20'1c00u) {
       return TranslateVectorLogical(insn, 2);
     }
+    if ((insn & 0xffe0'fc00u) == 0x4ea0'8400u) {
+      return TranslateVectorAddSub4S(insn, false);  // ADD
+    }
+    if ((insn & 0xffe0'fc00u) == 0x6ea0'8400u) {
+      return TranslateVectorAddSub4S(insn, true);  // SUB
+    }
     if ((insn & 0xffe0'fc00u) == 0x4ea0'9c00u) {
       return TranslateVectorMulAcc4S(insn, 0);  // MUL
     }
@@ -2327,6 +2333,21 @@ class LiteTranslator {
       } else {
         as_.VmsubW(Assembler::vr0, Assembler::vr1, Assembler::vr2);
       }
+    }
+    StoreV(rd, Assembler::vr0);
+    return true;
+  }
+
+  bool TranslateVectorAddSub4S(uint32_t insn, bool subtract) {
+    const uint32_t rm = (insn >> 16) & 31;
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    LoadV(rn, Assembler::vr1);
+    LoadV(rm, Assembler::vr2);
+    if (subtract) {
+      as_.VsubW(Assembler::vr0, Assembler::vr1, Assembler::vr2);
+    } else {
+      as_.VaddW(Assembler::vr0, Assembler::vr1, Assembler::vr2);
     }
     StoreV(rd, Assembler::vr0);
     return true;
