@@ -1154,6 +1154,40 @@ TEST(LoongArch64RuntimeLibraryTest, LiteLsxVectorFloatMatchesInterpreter) {
   }
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteFmls4SMatchesInterpreter) {
+  constexpr std::array<uint32_t, 1> kGuestCode = {
+      0x4ea2'cc20,  // fmls v0.4s,v1.4s,v2.4s
+  };
+  constexpr std::array<std::array<__uint128_t, 3>, 3> kInputs = {{
+      {MakeUint32x4(0x3f80'0000, 0x4000'0000, 0x4040'0000, 0x4080'0000),
+       MakeUint32x4(0x4000'0000, 0xc000'0000, 0x3f00'0000, 0xbf80'0000),
+       MakeUint32x4(0x4040'0000, 0x3f00'0000, 0xc000'0000, 0x4100'0000)},
+      {MakeUint32x4(0x0000'0000, 0x8000'0000, 0x7f80'0000, 0xff80'0000),
+       MakeUint32x4(0x8000'0000, 0x0000'0000, 0x3f80'0000, 0xbf80'0000),
+       MakeUint32x4(0x3f80'0000, 0xbf80'0000, 0x0000'0000, 0x8000'0000)},
+      {MakeUint32x4(0x7fc0'1234, 0x0080'0000, 0x0000'0001, 0x3f80'0001),
+       MakeUint32x4(0x3f80'0000, 0x7fc0'5678, 0x7f7f'ffff, 0x3f7f'ffff),
+       MakeUint32x4(0x4000'0000, 0x4040'0000, 0x0080'0000, 0x3f80'0001)},
+  }};
+
+  for (const auto& input : kInputs) {
+    ThreadState interpreted{};
+    ThreadState translated{};
+    interpreted.cpu.v[0] = input[0];
+    interpreted.cpu.v[1] = input[1];
+    interpreted.cpu.v[2] = input[2];
+    translated.cpu.v[0] = input[0];
+    translated.cpu.v[1] = input[1];
+    translated.cpu.v[2] = input[2];
+    SetInsnAddr(interpreted.cpu, ToGuestAddr(kGuestCode.data()));
+
+    InterpretInsn(&interpreted);
+    TranslateAndRun(kGuestCode, &translated);
+
+    EXPECT_EQ(translated.cpu.v[0], interpreted.cpu.v[0]);
+  }
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteScalarAndVectorFpBinaryMatchInterpreter) {
   // Scalar S/D and AdvSIMD 2S/4S/2D forms of FMUL, FDIV, FADD and FSUB.
   // These dominate Unity startup math, and the narrow forms also verify that

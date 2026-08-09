@@ -280,8 +280,10 @@ class LiteTranslator {
     if ((insn & 0xffff'ffe0u) == 0x4f00'e420u) {
       return TranslateMovi16BOne(insn);
     }
-    if ((insn & 0xff20'fc00u) == 0x4e20'cc00u) {
-      return TranslateFmla4S(insn);
+    // Bit 23 distinguishes FMLA (0) from FMLS (1).
+    if ((insn & 0xffa0'fc00u) == 0x4e20'cc00u ||
+        (insn & 0xffa0'fc00u) == 0x4ea0'cc00u) {
+      return TranslateFmlaFmls4S(insn);
     }
     // Scalar FP arithmetic is pervasive in Unity startup code.  Use scalar
     // LA64 operations so inactive SIMD lanes cannot raise spurious FP flags.
@@ -2222,13 +2224,22 @@ class LiteTranslator {
     return true;
   }
 
-  bool TranslateFmla4S(uint32_t insn) {
+  bool TranslateFmlaFmls4S(uint32_t insn) {
     uint32_t rm = (insn >> 16) & 31;
     uint32_t rn = (insn >> 5) & 31;
     uint32_t rd = insn & 31;
     LoadV(rn, Assembler::vr1);
     LoadV(rm, Assembler::vr2);
     LoadV(rd, Assembler::vr0);
+    if ((insn & 0x0080'0000u) != 0) {
+      // ARM FMLS is fma(-Vn, Vm, Vd).  LoongArch VFNMSUB is arithmetically
+      // equivalent for ordinary values but differs for signed zero and NaN
+      // sign propagation.  Flip Vn's sign bit explicitly, then use VFMADD to
+      // preserve ARM's fused operation and exceptional-value behavior.
+      as_.Li(Assembler::t0, 0x8000'0000u);
+      as_.Vreplgr2vrW(Assembler::vr3, Assembler::t0);
+      as_.VxorV(Assembler::vr1, Assembler::vr1, Assembler::vr3);
+    }
     as_.VfmaddS(Assembler::vr0, Assembler::vr1, Assembler::vr2, Assembler::vr0);
     StoreV(rd, Assembler::vr0);
     return true;
