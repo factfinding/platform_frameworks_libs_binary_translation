@@ -305,6 +305,15 @@ class Assembler : public AssemblerBase {
   void VxorV(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
     Emit32(0x7127'0000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
   }
+  void VmulW(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
+    Emit32(0x7085'0000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
+  }
+  void VmaddW(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
+    Emit32(0x70a9'0000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
+  }
+  void VmsubW(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
+    Emit32(0x70ab'0000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
+  }
   void Vreplgr2vrW(SimdRegister vd, Register rj) {
     Emit32(0x729f'0800 | EncodeRj(rj) | EncodeVd(vd));
   }

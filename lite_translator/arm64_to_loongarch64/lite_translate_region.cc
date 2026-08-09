@@ -278,6 +278,15 @@ class LiteTranslator {
     if ((insn & 0xffe0'fc00u) == 0x6e20'1c00u) {
       return TranslateVectorLogical(insn, 2);
     }
+    if ((insn & 0xffe0'fc00u) == 0x4ea0'9c00u) {
+      return TranslateVectorMulAcc4S(insn, 0);  // MUL
+    }
+    if ((insn & 0xffe0'fc00u) == 0x4ea0'9400u) {
+      return TranslateVectorMulAcc4S(insn, 1);  // MLA
+    }
+    if ((insn & 0xffe0'fc00u) == 0x6ea0'9400u) {
+      return TranslateVectorMulAcc4S(insn, 2);  // MLS
+    }
     if ((insn & 0xffff'fc00u) == 0x4ea0'f800u) {
       return TranslateFabs4S(insn);
     }
@@ -2287,6 +2296,26 @@ class LiteTranslator {
     }
     as_.StD(Assembler::t0, Assembler::s8, VOffset(rd));
     as_.StD(Assembler::t1, Assembler::s8, VOffset(rd) + 8);
+    return true;
+  }
+
+  bool TranslateVectorMulAcc4S(uint32_t insn, uint32_t operation) {
+    const uint32_t rm = (insn >> 16) & 31;
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    LoadV(rn, Assembler::vr1);
+    LoadV(rm, Assembler::vr2);
+    if (operation == 0) {
+      as_.VmulW(Assembler::vr0, Assembler::vr1, Assembler::vr2);
+    } else {
+      LoadV(rd, Assembler::vr0);
+      if (operation == 1) {
+        as_.VmaddW(Assembler::vr0, Assembler::vr1, Assembler::vr2);
+      } else {
+        as_.VmsubW(Assembler::vr0, Assembler::vr1, Assembler::vr2);
+      }
+    }
+    StoreV(rd, Assembler::vr0);
     return true;
   }
 
