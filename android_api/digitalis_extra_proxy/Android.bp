@@ -54,12 +54,12 @@ cc_library_static {
         "digitalis_extra_libcamera2ndk_trampolines.cc",
         "digitalis_extra_libegl_trampolines.cc",
         "digitalis_extra_libglesv2_trampolines.cc",
+        "digitalis_extra_libnativebridge_trampolines.cc",
         "digitalis_extra_libnativewindow_trampolines.cc",
         "digitalis_extra_libwebviewchromium_plat_support_trampolines.cc",
         "digitalis_host_call_redirect.cc",
     ],
-    // Sources are #ifdef'd on __x86_64__ so non-x86_64 builds get an
-    // empty static lib.
+    // Sources are individually guarded by their supported host architectures.
 }
 
 // Host-side ground-truth verification of the libcamera2ndk shared-camera V2
