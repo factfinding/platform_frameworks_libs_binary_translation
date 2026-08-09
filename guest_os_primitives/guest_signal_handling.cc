@@ -42,6 +42,7 @@
 #include "berberis/guest_state/guest_state.h"
 // endregion
 #include "berberis/runtime_primitives/crash_reporter.h"
+#include "berberis/runtime_primitives/host_function_wrapper_impl.h"
 #include "berberis/runtime_primitives/recovery_code.h"
 
 #include "guest_signal_action.h"
@@ -160,6 +161,23 @@ void HandleHostSignal(int sig, siginfo_t* info, void* context) {
         bit_cast<void*>(GetHostRegIP(ucontext)),
         info->si_addr,
         depth);
+
+  // NULL-page faults reached through an ARM64 host proxy cannot be resumed at
+  // the native instruction, and several protection SDK handlers depend on guest
+  // siglongjmp/sigreturn details that the bootstrap LA64 bridge does not yet
+  // reproduce.  Abort the proxy transaction before queuing a guest signal.
+  // RunHostCallFromGuest retains x0 (a natural failure/no-op result for common
+  // probes such as strlen(nullptr) and memcpy(dst, nullptr, n)) and resumes at
+  // LR.  Faults outside an active proxy boundary keep normal signal semantics.
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64) && defined(__loongarch__)
+  if ((sig == SIGSEGV || sig == SIGBUS) &&
+      IsPendingSignalWithoutRecoveryCodeFatal(info) &&
+      reinterpret_cast<uintptr_t>(info->si_addr) < 4096 &&
+      IsHostCallFaultRecoveryActive()) {
+    --g_handle_host_signal_depth;
+    RecoverHostCallFault();
+  }
+#endif
 
   bool attached;
   GuestThread* thread = AttachCurrentThread(false, &attached);

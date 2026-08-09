@@ -18,6 +18,7 @@
 
 #include <map>
 #include <mutex>
+#include <setjmp.h>
 
 #include "berberis/assembler/machine_code.h"
 #include "berberis/base/tracing.h"
@@ -42,6 +43,7 @@ struct HostCallData {
 
 std::mutex g_host_calls_mutex;
 std::map<GuestAddr, HostCallData> g_host_calls;
+thread_local sigjmp_buf* g_host_call_fault_recovery;
 
 }  // namespace
 #endif
@@ -89,10 +91,8 @@ void RunHostCallFromGuest(ThreadState* state) {
   CPUState& cpu = GetCPUState(*state);
   const GuestAddr pc = GetInsnAddr(cpu);
   // A wrapped function has a process-lifetime-stable trampoline mapping, and
-  // native-heavy code commonly calls the same function repeatedly (strlen is
-  // a prominent Unity startup example).  Avoid taking the global registration
-  // lock and walking std::map on every call.  Keep the cache thread-local so a
-  // callback that enters guest code on another thread cannot race with it.
+  // native-heavy code commonly calls the same function repeatedly.  Avoid
+  // taking the global registration lock and walking std::map on every call.
   thread_local GuestAddr cached_pc = 0;
   thread_local HostCallData cached_call{};
   if (pc != cached_pc) {
@@ -102,12 +102,38 @@ void RunHostCallFromGuest(ThreadState* state) {
     cached_call = it->second;
     cached_pc = pc;
   }
+  // A synchronous fault in a proxied host function has no generated-code
+  // recovery PC.  Establish a per-thread escape point so HandleHostSignal can
+  // abort the host transaction without terminating the process.
+  sigjmp_buf recovery;
+  sigjmp_buf* previous_recovery = g_host_call_fault_recovery;
+  g_host_call_fault_recovery = &recovery;
+  if (sigsetjmp(recovery, 1) != 0) {
+    g_host_call_fault_recovery = previous_recovery;
+    // The native proxy call was unwound, so it cannot be retried at the guest
+    // wrapper address.  Resume its caller and retain x0 as the compatibility
+    // result.
+    SetInsnAddr(cpu, GetLinkRegister(cpu));
+    return;
+  }
   cached_call.trampoline(cached_call.func, state);
+  g_host_call_fault_recovery = previous_recovery;
   SetInsnAddr(cpu, GetLinkRegister(cpu));
 #else
   UNUSED(state);
 #endif
 }
+
+#if defined(__loongarch__)
+bool IsHostCallFaultRecoveryActive() {
+  return g_host_call_fault_recovery != nullptr;
+}
+
+[[noreturn]] void RecoverHostCallFault() {
+  CHECK(g_host_call_fault_recovery);
+  siglongjmp(*g_host_call_fault_recovery, 1);
+}
+#endif
 
 void* UnwrapHostFunction(GuestAddr pc) {
   if (TranslationCache::GetInstance()->IsHostFunctionWrapped(pc)) {

@@ -45,6 +45,13 @@ void MakeTrampolineCallable(GuestAddr pc,
 // Interpreter-only hosts dispatch wrapped functions without generated code.
 void RunHostCallFromGuest(ThreadState* state);
 
+// LoongArch64 host-call fault boundary.  HandleHostSignal uses this to unwind
+// a faulting native proxy without terminating the guest process.
+#if defined(__loongarch__)
+bool IsHostCallFaultRecoveryActive();
+[[noreturn]] void RecoverHostCallFault();
+#endif
+
 inline void WrapHostFunctionImpl(HostCode func, TrampolineFunc trampoline_func, const char* name) {
   MakeTrampolineCallable(ToGuestAddr(func), true, trampoline_func, func, name);
 }

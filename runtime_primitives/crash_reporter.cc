@@ -31,6 +31,7 @@
 #include "berberis/base/gettid.h"
 #include "berberis/base/tracing.h"
 #include "berberis/instrument/crash.h"
+#include "berberis/runtime_primitives/host_function_wrapper_impl.h"
 
 namespace berberis {
 
@@ -42,6 +43,17 @@ struct sigaction g_orig_action[NSIG];
 
 void HandleFatalSignal(int sig, siginfo_t* info, void* context) {
   TRACE("Fatal signal %d", sig);
+
+#if defined(__loongarch__)
+  // libsigchain may dispatch this crash reporter before the guest fault
+  // handler.  Recover a kernel-originated NULL-page fault while a wrapped host
+  // call is active; every other fault keeps the normal crash-reporting path.
+  if ((sig == SIGSEGV || sig == SIGBUS) && info && info->si_code > 0 &&
+      reinterpret_cast<uintptr_t>(info->si_addr) < 4096 &&
+      IsHostCallFaultRecoveryActive()) {
+    RecoverHostCallFault();
+  }
+#endif
 
   // region digitalis - unconditional logcat dump of host signal frame so the
   // FB Katana / breakpad-style second-SEGV path produces a visible diagnostic
