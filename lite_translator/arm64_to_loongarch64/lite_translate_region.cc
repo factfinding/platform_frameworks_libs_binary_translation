@@ -287,6 +287,12 @@ class LiteTranslator {
     if ((insn & 0xffe0'fc00u) == 0x6ea0'9400u) {
       return TranslateVectorMulAcc4S(insn, 2);  // MLS
     }
+    // SSHLL/SSHLL2 Vd.4S, Vn.4H/8H, #shift.  These widening shifts are hot in
+    // HEVC inverse transforms.  immh=001x selects the 16-to-32-bit form.
+    if ((insn & 0xbf80'fc00u) == 0x0f00'a400u &&
+        (((insn >> 19) & 0xeu) == 0x2u)) {
+      return TranslateSshll4S(insn);
+    }
     if ((insn & 0xffff'fc00u) == 0x4ea0'f800u) {
       return TranslateFabs4S(insn);
     }
@@ -2315,6 +2321,22 @@ class LiteTranslator {
         as_.VmsubW(Assembler::vr0, Assembler::vr1, Assembler::vr2);
       }
     }
+    StoreV(rd, Assembler::vr0);
+    return true;
+  }
+
+  bool TranslateSshll4S(uint32_t insn) {
+    const uint32_t immh_immb = (insn >> 16) & 0x7f;
+    const uint32_t shift = immh_immb - 16;
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    LoadV(rn, Assembler::vr1);
+    if ((insn & 0x4000'0000u) != 0) {
+      // SSHLL2 widens Vn's upper four halfwords.  Move that 64-bit half down
+      // before LSX widens the low four signed halfwords.
+      as_.VbsrlV(Assembler::vr1, Assembler::vr1, 8);
+    }
+    as_.VsllwilWH(Assembler::vr0, Assembler::vr1, shift);
     StoreV(rd, Assembler::vr0);
     return true;
   }
