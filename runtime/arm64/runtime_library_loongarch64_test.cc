@@ -1154,6 +1154,34 @@ TEST(LoongArch64RuntimeLibraryTest, LiteLsxVectorFloatMatchesInterpreter) {
   }
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteTbl16BMatchesInterpreterWithAliasedIndex) {
+  // FFmpeg HEVC hot path: tbl v19.16b, {v8.16b-v11.16b}, v19.16b.
+  // Vd == Vm is intentional and verifies that translation consumes every
+  // index before committing the destination.
+  constexpr std::array<uint32_t, 1> kGuestCode = {0x4e13'6113};
+  constexpr std::array<uint8_t, 16> kIndices = {
+      0, 15, 16, 31, 32, 47, 48, 63, 64, 255, 7, 23, 39, 55, 1, 62};
+
+  ThreadState interpreted{};
+  ThreadState translated{};
+  for (uint32_t reg = 8; reg <= 11; ++reg) {
+    uint8_t bytes[16];
+    for (uint32_t lane = 0; lane < 16; ++lane) {
+      bytes[lane] = static_cast<uint8_t>((reg - 8) * 16 + lane + 0x40);
+    }
+    memcpy(&interpreted.cpu.v[reg], bytes, sizeof(bytes));
+    memcpy(&translated.cpu.v[reg], bytes, sizeof(bytes));
+  }
+  memcpy(&interpreted.cpu.v[19], kIndices.data(), kIndices.size());
+  memcpy(&translated.cpu.v[19], kIndices.data(), kIndices.size());
+  SetInsnAddr(interpreted.cpu, ToGuestAddr(kGuestCode.data()));
+
+  InterpretInsn(&interpreted);
+  TranslateAndRun(kGuestCode, &translated);
+
+  EXPECT_EQ(translated.cpu.v[19], interpreted.cpu.v[19]);
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteFmls4SMatchesInterpreter) {
   constexpr std::array<uint32_t, 1> kGuestCode = {
       0x4ea2'cc20,  // fmls v0.4s,v1.4s,v2.4s
