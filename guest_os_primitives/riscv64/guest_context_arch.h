@@ -32,7 +32,7 @@ class GuestContext {
   GuestContext(const GuestContext&) = delete;
   GuestContext& operator=(const GuestContext&) = delete;
 
-  void Save(const CPUState* cpu) {
+  void Save(const CPUState* cpu, uint64_t /*fault_address*/ = 0) {
     // Save everything.
     cpu_ = *cpu;
 

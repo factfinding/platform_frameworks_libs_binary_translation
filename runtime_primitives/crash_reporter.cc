@@ -38,11 +38,21 @@ namespace berberis {
 namespace {
 
 struct sigaction g_orig_action[NSIG];
+DirectGuestCallHook g_direct_guest_call_hook = nullptr;
 
 }  // namespace
 
+void SetDirectGuestCallHook(DirectGuestCallHook hook) {
+  g_direct_guest_call_hook = hook;
+}
+
 void HandleFatalSignal(int sig, siginfo_t* info, void* context) {
   TRACE("Fatal signal %d", sig);
+
+  if (g_direct_guest_call_hook != nullptr &&
+      g_direct_guest_call_hook(sig, info, context)) {
+    return;
+  }
 
 #if defined(__loongarch__)
   // libsigchain may dispatch this crash reporter before the guest fault
@@ -64,10 +74,20 @@ void HandleFatalSignal(int sig, siginfo_t* info, void* context) {
 #if defined(__ANDROID__)
   {
     auto* uc = static_cast<ucontext_t*>(context);
+    unsigned long host_ra = 0;
+    unsigned long host_a0 = 0;
+    unsigned long host_a1 = 0;
+    unsigned long host_a2 = 0;
+    unsigned long host_a3 = 0;
 #if defined(__loongarch__)
     unsigned long host_pc = uc ? static_cast<unsigned long>(uc->uc_mcontext.sc_pc) : 0;
     unsigned long host_sp = uc ? static_cast<unsigned long>(uc->uc_mcontext.sc_regs[3]) : 0;
     unsigned long host_fp = uc ? static_cast<unsigned long>(uc->uc_mcontext.sc_regs[22]) : 0;
+    host_ra = uc ? static_cast<unsigned long>(uc->uc_mcontext.sc_regs[1]) : 0;
+    host_a0 = uc ? static_cast<unsigned long>(uc->uc_mcontext.sc_regs[4]) : 0;
+    host_a1 = uc ? static_cast<unsigned long>(uc->uc_mcontext.sc_regs[5]) : 0;
+    host_a2 = uc ? static_cast<unsigned long>(uc->uc_mcontext.sc_regs[6]) : 0;
+    host_a3 = uc ? static_cast<unsigned long>(uc->uc_mcontext.sc_regs[7]) : 0;
 #elif defined(__x86_64__)
     unsigned long host_pc =
         uc ? static_cast<unsigned long>(uc->uc_mcontext.gregs[REG_RIP]) : 0;
@@ -83,9 +103,10 @@ void HandleFatalSignal(int sig, siginfo_t* info, void* context) {
     __android_log_print(
         ANDROID_LOG_ERROR, "berberis",
         "HandleFatalSignal: sig=%d si_addr=%p si_code=%d host_pc=0x%lx "
-        "host_sp=0x%lx host_fp=0x%lx",
+        "host_sp=0x%lx host_fp=0x%lx host_ra=0x%lx "
+        "host_a0=0x%lx host_a1=0x%lx host_a2=0x%lx host_a3=0x%lx",
         sig, info ? info->si_addr : nullptr, info ? info->si_code : 0,
-        host_pc, host_sp, host_fp);
+        host_pc, host_sp, host_fp, host_ra, host_a0, host_a1, host_a2, host_a3);
   }
 #endif
   // endregion

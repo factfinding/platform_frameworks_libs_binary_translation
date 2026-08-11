@@ -24,6 +24,13 @@ namespace berberis {
 void InitCrashReporter();
 void HandleFatalSignal(int sig, siginfo_t* info, void* context);
 
+// Optional last-chance recovery for a host control-flow transfer into guest
+// code.  A native bridge may use it to replace the interrupted host PC with a
+// host-callable guest wrapper.  The hook runs in signal context and must only
+// inspect lock-free state and modify the supplied ucontext.
+using DirectGuestCallHook = bool (*)(int sig, siginfo_t* info, void* context);
+void SetDirectGuestCallHook(DirectGuestCallHook hook);
+
 }  // namespace berberis
 
 #endif  // BERBERIS_RUNTIME_PRIMITIVES_CRASH_REPORTER_H_

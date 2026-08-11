@@ -20,21 +20,21 @@
 namespace berberis {
 
 // Guest struct (__kernel_)sigaction, as expected by rt_sigaction syscall.
-// ARM64 sigaction includes sa_restorer (same as x86_64, unlike RISC-V).
+// ARM64 uses asm-generic's layout without SA_RESTORER.  Do not confuse this
+// with bionic's public struct sigaction, which has a source-compatible
+// sa_restorer member that bionic removes before issuing the syscall.
 struct Guest_sigaction {
   // Prefix avoids conflict with original 'sa_sigaction' defined as macro.
   GuestAddr guest_sa_sigaction;
   unsigned long sa_flags;
-  GuestAddr sa_restorer;
   Guest_sigset_t sa_mask;
 };
 
 #if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
-CHECK_STRUCT_LAYOUT(Guest_sigaction, 256, 64);
+CHECK_STRUCT_LAYOUT(Guest_sigaction, 192, 64);
 CHECK_FIELD_LAYOUT(Guest_sigaction, guest_sa_sigaction, 0, 64);
 CHECK_FIELD_LAYOUT(Guest_sigaction, sa_flags, 64, 64);
-CHECK_FIELD_LAYOUT(Guest_sigaction, sa_restorer, 128, 64);
-CHECK_FIELD_LAYOUT(Guest_sigaction, sa_mask, 192, 64);
+CHECK_FIELD_LAYOUT(Guest_sigaction, sa_mask, 128, 64);
 #else
 #error "Unexpected guest arch."
 #endif

@@ -598,8 +598,32 @@ bool SetGuestSignalHandler(int signal,
   }
 
   std::lock_guard<std::mutex> lock(*GetSignalActionsGuardMutex());
-  GuestSignalAction& action = GetCurrentGuestThread()->GetSignalActionsTable()->at(signal - 1);
-  return action.Change(signal, act, HandleHostSignal, old_act, error);
+  GuestThread* thread = GetCurrentGuestThread();
+  GuestSignalActionsTable* table = thread->GetSignalActionsTable();
+  GuestSignalAction& action = table->at(signal - 1);
+  bool changed = action.Change(signal, act, HandleHostSignal, old_act, error);
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+  if (signal == SIGSEGV || signal == SIGBUS) {
+    __android_log_print(ANDROID_LOG_ERROR,
+                        "berberis",
+                        "Guest rt_sigaction tid=%d sig=%d table=%p act=%p handler=%p flags=0x%llx "
+                        "old=%p result=%d error=%d stored=%p",
+                        static_cast<int>(GettidSyscall()),
+                        signal,
+                        table,
+                        act,
+                        act ? reinterpret_cast<void*>(act->guest_sa_sigaction) : nullptr,
+                        act ? static_cast<unsigned long long>(act->sa_flags) : 0ULL,
+                        old_act,
+                        changed,
+                        changed ? 0 : *error,
+                        action.TryGetGuestAction()
+                            ? reinterpret_cast<void*>(
+                                  action.TryGetGuestAction()->guest_sa_sigaction)
+                            : nullptr);
+  }
+#endif
+  return changed;
 }
 
 // region digitalis

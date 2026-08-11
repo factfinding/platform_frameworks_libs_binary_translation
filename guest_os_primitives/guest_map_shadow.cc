@@ -190,9 +190,18 @@ void GuestMapShadow::SetExecutable(GuestAddr start, size_t size) {
   // endregion
   GuestAddr end = AlignUpGuestPageSize(start + size);
   GuestAddr pc = AlignDownGuestPageSize(start);
+  bool changed = false;
   while (pc < end) {
-    SetExecAddr(pc, 1);
+    changed |= SetExecAddr(pc, 1);
     pc += kGuestPageSize;
+  }
+  // A lookup can race ahead of a dynamic loader and cache kEntryNoExec before
+  // the loader publishes the executable mapping.  Merely setting the shadow
+  // bit leaves that special cache entry in place forever, so execution keeps
+  // returning to berberis_HandleNoExec even though the mapping is now valid.
+  // Invalidate only on an actual non-executable -> executable transition.
+  if (changed) {
+    InvalidateGuestRange(start, end);
   }
 }
 

@@ -27,18 +27,8 @@ size_t GetGuest_MINSIGSTKSZ() {
   return 5120;
 }
 
-void CheckSigactionRestorer(const Guest_sigaction* guest_sa) {
-  // ARM64 sigaction has sa_restorer field.
-  // Check that the restorer is the kernel-provided one.
-  TRACE("Checking arm64 sa_restorer in guest sigaction");
-  if (guest_sa->sa_restorer != 0) {
-    TRACE("Guest sigaction has non-zero sa_restorer: 0x%lx",
-          static_cast<unsigned long>(guest_sa->sa_restorer));
-  }
-}
+void CheckSigactionRestorer(const Guest_sigaction* /*guest_sa*/) {}
 
-void ResetSigactionRestorer(Guest_sigaction* guest_sa) {
-  guest_sa->sa_restorer = 0;
-}
+void ResetSigactionRestorer(Guest_sigaction* /*guest_sa*/) {}
 
 }  // namespace berberis

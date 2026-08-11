@@ -53,7 +53,7 @@ void ProcessGuestSignal(GuestThread* thread, const Guest_sigaction* sa, Guest_si
   // Save state to ucontext.
   ThreadState* state = thread->state();
   GuestContext ctx;
-  ctx.Save(&state->cpu);
+  ctx.Save(&state->cpu, ToGuestAddr(info->si_addr));
 
   // region digitalis - capture pre-altstack SP for diagnostics (arm64-guest
   // only; consumed by the forensics TRACE below).

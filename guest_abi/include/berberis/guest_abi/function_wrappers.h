@@ -138,8 +138,13 @@ class TrampolineFuncGenerator<Res(Args...), kCallingConventionsVariant> {
       if constexpr (std::is_pointer_v<std::tuple_element_t<0, std::tuple<Args...>>>) {
         auto raw_x0 = state->cpu.x[0];
         if (raw_x0 != 0 && raw_x0 < 0x10000) {
-          TRACE_AND_ALOGE("BAD proxy PRE-EXTRACT: raw_x0=0x%lx func=%p pc=0x%lx lr=0x%lx",
-              (unsigned long)raw_x0, reinterpret_cast<void*>(func),
+          Dl_info dli{};
+          dladdr(reinterpret_cast<void*>(func), &dli);
+          TRACE_AND_ALOGE("BAD proxy PRE-EXTRACT: raw_x0=0x%lx func=%s(%p) file=%s "
+                          "base=%p pc=0x%lx lr=0x%lx",
+              (unsigned long)raw_x0,
+              dli.dli_sname ? dli.dli_sname : "??", reinterpret_cast<void*>(func),
+              dli.dli_fname ? dli.dli_fname : "??", dli.dli_fbase,
               (unsigned long)state->cpu.insn_addr, (unsigned long)state->cpu.x[30]);
           TRACE_AND_ALOGE("  x0=0x%lx x1=0x%lx x2=0x%lx x3=0x%lx x8=0x%lx x29=0x%lx",
               (unsigned long)state->cpu.x[0], (unsigned long)state->cpu.x[1],

@@ -35,12 +35,13 @@ class GuestContext {
   GuestContext(const GuestContext&) = delete;
   GuestContext& operator=(const GuestContext&) = delete;
 
-  void Save(const CPUState* cpu) {
+  void Save(const CPUState* cpu, uint64_t fault_address = 0) {
     // Save everything.
     cpu_ = *cpu;
 
     // Save context.
     memset(&ctx_, 0, sizeof(ctx_));
+    ctx_.uc_mcontext.fault_address = fault_address;
     // x0-x30
     static_assert(sizeof(cpu->x) == sizeof(ctx_.uc_mcontext.regs));
     memcpy(ctx_.uc_mcontext.regs, cpu->x, sizeof(ctx_.uc_mcontext.regs));
