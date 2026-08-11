@@ -23,9 +23,9 @@ PRODUCT_SYSTEM_PROPERTIES += \
     ro.dalvik.vm.native.bridge=libberberis_arm64.so \
     ro.dalvik.vm.isa.arm64=loongarch64 \
     ro.enable.native.bridge.exec=1 \
-    ro.product.cpu.abilist=loongarch64,lp64d,arm64-v8a \
+    ro.product.cpu.abilist=arm64-v8a,loongarch64,lp64d \
     ro.product.cpu.abilist32= \
-    ro.product.cpu.abilist64=loongarch64,lp64d,arm64-v8a
+    ro.product.cpu.abilist64=arm64-v8a,loongarch64,lp64d
 
 PRODUCT_SOONG_NAMESPACES += frameworks/libs/native_bridge_support/android_api/libc
 
