@@ -17,6 +17,7 @@
 #include "translator.h"
 
 #include <array>
+#include <atomic>
 #include <cstring>
 #include <tuple>
 
@@ -45,8 +46,12 @@ enum class TranslationMode {
 // for arbitrary APK startup code.  Set berberis.mode to
 // lite-translate-or-interpret to exercise translated regions.
 TranslationMode g_translation_mode = TranslationMode::kInterpretOnly;
-uint64_t g_jit_successes;
-uint64_t g_jit_fallbacks;
+std::atomic<uint64_t> g_jit_successes;
+std::atomic<uint64_t> g_jit_fallbacks;
+std::atomic<uint64_t> g_jit_guest_insns;
+std::atomic<uint64_t> g_jit_host_bytes;
+constexpr size_t kJitRegionBucketCount = 7;
+std::array<std::atomic<uint64_t>, kJitRegionBucketCount> g_jit_region_buckets{};
 // A failed translation attempt is followed by one adaptive interpreter batch
 // on the same host thread. Isolated unsupported instructions should hand the
 // next PC back to the translator immediately, while runs of unsupported code
@@ -56,6 +61,68 @@ thread_local int g_next_interpreter_batch_size;
 
 constexpr int kDefaultJitInterpreterBatchSize = 16;
 constexpr uint32_t kMaxJitFallbackBackoffShift = 4;
+
+constexpr size_t GetJitRegionBucket(size_t guest_insns) {
+  if (guest_insns <= 1) {
+    return 0;
+  }
+  if (guest_insns == 2) {
+    return 1;
+  }
+  if (guest_insns <= 4) {
+    return 2;
+  }
+  if (guest_insns <= 8) {
+    return 3;
+  }
+  if (guest_insns <= 16) {
+    return 4;
+  }
+  if (guest_insns <= 32) {
+    return 5;
+  }
+  return 6;
+}
+
+static_assert(GetJitRegionBucket(1) == 0);
+static_assert(GetJitRegionBucket(2) == 1);
+static_assert(GetJitRegionBucket(3) == 2);
+static_assert(GetJitRegionBucket(8) == 3);
+static_assert(GetJitRegionBucket(16) == 4);
+static_assert(GetJitRegionBucket(32) == 5);
+static_assert(GetJitRegionBucket(64) == 6);
+
+uint64_t RecordJitRegion(size_t guest_size, size_t host_size) {
+  size_t guest_insns = guest_size / sizeof(uint32_t);
+  uint64_t regions = g_jit_successes.fetch_add(1, std::memory_order_relaxed) + 1;
+  g_jit_guest_insns.fetch_add(guest_insns, std::memory_order_relaxed);
+  g_jit_host_bytes.fetch_add(host_size, std::memory_order_relaxed);
+  g_jit_region_buckets[GetJitRegionBucket(guest_insns)].fetch_add(1, std::memory_order_relaxed);
+
+  // Region installation is cold compared with region execution.  Report a
+  // cumulative snapshot at exponentially increasing intervals so production
+  // runs retain useful region-quality data without per-dispatch overhead.
+  if ((regions & (regions - 1)) == 0) {
+    uint64_t total_guest_insns = g_jit_guest_insns.load(std::memory_order_relaxed);
+    uint64_t total_host_bytes = g_jit_host_bytes.load(std::memory_order_relaxed);
+    TRACE_AND_ALOGD(
+        "berberis-la64: region-stats regions=%lu guest_insns=%lu host_bytes=%lu "
+        "avg_guest_x100=%lu avg_host_bytes_x100=%lu buckets=%lu,%lu,%lu,%lu,%lu,%lu,%lu",
+        static_cast<unsigned long>(regions),
+        static_cast<unsigned long>(total_guest_insns),
+        static_cast<unsigned long>(total_host_bytes),
+        static_cast<unsigned long>(total_guest_insns * 100 / regions),
+        static_cast<unsigned long>(total_host_bytes * 100 / regions),
+        static_cast<unsigned long>(g_jit_region_buckets[0].load(std::memory_order_relaxed)),
+        static_cast<unsigned long>(g_jit_region_buckets[1].load(std::memory_order_relaxed)),
+        static_cast<unsigned long>(g_jit_region_buckets[2].load(std::memory_order_relaxed)),
+        static_cast<unsigned long>(g_jit_region_buckets[3].load(std::memory_order_relaxed)),
+        static_cast<unsigned long>(g_jit_region_buckets[4].load(std::memory_order_relaxed)),
+        static_cast<unsigned long>(g_jit_region_buckets[5].load(std::memory_order_relaxed)),
+        static_cast<unsigned long>(g_jit_region_buckets[6].load(std::memory_order_relaxed)));
+  }
+  return regions;
+}
 
 constexpr int GetJitFallbackBatchSize(uint32_t consecutive_fallbacks) {
   uint32_t shift = consecutive_fallbacks == 0 ? 0 : consecutive_fallbacks - 1;
@@ -169,10 +236,10 @@ void TranslateRegion(GuestAddr pc) {
     if (success) {
       g_consecutive_jit_fallbacks = 0;
       g_next_interpreter_batch_size = 0;
-      ++g_jit_successes;
-      if (g_jit_successes <= 20 || g_jit_successes % 1000 == 0) {
+      uint64_t jit_successes = RecordJitRegion(size, piece.size);
+      if (jit_successes <= 20 || jit_successes % 1000 == 0) {
         TRACE_AND_ALOGD("berberis-la64: JIT #%lu pc=0x%lx insns=%lu",
-                        static_cast<unsigned long>(g_jit_successes),
+                        static_cast<unsigned long>(jit_successes),
                         static_cast<unsigned long>(pc),
                         static_cast<unsigned long>(size / 4));
       }
@@ -186,10 +253,10 @@ void TranslateRegion(GuestAddr pc) {
     }
     g_next_interpreter_batch_size =
         GetJitFallbackBatchSize(g_consecutive_jit_fallbacks);
-    ++g_jit_fallbacks;
-    if (g_jit_fallbacks <= 20 || g_jit_fallbacks % 1000 == 0) {
+    uint64_t jit_fallbacks = g_jit_fallbacks.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (jit_fallbacks <= 20 || jit_fallbacks % 1000 == 0) {
       TRACE_AND_ALOGD("berberis-la64: fallback #%lu pc=0x%lx insn=0x%08x batch=%d",
-                      static_cast<unsigned long>(g_jit_fallbacks),
+                      static_cast<unsigned long>(jit_fallbacks),
                       static_cast<unsigned long>(pc),
                       *ToHostAddr<const uint32_t>(pc),
                       g_next_interpreter_batch_size);
