@@ -70,9 +70,7 @@ CachedXRegisterMap SelectCachedXRegisters(GuestAddr start_pc, GuestAddr end_pc) 
         best_reg = reg;
       }
     }
-    // A one-use value merely replaces one ThreadState access with a preload
-    // plus a move (and possibly a flush), increasing both work and code size.
-    if (best_reg == 31 || uses[best_reg] < 2) {
+    if (best_reg == 31) {
       break;
     }
     result[best_reg] = slot;
