@@ -278,6 +278,9 @@ class LiteTranslator {
     if ((insn & 0xffe0'fc00u) == 0x4ea0'8400u) {
       return TranslateVectorAddSub4S(insn, false);  // ADD
     }
+    if ((insn & 0xffe0'fc00u) == 0x4ee0'8400u) {
+      return TranslateVectorAdd2D(insn);
+    }
     if ((insn & 0xffe0'fc00u) == 0x6ea0'8400u) {
       return TranslateVectorAddSub4S(insn, true);  // SUB
     }
@@ -337,6 +340,18 @@ class LiteTranslator {
     }
     if ((insn & 0xffff'ffe0u) == 0x4f00'e420u) {
       return TranslateMovi16BOne(insn);
+    }
+    if ((insn & 0xffff'ffe0u) == 0x6f07'e7e0u) {
+      return TranslateMoviConstant(insn, UINT64_MAX, UINT64_MAX);
+    }
+    if ((insn & 0xffff'ffe0u) == 0x6f00'e5e0u) {
+      return TranslateMoviConstant(insn, UINT32_MAX, UINT32_MAX);
+    }
+    if ((insn & 0xffff'ffe0u) == 0x2f00'e5e0u) {
+      return TranslateMoviConstant(insn, UINT32_MAX, 0);
+    }
+    if ((insn & 0xffff'ffe0u) == 0x0f00'0420u) {
+      return TranslateMoviConstant(insn, 0x0000'0001'0000'0001ULL, 0);
     }
     // Bit 23 distinguishes FMLA (0) from FMLS (1).
     if ((insn & 0xffa0'fc00u) == 0x4e20'cc00u ||
@@ -433,6 +448,9 @@ class LiteTranslator {
     if ((insn & 0x1fe0'0800u) == 0x1a80'0000u) {
       return TranslateConditionalSelect(insn);
     }
+    if ((insn & 0x7fe0'fc00u) == 0x1a00'0000u) {
+      return TranslateAdc(insn);
+    }
     if ((insn & 0x3fe0'0410u) == 0x3a40'0000u) {
       return TranslateConditionalCompare(insn);
     }
@@ -444,6 +462,9 @@ class LiteTranslator {
     }
     if ((insn & 0xffe0'fc00u) == 0x9bc0'7c00u) {
       return TranslateUmulh(insn);
+    }
+    if ((insn & 0xffe0'fc00u) == 0x9b40'7c00u) {
+      return TranslateSmulh(insn);
     }
     if ((insn & 0xffe0'fc00u) == 0x9ba0'7c00u) {
       return TranslateUmull(insn);
@@ -1267,6 +1288,41 @@ class LiteTranslator {
     LoadXOrZero(rn, Assembler::t0);
     LoadXOrZero(rm, Assembler::t1);
     as_.MulhDU(Assembler::t0, Assembler::t0, Assembler::t1);
+    StoreXOrDiscard(rd, Assembler::t0);
+    return true;
+  }
+
+  bool TranslateSmulh(uint32_t insn) {
+    const uint32_t rm = (insn >> 16) & 31;
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    LoadXOrZero(rn, Assembler::t0);
+    LoadXOrZero(rm, Assembler::t1);
+    as_.MulhD(Assembler::t0, Assembler::t0, Assembler::t1);
+    StoreXOrDiscard(rd, Assembler::t0);
+    return true;
+  }
+
+  bool TranslateAdc(uint32_t insn) {
+    const bool is_64_bit = (insn >> 31) != 0;
+    const uint32_t rm = (insn >> 16) & 31;
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    LoadXOrZero(rn, Assembler::t0);
+    LoadXOrZero(rm, Assembler::t1);
+    if (!is_64_bit) {
+      ZeroExtend32(Assembler::t0);
+      ZeroExtend32(Assembler::t1);
+    }
+    as_.LdWU(Assembler::t2, Assembler::s8, kFlagsOffset);
+    as_.SrliD(Assembler::t2, Assembler::t2, 1);
+    as_.AddiD(Assembler::t3, Assembler::zero, 1);
+    as_.And(Assembler::t2, Assembler::t2, Assembler::t3);
+    as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
+    as_.AddD(Assembler::t0, Assembler::t0, Assembler::t2);
+    if (!is_64_bit) {
+      ZeroExtend32(Assembler::t0);
+    }
     StoreXOrDiscard(rd, Assembler::t0);
     return true;
   }
@@ -2492,6 +2548,17 @@ class LiteTranslator {
     return true;
   }
 
+  bool TranslateVectorAdd2D(uint32_t insn) {
+    const uint32_t rm = (insn >> 16) & 31;
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    LoadV(rn, Assembler::vr1);
+    LoadV(rm, Assembler::vr2);
+    as_.VaddD(Assembler::vr0, Assembler::vr1, Assembler::vr2);
+    StoreV(rd, Assembler::vr0);
+    return true;
+  }
+
   bool TranslateFaddp2S(uint32_t insn) {
     const uint32_t rm = (insn >> 16) & 31;
     const uint32_t rn = (insn >> 5) & 31;
@@ -2699,6 +2766,15 @@ class LiteTranslator {
     uint32_t rd = insn & 31;
     as_.Li(Assembler::t0, 0x0101'0101'0101'0101ULL);
     as_.StD(Assembler::t0, Assembler::s8, VOffset(rd));
+    as_.StD(Assembler::t0, Assembler::s8, VOffset(rd) + 8);
+    return true;
+  }
+
+  bool TranslateMoviConstant(uint32_t insn, uint64_t low, uint64_t high) {
+    const uint32_t rd = insn & 31;
+    as_.Li(Assembler::t0, low);
+    as_.StD(Assembler::t0, Assembler::s8, VOffset(rd));
+    as_.Li(Assembler::t0, high);
     as_.StD(Assembler::t0, Assembler::s8, VOffset(rd) + 8);
     return true;
   }

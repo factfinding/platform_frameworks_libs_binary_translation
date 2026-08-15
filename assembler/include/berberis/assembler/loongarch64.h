@@ -146,6 +146,7 @@ class Assembler : public AssemblerBase {
   void Or(Register rd, Register rj, Register rk) { Emit3R(0x0015'0000, rd, rj, rk); }
   void Xor(Register rd, Register rj, Register rk) { Emit3R(0x0015'8000, rd, rj, rk); }
   void MulD(Register rd, Register rj, Register rk) { Emit3R(0x001d'8000, rd, rj, rk); }
+  void MulhD(Register rd, Register rj, Register rk) { Emit3R(0x001e'0000, rd, rj, rk); }
   void MulhDU(Register rd, Register rj, Register rk) { Emit3R(0x001e'8000, rd, rj, rk); }
   void ClzW(Register rd, Register rj) { Emit2R(0x0000'1400, rd, rj); }
   void ClzD(Register rd, Register rj) { Emit2R(0x0000'2400, rd, rj); }
@@ -334,6 +335,9 @@ class Assembler : public AssemblerBase {
   }
   void VaddW(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
     Emit32(0x700b'0000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
+  }
+  void VaddD(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
+    Emit32(0x700b'8000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
   }
   void VsubW(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
     Emit32(0x700d'0000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));

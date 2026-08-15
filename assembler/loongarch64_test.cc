@@ -226,6 +226,21 @@ TEST(LoongArch64AssemblerTest, EncodesHotLsxConversionsAndComparisons) {
   }
 }
 
+TEST(LoongArch64AssemblerTest, EncodesHotSignedMultiplyAndVectorAdd) {
+  MachineCode code;
+  Assembler assembler(&code);
+
+  assembler.MulhD(Assembler::t0, Assembler::t1, Assembler::t2);
+  assembler.VaddD(Assembler::vr2, Assembler::vr3, Assembler::vr4);
+
+  // Generated independently with LLVM 21 llvm-mc for LoongArch64 and LSX.
+  constexpr std::array<uint32_t, 2> kExpected = {0x001e'39ac, 0x700b'9062};
+  ASSERT_EQ(code.install_size(), sizeof(kExpected));
+  for (size_t i = 0; i < kExpected.size(); ++i) {
+    EXPECT_EQ(*code.AddrAs<const uint32_t>(i * sizeof(uint32_t)), kExpected[i]) << i;
+  }
+}
+
 TEST(LoongArch64AssemblerTest, EncodesLsxFloatingPointInstructions) {
   MachineCode code;
   Assembler assembler(&code);

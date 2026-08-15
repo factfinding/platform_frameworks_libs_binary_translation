@@ -2713,5 +2713,110 @@ TEST(LoongArch64RuntimeLibraryTest, LiteScvtf4SMatchesInterpreter) {
   }
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteAdd2DMatchesInterpreter) {
+  constexpr std::array<uint32_t, 2> kGuestCode = {
+      0x4ee2'8423,  // add v3.2d,v1.2d,v2.2d
+      0x4ee1'8400,  // add v0.2d,v0.2d,v1.2d (destination aliases first source)
+  };
+  for (uint32_t insn : kGuestCode) {
+    const std::array<uint32_t, 1> one_insn = {insn};
+    ThreadState interpreted{};
+    ThreadState translated{};
+    auto initialize = [](ThreadState* state) {
+      state->cpu.v[0] = MakeUint128(UINT64_MAX, 0x7fff'ffff'ffff'ffffULL);
+      state->cpu.v[1] = MakeUint128(1, 0x8000'0000'0000'0001ULL);
+      state->cpu.v[2] = MakeUint128(0x0123'4567'89ab'cdefULL, 0xfedc'ba98'7654'3210ULL);
+    };
+    initialize(&interpreted);
+    initialize(&translated);
+    SetInsnAddr(interpreted.cpu, ToGuestAddr(one_insn.data()));
+    InterpretInsn(&interpreted);
+    TranslateAndRun(one_insn, &translated);
+    const uint32_t rd = insn & 31;
+    EXPECT_EQ(translated.cpu.v[rd], interpreted.cpu.v[rd]) << std::hex << insn;
+  }
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteSmulhMatchesInterpreter) {
+  constexpr std::array<uint32_t, 2> kGuestCode = {
+      0x9b42'7c23,  // smulh x3,x1,x2
+      0x9b49'7d08,  // smulh x8,x8,x9 (destination aliases first source)
+  };
+  constexpr std::array<std::pair<uint64_t, uint64_t>, 4> kInputs = {{
+      {0, UINT64_MAX},
+      {0x7fff'ffff'ffff'ffffULL, 2},
+      {0x8000'0000'0000'0000ULL, UINT64_MAX},
+      {0xfedc'ba98'7654'3210ULL, 0x89ab'cdef'0123'4567ULL},
+  }};
+  for (uint32_t insn : kGuestCode) {
+    for (auto [lhs, rhs] : kInputs) {
+      const std::array<uint32_t, 1> one_insn = {insn};
+      ThreadState interpreted{};
+      ThreadState translated{};
+      const uint32_t rm = (insn >> 16) & 31;
+      const uint32_t rn = (insn >> 5) & 31;
+      const uint32_t rd = insn & 31;
+      interpreted.cpu.x[rn] = lhs;
+      interpreted.cpu.x[rm] = rhs;
+      translated.cpu.x[rn] = lhs;
+      translated.cpu.x[rm] = rhs;
+      SetInsnAddr(interpreted.cpu, ToGuestAddr(one_insn.data()));
+      InterpretInsn(&interpreted);
+      TranslateAndRun(one_insn, &translated);
+      EXPECT_EQ(translated.cpu.x[rd], interpreted.cpu.x[rd])
+          << "insn=" << std::hex << insn << " lhs=" << lhs << " rhs=" << rhs;
+    }
+  }
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteAdcMatchesInterpreter) {
+  constexpr std::array<uint32_t, 2> kGuestCode = {
+      0x9a0f'020d,  // adc x13,x16,x15
+      0x1a02'0023,  // adc w3,w1,w2
+  };
+  for (uint32_t insn : kGuestCode) {
+    for (uint32_t flags : {0u, 2u, 13u, 15u}) {
+      const std::array<uint32_t, 1> one_insn = {insn};
+      ThreadState interpreted{};
+      ThreadState translated{};
+      const uint32_t rm = (insn >> 16) & 31;
+      const uint32_t rn = (insn >> 5) & 31;
+      const uint32_t rd = insn & 31;
+      interpreted.cpu.x[rn] = UINT64_MAX;
+      interpreted.cpu.x[rm] = 0x8000'0000'0000'0001ULL;
+      interpreted.cpu.flags = flags;
+      translated.cpu.x[rn] = interpreted.cpu.x[rn];
+      translated.cpu.x[rm] = interpreted.cpu.x[rm];
+      translated.cpu.flags = flags;
+      SetInsnAddr(interpreted.cpu, ToGuestAddr(one_insn.data()));
+      InterpretInsn(&interpreted);
+      TranslateAndRun(one_insn, &translated);
+      EXPECT_EQ(translated.cpu.x[rd], interpreted.cpu.x[rd])
+          << "insn=" << std::hex << insn << " flags=" << flags;
+      EXPECT_EQ(translated.cpu.flags, flags);
+    }
+  }
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteHotMoviConstantsMatchInterpreter) {
+  constexpr std::array<uint32_t, 4> kGuestCode = {
+      0x6f07'e7e3,  // movi v3.2d,#0xffffffffffffffff
+      0x6f00'e5e3,  // movi v3.2d,#0x00000000ffffffff
+      0x2f00'e5e3,  // movi d3,#0x00000000ffffffff
+      0x0f00'0423,  // movi v3.2s,#1
+  };
+  for (uint32_t insn : kGuestCode) {
+    const std::array<uint32_t, 1> one_insn = {insn};
+    ThreadState interpreted{};
+    ThreadState translated{};
+    interpreted.cpu.v[3] = MakeUint128(0x0123'4567'89ab'cdefULL, 0xfedc'ba98'7654'3210ULL);
+    translated.cpu.v[3] = interpreted.cpu.v[3];
+    SetInsnAddr(interpreted.cpu, ToGuestAddr(one_insn.data()));
+    InterpretInsn(&interpreted);
+    TranslateAndRun(one_insn, &translated);
+    EXPECT_EQ(translated.cpu.v[3], interpreted.cpu.v[3]) << std::hex << insn;
+  }
+}
+
 }  // namespace
 }  // namespace berberis
