@@ -211,6 +211,9 @@ class Assembler : public AssemblerBase {
   void ScW(Register rd, Register rj) { Emit32(0x2100'0000 | EncodeRj(rj) | EncodeRd(rd)); }
   void LlD(Register rd, Register rj) { Emit32(0x2200'0000 | EncodeRj(rj) | EncodeRd(rd)); }
   void ScD(Register rd, Register rj) { Emit32(0x2300'0000 | EncodeRj(rj) | EncodeRd(rd)); }
+  void ScQ(Register low_and_status, Register high, Register address) {
+    Emit3R(0x3857'0000, low_and_status, address, high);
+  }
   void AmswapDbW(Register rd, Register value, Register address) {
     Emit3R(0x3869'0000, rd, address, value);
   }
@@ -222,6 +225,18 @@ class Assembler : public AssemblerBase {
   }
   void AmaddDbD(Register rd, Register value, Register address) {
     Emit3R(0x386a'8000, rd, address, value);
+  }
+  void AmcasB(Register expected, Register value, Register address) {
+    Emit3R(0x3858'0000, expected, address, value);
+  }
+  void AmcasH(Register expected, Register value, Register address) {
+    Emit3R(0x3858'8000, expected, address, value);
+  }
+  void AmcasDbB(Register expected, Register value, Register address) {
+    Emit3R(0x385a'0000, expected, address, value);
+  }
+  void AmcasDbH(Register expected, Register value, Register address) {
+    Emit3R(0x385a'8000, expected, address, value);
   }
 
   void Vld(SimdRegister vd, Register rj, int32_t imm12) {

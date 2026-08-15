@@ -2018,6 +2018,148 @@ TEST(LoongArch64RuntimeLibraryTest, LiteExclusiveRoundTripAndFailure) {
   EXPECT_EQ(memory, 0x7654'3210u);
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteSubwordExclusiveRoundTripAndFailure) {
+  // ldxrb w2,[x0]; stxrb w3,w1,[x0]
+  constexpr std::array<uint32_t, 2> kByteCode = {0x085f'7c02, 0x0803'7c01};
+  uint8_t byte = 0x7a;
+  ThreadState byte_state{};
+  byte_state.cpu.x[0] = ToGuestAddr(&byte) | 0xab00'0000'0000'0000ULL;
+  byte_state.cpu.x[1] = 0xc5;
+  TranslateAndRun(kByteCode, &byte_state);
+  EXPECT_EQ(byte_state.cpu.x[2], 0x7au);
+  EXPECT_EQ(byte_state.cpu.x[3], 0u);
+  EXPECT_EQ(byte, 0xc5u);
+  EXPECT_EQ(byte_state.cpu.reservation_address, 0u);
+
+  // ldaxrh w6,[x4]; stlxrh w7,w5,[x4]
+  constexpr std::array<uint32_t, 2> kHalfCode = {0x485f'fc86, 0x4807'fc85};
+  alignas(2) uint16_t half = 0x1234;
+  ThreadState half_state{};
+  half_state.cpu.x[4] = ToGuestAddr(&half);
+  half_state.cpu.x[5] = 0xabcd;
+  TranslateAndRun(std::array<uint32_t, 1>{kHalfCode[0]}, &half_state);
+  EXPECT_EQ(half_state.cpu.x[6], 0x1234u);
+  half = 0x5678;  // A change after LDXRH must make STLXRH fail.
+  TranslateAndRun(std::array<uint32_t, 1>{kHalfCode[1]}, &half_state);
+  EXPECT_EQ(half_state.cpu.x[7], 1u);
+  EXPECT_EQ(half, 0x5678u);
+  EXPECT_EQ(half_state.cpu.reservation_address, 0u);
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteSubwordExclusiveIsAtomicUnderContention) {
+  // Compile one atomic increment region per host thread, then invoke it until
+  // 1000 STLXRH operations succeed.  Keeping the retry loop outside the guest
+  // region is intentional: this test configures Lite translation with direct
+  // dispatch disabled, so a backward guest branch ends the region.
+  constexpr std::array<uint32_t, 3> kGuestCode = {
+      0x485f'fc01,  // ldaxrh w1,[x0]
+      0x1100'0421,  // add w1,w1,#1
+      0x4802'fc01,  // stlxrh w2,w1,[x0]
+  };
+  alignas(2) uint16_t counter = 0;
+  auto increment = [&] {
+    InitHostEntries();
+    const GuestAddr start_pc = ToGuestAddr(kGuestCode.data());
+    MachineCode code;
+    LiteTranslateParams params;
+    params.end_pc = start_pc + sizeof(kGuestCode);
+    params.allow_dispatch = false;
+    auto [success, stop_pc] = TryLiteTranslateRegion(start_pc, &code, params);
+    ASSERT_TRUE(success);
+    ASSERT_EQ(stop_pc, start_pc + sizeof(kGuestCode));
+    ScopedExecRegion exec(&code);
+
+    ThreadState state{};
+    state.cpu.x[0] = ToGuestAddr(&counter);
+    size_t completed = 0;
+    while (completed != 1000) {
+      SetInsnAddr(state.cpu, start_pc);
+      SetResidence(state, kOutsideGeneratedCode);
+      berberis_RunGeneratedCode(&state, AsHostCode(exec.GetHostCodeAddr()));
+      if (state.cpu.x[2] == 0) {
+        ++completed;
+      }
+    }
+  };
+  std::thread first(increment);
+  std::thread second(increment);
+  first.join();
+  second.join();
+  EXPECT_EQ(counter, 2000u);
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LitePairExclusiveRoundTripAndFailure) {
+  // ldxp w1,w2,[x0]; stxp w3,w4,w5,[x0]
+  constexpr uint32_t kLdxpW = 0x887f'0801;
+  constexpr uint32_t kStxpW = 0x8823'1404;
+  alignas(16) std::array<uint64_t, 2> memory = {
+      0x1122'3344'5566'7788ULL, 0x99aa'bbcc'ddee'ff00ULL};
+  ThreadState word_state{};
+  word_state.cpu.x[0] = ToGuestAddr(memory.data()) | 0xab00'0000'0000'0000ULL;
+  TranslateAndRun(std::array<uint32_t, 1>{kLdxpW}, &word_state);
+  EXPECT_EQ(word_state.cpu.x[1], 0x5566'7788u);
+  EXPECT_EQ(word_state.cpu.x[2], 0x1122'3344u);
+  word_state.cpu.x[4] = 0x0123'4567;
+  word_state.cpu.x[5] = 0x89ab'cdef;
+  TranslateAndRun(std::array<uint32_t, 1>{kStxpW}, &word_state);
+  EXPECT_EQ(word_state.cpu.x[3], 0u);
+  EXPECT_EQ(memory[0], 0x89ab'cdef'0123'4567ULL);
+
+  // ldaxp x1,x2,[x0]; stlxp w3,x4,x5,[x0]
+  constexpr uint32_t kLdaxpX = 0xc87f'8801;
+  constexpr uint32_t kStlxpX = 0xc823'9404;
+  ThreadState double_state{};
+  double_state.cpu.x[0] = ToGuestAddr(memory.data());
+  TranslateAndRun(std::array<uint32_t, 1>{kLdaxpX}, &double_state);
+  EXPECT_EQ(double_state.cpu.x[1], memory[0]);
+  EXPECT_EQ(double_state.cpu.x[2], memory[1]);
+  double_state.cpu.x[4] = 0xdead'beef'0123'4567ULL;
+  double_state.cpu.x[5] = 0x7654'3210'cafe'babeULL;
+  memory[1] ^= 1;  // A change in either half must make STLXP fail.
+  const auto changed_memory = memory;
+  TranslateAndRun(std::array<uint32_t, 1>{kStlxpX}, &double_state);
+  EXPECT_EQ(double_state.cpu.x[3], 1u);
+  EXPECT_EQ(memory, changed_memory);
+  EXPECT_EQ(double_state.cpu.reservation_address, 0u);
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LitePairExclusiveIsAtomicUnderContention) {
+  // ldaxp x1,x2,[x0]; add x1,x1,#1; stlxp w3,x1,x2,[x0]
+  constexpr std::array<uint32_t, 3> kGuestCode = {
+      0xc87f'8801, 0x9100'0421, 0xc823'8801};
+  alignas(16) std::array<uint64_t, 2> counter{};
+  auto increment = [&] {
+    InitHostEntries();
+    const GuestAddr start_pc = ToGuestAddr(kGuestCode.data());
+    MachineCode code;
+    LiteTranslateParams params;
+    params.end_pc = start_pc + sizeof(kGuestCode);
+    params.allow_dispatch = false;
+    auto [success, stop_pc] = TryLiteTranslateRegion(start_pc, &code, params);
+    ASSERT_TRUE(success);
+    ASSERT_EQ(stop_pc, start_pc + sizeof(kGuestCode));
+    ScopedExecRegion exec(&code);
+
+    ThreadState state{};
+    state.cpu.x[0] = ToGuestAddr(counter.data());
+    size_t completed = 0;
+    while (completed != 1000) {
+      SetInsnAddr(state.cpu, start_pc);
+      SetResidence(state, kOutsideGeneratedCode);
+      berberis_RunGeneratedCode(&state, AsHostCode(exec.GetHostCodeAddr()));
+      if (state.cpu.x[3] == 0) {
+        ++completed;
+      }
+    }
+  };
+  std::thread first(increment);
+  std::thread second(increment);
+  first.join();
+  second.join();
+  EXPECT_EQ(counter[0], 2000u);
+  EXPECT_EQ(counter[1], 0u);
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesStoreReleaseWidths) {
   // stlrb w1,[x0]; stlrh w1,[x2]; stlr w1,[x4]; stlr x1,[x6]
   constexpr std::array<uint32_t, 4> kGuestCode = {

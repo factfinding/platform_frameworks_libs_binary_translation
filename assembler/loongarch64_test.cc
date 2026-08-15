@@ -241,6 +241,36 @@ TEST(LoongArch64AssemblerTest, EncodesHotSignedMultiplyAndVectorAdd) {
   }
 }
 
+TEST(LoongArch64AssemblerTest, EncodesLamSubwordCompareExchange) {
+  MachineCode code;
+  Assembler assembler(&code);
+
+  assembler.AmcasB(Assembler::t0, Assembler::t1, Assembler::t2);
+  assembler.AmcasH(Assembler::t0, Assembler::t1, Assembler::t2);
+  assembler.AmcasDbB(Assembler::t0, Assembler::t1, Assembler::t2);
+  assembler.AmcasDbH(Assembler::t0, Assembler::t1, Assembler::t2);
+
+  // Generated independently with LLVM 21 llvm-mc for LoongArch64 LAM_BH.
+  constexpr std::array<uint32_t, 4> kExpected = {
+      0x3858'35cc, 0x3858'b5cc, 0x385a'35cc, 0x385a'b5cc};
+  ASSERT_EQ(code.install_size(), sizeof(kExpected));
+  for (size_t i = 0; i < kExpected.size(); ++i) {
+    EXPECT_EQ(*code.AddrAs<const uint32_t>(i * sizeof(uint32_t)), kExpected[i]) << i;
+  }
+}
+
+TEST(LoongArch64AssemblerTest, EncodesStoreConditionalQuadword) {
+  MachineCode code;
+  Assembler assembler(&code);
+
+  assembler.ScQ(Assembler::t0, Assembler::t1, Assembler::t2);
+
+  // Generated independently with LLVM 21 llvm-mc for LoongArch64 SCQ.
+  constexpr uint32_t kExpected = 0x3857'35cc;
+  ASSERT_EQ(code.install_size(), sizeof(kExpected));
+  EXPECT_EQ(*code.AddrAs<const uint32_t>(0), kExpected);
+}
+
 TEST(LoongArch64AssemblerTest, EncodesLsxFloatingPointInstructions) {
   MachineCode code;
   Assembler assembler(&code);

@@ -192,6 +192,14 @@ class LiteTranslator {
       }
       return TranslateLoadExclusive(insn, pc);
     }
+    // LDXP/LDAXP.  A 32-bit register pair is one host doubleword; a 64-bit
+    // pair uses the SCQ-capable 128-bit reservation model below.
+    if ((insn & 0x3f7f'0000u) == 0x087f'0000u) {
+      if (!enable_guest_memory_) {
+        return false;
+      }
+      return TranslateLoadExclusivePair(insn, pc);
+    }
     // STLR[BH] uses Rs==31 in the exclusive/ordered load-store encoding.
     if ((insn & 0x3fff'fc00u) == 0x089f'fc00u) {
       if (!enable_guest_memory_) {
@@ -206,6 +214,12 @@ class LiteTranslator {
         return false;
       }
       return TranslateStoreExclusive(insn, pc);
+    }
+    if ((insn & 0x3f60'0000u) == 0x0820'0000u) {
+      if (!enable_guest_memory_) {
+        return false;
+      }
+      return TranslateStoreExclusivePair(insn, pc);
     }
     // LD1/ST1 of one through four complete 4S vectors.  Unlike LD2/LD3/LD4,
     // these forms transfer consecutive vectors without interleaving, so all
@@ -1806,9 +1820,6 @@ class LiteTranslator {
 
   bool TranslateStoreExclusive(uint32_t insn, GuestAddr pc) {
     const uint32_t size = insn >> 30;
-    if (size < 2) {
-      return false;
-    }
     const bool release = ((insn >> 15) & 1) != 0;
     const uint32_t rs = (insn >> 16) & 31;
     const uint32_t rn = (insn >> 5) & 31;
@@ -1817,6 +1828,54 @@ class LiteTranslator {
         offsetof(ThreadState, cpu) + offsetof(CPUState, reservation_address);
     constexpr int32_t kReservationValueOffset =
         offsetof(ThreadState, cpu) + offsetof(CPUState, reservation_value);
+
+    if (size < 2) {
+      Assembler::Label* fail = as_.MakeLabel();
+      Assembler::Label* success = as_.MakeLabel();
+      Assembler::Label* recovery = as_.MakeLabel();
+      Assembler::Label* done = as_.MakeLabel();
+
+      // LAM_BH provides native byte/halfword compare-and-exchange.  Combine
+      // it with Berberis' software exclusive monitor: the reservation address
+      // must still match, and AMCAS must observe the value saved by LDXR.
+      LoadXOrSp(rn, Assembler::t0);
+      as_.LdD(Assembler::t1, Assembler::s8, kReservationAddressOffset);
+      as_.Bne(Assembler::t0, Assembler::t1, *fail);
+      ApplyTbi(Assembler::t0);
+      as_.LdD(Assembler::t1, Assembler::s8, kReservationValueOffset);
+      LoadXOrZero(rt, Assembler::t2);
+      as_.Li(Assembler::t7, size == 0 ? 0xffu : 0xffffu);
+      as_.And(Assembler::t1, Assembler::t1, Assembler::t7);
+      as_.And(Assembler::t2, Assembler::t2, Assembler::t7);
+      as_.Move(Assembler::t4, Assembler::t1);
+      as_.SetRecoveryPoint(recovery);
+      if (size == 0) {
+        release ? as_.AmcasDbB(Assembler::t1, Assembler::t2, Assembler::t0)
+                : as_.AmcasB(Assembler::t1, Assembler::t2, Assembler::t0);
+      } else {
+        release ? as_.AmcasDbH(Assembler::t1, Assembler::t2, Assembler::t0)
+                : as_.AmcasH(Assembler::t1, Assembler::t2, Assembler::t0);
+      }
+      as_.And(Assembler::t1, Assembler::t1, Assembler::t7);
+      as_.Bne(Assembler::t1, Assembler::t4, *fail);
+      as_.B(*success);
+
+      as_.Bind(fail);
+      as_.StD(Assembler::zero, Assembler::s8, kReservationAddressOffset);
+      as_.AddiD(Assembler::t0, Assembler::zero, 1);
+      StoreXOrDiscard(rs, Assembler::t0);
+      as_.B(*done);
+
+      as_.Bind(success);
+      as_.StD(Assembler::zero, Assembler::s8, kReservationAddressOffset);
+      StoreXOrDiscard(rs, Assembler::zero);
+      as_.B(*done);
+
+      as_.Bind(recovery);
+      ExitGeneratedCode(pc);
+      as_.Bind(done);
+      return true;
+    }
 
     Assembler::Label* retry = as_.MakeLabel();
     Assembler::Label* fail = as_.MakeLabel();
@@ -1855,6 +1914,139 @@ class LiteTranslator {
       as_.ScD(Assembler::t3, Assembler::t0);
     }
     as_.Beqz(Assembler::t3, *retry);
+    as_.B(*success);
+
+    as_.Bind(fail);
+    as_.StD(Assembler::zero, Assembler::s8, kReservationAddressOffset);
+    as_.AddiD(Assembler::t0, Assembler::zero, 1);
+    StoreXOrDiscard(rs, Assembler::t0);
+    as_.B(*done);
+
+    as_.Bind(success);
+    if (release) {
+      as_.Dbar(0x12);
+    }
+    as_.StD(Assembler::zero, Assembler::s8, kReservationAddressOffset);
+    StoreXOrDiscard(rs, Assembler::zero);
+    as_.B(*done);
+
+    as_.Bind(recovery);
+    ExitGeneratedCode(pc);
+    as_.Bind(done);
+    return true;
+  }
+
+  bool TranslateLoadExclusivePair(uint32_t insn, GuestAddr pc) {
+    const uint32_t size = insn >> 30;
+    const bool acquire = ((insn >> 15) & 1) != 0;
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rt = insn & 31;
+    const uint32_t rt2 = (insn >> 10) & 31;
+    if ((size != 2 && size != 3) || rt == rt2) {
+      return false;
+    }
+    constexpr int32_t kReservationAddressOffset =
+        offsetof(ThreadState, cpu) + offsetof(CPUState, reservation_address);
+    constexpr int32_t kReservationValueOffset =
+        offsetof(ThreadState, cpu) + offsetof(CPUState, reservation_value);
+
+    LoadXOrSp(rn, Assembler::t0);
+    as_.Move(Assembler::t3, Assembler::t0);
+    ApplyTbi(Assembler::t0);
+    Assembler::Label* recovery = as_.MakeLabel();
+    Assembler::Label* done = as_.MakeLabel();
+    as_.SetRecoveryPoint(recovery);
+    as_.LlD(Assembler::t1, Assembler::t0);
+    if (size == 2) {
+      as_.Move(Assembler::t2, Assembler::t1);
+      if (acquire) {
+        as_.Dbar(0x14);
+      }
+      as_.StD(Assembler::t3, Assembler::s8, kReservationAddressOffset);
+      as_.StD(Assembler::t1, Assembler::s8, kReservationValueOffset);
+      as_.StD(Assembler::zero, Assembler::s8, kReservationValueOffset + 8);
+      ZeroExtend32(Assembler::t1);
+      as_.SrliD(Assembler::t2, Assembler::t2, 32);
+    } else {
+      as_.SetRecoveryPoint(recovery);
+      as_.LdD(Assembler::t2, Assembler::t0, 8);
+      if (acquire) {
+        as_.Dbar(0x14);
+      }
+      as_.StD(Assembler::t3, Assembler::s8, kReservationAddressOffset);
+      as_.StD(Assembler::t1, Assembler::s8, kReservationValueOffset);
+      as_.StD(Assembler::t2, Assembler::s8, kReservationValueOffset + 8);
+    }
+    StoreXOrDiscard(rt, Assembler::t1);
+    StoreXOrDiscard(rt2, Assembler::t2);
+    as_.B(*done);
+    as_.Bind(recovery);
+    ExitGeneratedCode(pc);
+    as_.Bind(done);
+    return true;
+  }
+
+  bool TranslateStoreExclusivePair(uint32_t insn, GuestAddr pc) {
+    const uint32_t size = insn >> 30;
+    const bool release = ((insn >> 15) & 1) != 0;
+    const uint32_t rs = (insn >> 16) & 31;
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rt = insn & 31;
+    const uint32_t rt2 = (insn >> 10) & 31;
+    if ((size != 2 && size != 3) || rt == rt2) {
+      return false;
+    }
+    constexpr int32_t kReservationAddressOffset =
+        offsetof(ThreadState, cpu) + offsetof(CPUState, reservation_address);
+    constexpr int32_t kReservationValueOffset =
+        offsetof(ThreadState, cpu) + offsetof(CPUState, reservation_value);
+
+    Assembler::Label* retry = as_.MakeLabel();
+    Assembler::Label* fail = as_.MakeLabel();
+    Assembler::Label* success = as_.MakeLabel();
+    Assembler::Label* recovery = as_.MakeLabel();
+    Assembler::Label* done = as_.MakeLabel();
+
+    LoadXOrSp(rn, Assembler::t0);
+    as_.LdD(Assembler::t1, Assembler::s8, kReservationAddressOffset);
+    as_.Bne(Assembler::t0, Assembler::t1, *fail);
+    ApplyTbi(Assembler::t0);
+
+    if (size == 2) {
+      as_.LdD(Assembler::t1, Assembler::s8, kReservationValueOffset);
+      LoadXOrZero(rt, Assembler::t2);
+      LoadXOrZero(rt2, Assembler::t3);
+      ZeroExtend32(Assembler::t2);
+      ZeroExtend32(Assembler::t3);
+      as_.SlliD(Assembler::t3, Assembler::t3, 32);
+      as_.Or(Assembler::t2, Assembler::t2, Assembler::t3);
+
+      as_.Bind(retry);
+      as_.SetRecoveryPoint(recovery);
+      as_.LlD(Assembler::t4, Assembler::t0);
+      as_.Bne(Assembler::t4, Assembler::t1, *fail);
+      as_.Move(Assembler::t5, Assembler::t2);
+      as_.SetRecoveryPoint(recovery);
+      as_.ScD(Assembler::t5, Assembler::t0);
+      as_.Beqz(Assembler::t5, *retry);
+    } else {
+      as_.LdD(Assembler::t1, Assembler::s8, kReservationValueOffset);
+      as_.LdD(Assembler::t2, Assembler::s8, kReservationValueOffset + 8);
+      LoadXOrZero(rt, Assembler::t3);
+      LoadXOrZero(rt2, Assembler::t4);
+
+      as_.Bind(retry);
+      as_.SetRecoveryPoint(recovery);
+      as_.LlD(Assembler::t5, Assembler::t0);
+      as_.SetRecoveryPoint(recovery);
+      as_.LdD(Assembler::t6, Assembler::t0, 8);
+      as_.Bne(Assembler::t5, Assembler::t1, *fail);
+      as_.Bne(Assembler::t6, Assembler::t2, *fail);
+      as_.Move(Assembler::t7, Assembler::t3);
+      as_.SetRecoveryPoint(recovery);
+      as_.ScQ(Assembler::t7, Assembler::t4, Assembler::t0);
+      as_.Beqz(Assembler::t7, *retry);
+    }
     as_.B(*success);
 
     as_.Bind(fail);
