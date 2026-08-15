@@ -103,6 +103,56 @@ TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesMoveWideAndAddSubImmediate) {
   EXPECT_EQ(GetInsnAddr(state.cpu), ToGuestAddr(kGuestCode.data() + kGuestCode.size()));
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteRegisterMappingPreservesIntegerRegions) {
+  // movz x0, #1; then keep the three values live across a straight-line
+  // region so mapped guest registers replace repeated ThreadState traffic.
+  constexpr std::array<uint32_t, 13> kGuestCode = {
+      0xd280'0020,
+      0x9100'0401,
+      0x9100'0422,
+      0x9100'0440,
+      0x9100'0401,
+      0x9100'0422,
+      0x9100'0440,
+      0x9100'0401,
+      0x9100'0422,
+      0x9100'0440,
+      0x9100'0401,
+      0x9100'0422,
+      0x9100'0440,
+  };
+  InitHostEntries();
+  GuestAddr start_pc = ToGuestAddr(kGuestCode.data());
+
+  MachineCode unmapped_code;
+  LiteTranslateParams unmapped_params;
+  unmapped_params.end_pc = start_pc + sizeof(kGuestCode);
+  unmapped_params.allow_dispatch = false;
+  unmapped_params.enable_reg_mapping = false;
+  auto [unmapped_success, unmapped_stop_pc] =
+      TryLiteTranslateRegion(start_pc, &unmapped_code, unmapped_params);
+  ASSERT_TRUE(unmapped_success);
+  ASSERT_EQ(unmapped_stop_pc, start_pc + sizeof(kGuestCode));
+
+  MachineCode mapped_code;
+  LiteTranslateParams mapped_params = unmapped_params;
+  mapped_params.enable_reg_mapping = true;
+  auto [mapped_success, mapped_stop_pc] =
+      TryLiteTranslateRegion(start_pc, &mapped_code, mapped_params);
+  ASSERT_TRUE(mapped_success);
+  ASSERT_EQ(mapped_stop_pc, start_pc + sizeof(kGuestCode));
+  EXPECT_NE(mapped_code.install_size(), unmapped_code.install_size());
+
+  ThreadState state{};
+  ScopedExecRegion exec(&mapped_code);
+  SetInsnAddr(state.cpu, start_pc);
+  SetResidence(state, kOutsideGeneratedCode);
+  berberis_RunGeneratedCode(&state, AsHostCode(exec.GetHostCodeAddr()));
+  EXPECT_EQ(state.cpu.x[0], 13u);
+  EXPECT_EQ(state.cpu.x[1], 11u);
+  EXPECT_EQ(state.cpu.x[2], 12u);
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesCompareAndBranch) {
   // cbz x0, +8.  The following words only provide valid branch destinations;
   // the translated region ends at the conditional branch.

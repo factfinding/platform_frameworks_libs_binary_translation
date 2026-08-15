@@ -35,6 +35,7 @@ namespace {
 using Assembler = loongarch64::Assembler;
 using Register = loongarch64::Register;
 using SimdRegister = loongarch64::SimdRegister;
+using CachedXRegisterMap = std::array<int8_t, 32>;
 
 constexpr int32_t kSpOffset = offsetof(ThreadState, cpu) + offsetof(CPUState, sp);
 constexpr int32_t kFlagsOffset = offsetof(ThreadState, cpu) + offsetof(CPUState, flags);
@@ -47,6 +48,35 @@ constexpr int64_t SignExtend(uint64_t value, uint32_t width) {
   uint64_t sign = uint64_t{1} << (width - 1);
   uint64_t mask = (uint64_t{1} << width) - 1;
   return static_cast<int64_t>((value & mask) ^ sign) - static_cast<int64_t>(sign);
+}
+
+CachedXRegisterMap SelectCachedXRegisters(GuestAddr start_pc, GuestAddr end_pc) {
+  std::array<uint16_t, 31> uses{};
+  for (GuestAddr pc = start_pc; pc < end_pc; pc += sizeof(uint32_t)) {
+    uint32_t insn = *ToHostAddr<const uint32_t>(pc);
+    for (uint32_t reg : {insn & 31, (insn >> 5) & 31, (insn >> 10) & 31, (insn >> 16) & 31}) {
+      if (reg != 31) {
+        ++uses[reg];
+      }
+    }
+  }
+
+  CachedXRegisterMap result{};
+  result.fill(-1);
+  for (int8_t slot = 0; slot < 7; ++slot) {
+    uint32_t best_reg = 31;
+    for (uint32_t reg = 0; reg < uses.size(); ++reg) {
+      if (uses[reg] != 0 && (best_reg == 31 || uses[reg] > uses[best_reg])) {
+        best_reg = reg;
+      }
+    }
+    if (best_reg == 31) {
+      break;
+    }
+    result[best_reg] = slot;
+    uses[best_reg] = 0;
+  }
+  return result;
 }
 
 bool DecodeLogicalImmediate(uint32_t n,
@@ -92,10 +122,22 @@ bool DecodeLogicalImmediate(uint32_t n,
 
 class LiteTranslator {
  public:
-  explicit LiteTranslator(MachineCode* machine_code, bool enable_guest_memory, bool allow_dispatch)
+  explicit LiteTranslator(MachineCode* machine_code,
+                          CachedXRegisterMap cached_x_registers,
+                          bool enable_guest_memory,
+                          bool allow_dispatch)
       : as_(machine_code),
         enable_guest_memory_(enable_guest_memory),
-        allow_dispatch_(allow_dispatch) {}
+        allow_dispatch_(allow_dispatch),
+        cached_x_registers_(cached_x_registers) {
+    for (uint32_t guest_reg = 0; guest_reg < cached_x_registers_.size(); ++guest_reg) {
+      int slot = cached_x_registers_[guest_reg];
+      if (slot >= 0) {
+        cached_x_guest_registers_[slot] = guest_reg;
+        as_.LdD(kCachedXHostRegisters[slot], Assembler::s8, XOffset(guest_reg));
+      }
+    }
+  }
 
   bool Translate(uint32_t insn, GuestAddr pc) {
     if ((insn & 0x1f80'0000u) == 0x1280'0000u) {
@@ -225,8 +267,7 @@ class LiteTranslator {
     // these forms transfer consecutive vectors without interleaving, so all
     // list lengths share one lowering.  Accept both no-writeback and
     // immediate/register post-index encodings.
-    if ((insn & 0xffbf'0c00u) == 0x4c00'0800u ||
-        (insn & 0xffa0'0c00u) == 0x4c80'0800u) {
+    if ((insn & 0xffbf'0c00u) == 0x4c00'0800u || (insn & 0xffa0'0c00u) == 0x4c80'0800u) {
       if (!enable_guest_memory_) {
         return false;
       }
@@ -309,15 +350,13 @@ class LiteTranslator {
     }
     // SSHLL/SSHLL2 Vd.4S, Vn.4H/8H, #shift.  These widening shifts are hot in
     // HEVC inverse transforms.  immh=001x selects the 16-to-32-bit form.
-    if ((insn & 0xbf80'fc00u) == 0x0f00'a400u &&
-        (((insn >> 19) & 0xeu) == 0x2u)) {
+    if ((insn & 0xbf80'fc00u) == 0x0f00'a400u && (((insn >> 19) & 0xeu) == 0x2u)) {
       return TranslateSshll4S(insn);
     }
     // SQRSHRN/SQRSHRN2 Vd.4H/8H, Vn.4S, #shift.  LSX performs the same
     // rounding signed-saturating narrow; the Q form additionally preserves
     // Vd's low 64 bits and inserts the narrowed lanes into the high half.
-    if ((insn & 0xbf80'fc00u) == 0x0f00'9c00u &&
-        (((insn >> 19) & 0xeu) == 0x2u)) {
+    if ((insn & 0xbf80'fc00u) == 0x0f00'9c00u && (((insn >> 19) & 0xeu) == 0x2u)) {
       return TranslateSqrshrn4H(insn);
     }
     if ((insn & 0xffff'fc00u) == 0x4ea0'f800u) {
@@ -368,8 +407,7 @@ class LiteTranslator {
       return TranslateMoviConstant(insn, 0x0000'0001'0000'0001ULL, 0);
     }
     // Bit 23 distinguishes FMLA (0) from FMLS (1).
-    if ((insn & 0xffa0'fc00u) == 0x4e20'cc00u ||
-        (insn & 0xffa0'fc00u) == 0x4ea0'cc00u) {
+    if ((insn & 0xffa0'fc00u) == 0x4e20'cc00u || (insn & 0xffa0'fc00u) == 0x4ea0'cc00u) {
       return TranslateFmlaFmls4S(insn);
     }
     // Scalar FP arithmetic is pervasive in Unity startup code.  Use scalar
@@ -554,6 +592,7 @@ class LiteTranslator {
   }
 
   void Exit(GuestAddr pc) {
+    FlushCachedXRegisters();
     as_.Li(Assembler::s7, pc);
     if (allow_dispatch_ && config::kLinkJumpsBetweenRegions) {
       Assembler::Label* pending_signal = as_.MakeLabel();
@@ -574,6 +613,7 @@ class LiteTranslator {
   }
 
   void ExitGeneratedCode(GuestAddr pc) {
+    FlushCachedXRegisters();
     as_.Li(Assembler::s7, pc);
     ExitGeneratedCode();
   }
@@ -584,6 +624,7 @@ class LiteTranslator {
   }
 
   void ExitIndirect(Register target) {
+    FlushCachedXRegisters();
     if (target != Assembler::s7) {
       as_.Move(Assembler::s7, target);
     }
@@ -637,6 +678,27 @@ class LiteTranslator {
     return offsetof(ThreadState, cpu) + offsetof(CPUState, v) + reg * sizeof(__uint128_t);
   }
 
+  static constexpr std::array<Register, 7> kCachedXHostRegisters = {
+      Assembler::s0,
+      Assembler::s1,
+      Assembler::s2,
+      Assembler::s3,
+      Assembler::s4,
+      Assembler::s5,
+      Assembler::s6,
+  };
+  int FindCachedXRegister(uint32_t guest_reg) const { return cached_x_registers_[guest_reg]; }
+
+  void FlushCachedXRegisters() {
+    for (size_t slot = 0; slot < kCachedXHostRegisters.size(); ++slot) {
+      if (!cached_x_dirty_[slot]) {
+        continue;
+      }
+      uint32_t guest_reg = cached_x_guest_registers_[slot];
+      as_.StD(kCachedXHostRegisters[slot], Assembler::s8, XOffset(guest_reg));
+    }
+  }
+
   void LoadV(uint32_t reg, SimdRegister dst) { as_.Vld(dst, Assembler::s8, VOffset(reg)); }
 
   void StoreV(uint32_t reg, SimdRegister src) { as_.Vst(src, Assembler::s8, VOffset(reg)); }
@@ -645,22 +707,48 @@ class LiteTranslator {
     if (reg == 31) {
       as_.Move(dst, Assembler::zero);
     } else {
-      as_.LdD(dst, Assembler::s8, XOffset(reg));
+      int slot = FindCachedXRegister(reg);
+      if (slot < 0) {
+        as_.LdD(dst, Assembler::s8, XOffset(reg));
+      } else if (dst != kCachedXHostRegisters[slot]) {
+        as_.Move(dst, kCachedXHostRegisters[slot]);
+      }
     }
   }
 
   void StoreXOrDiscard(uint32_t reg, Register src) {
     if (reg != 31) {
-      as_.StD(src, Assembler::s8, XOffset(reg));
+      int slot = FindCachedXRegister(reg);
+      if (slot < 0) {
+        as_.StD(src, Assembler::s8, XOffset(reg));
+      } else {
+        if (src != kCachedXHostRegisters[slot]) {
+          as_.Move(kCachedXHostRegisters[slot], src);
+        }
+        cached_x_dirty_[slot] = true;
+      }
     }
   }
 
   void LoadXOrSp(uint32_t reg, Register dst) {
-    as_.LdD(dst, Assembler::s8, reg == 31 ? kSpOffset : XOffset(reg));
+    int slot = reg == 31 ? -1 : FindCachedXRegister(reg);
+    if (slot < 0) {
+      as_.LdD(dst, Assembler::s8, reg == 31 ? kSpOffset : XOffset(reg));
+    } else if (dst != kCachedXHostRegisters[slot]) {
+      as_.Move(dst, kCachedXHostRegisters[slot]);
+    }
   }
 
   void StoreXOrSp(uint32_t reg, Register src) {
-    as_.StD(src, Assembler::s8, reg == 31 ? kSpOffset : XOffset(reg));
+    int slot = reg == 31 ? -1 : FindCachedXRegister(reg);
+    if (slot < 0) {
+      as_.StD(src, Assembler::s8, reg == 31 ? kSpOffset : XOffset(reg));
+    } else {
+      if (src != kCachedXHostRegisters[slot]) {
+        as_.Move(kCachedXHostRegisters[slot], src);
+      }
+      cached_x_dirty_[slot] = true;
+    }
   }
 
   void ZeroExtend32(Register reg) {
@@ -2071,10 +2159,10 @@ class LiteTranslator {
 
   bool TranslateAtomicMemory(uint32_t insn, GuestAddr pc, AtomicMemoryOp operation) {
     const uint32_t size = insn >> 30;
-    const bool acquire = operation == AtomicMemoryOp::kCas ? ((insn >> 22) & 1) != 0
-                                                           : ((insn >> 23) & 1) != 0;
-    const bool release = operation == AtomicMemoryOp::kCas ? ((insn >> 15) & 1) != 0
-                                                           : ((insn >> 22) & 1) != 0;
+    const bool acquire =
+        operation == AtomicMemoryOp::kCas ? ((insn >> 22) & 1) != 0 : ((insn >> 23) & 1) != 0;
+    const bool release =
+        operation == AtomicMemoryOp::kCas ? ((insn >> 15) & 1) != 0 : ((insn >> 22) & 1) != 0;
     const uint32_t rs = (insn >> 16) & 31;
     const uint32_t rn = (insn >> 5) & 31;
     const uint32_t rt = insn & 31;
@@ -2344,9 +2432,14 @@ class LiteTranslator {
         return false;
     }
 
-    constexpr std::array<Register, 8> kValues = {
-        Assembler::t1, Assembler::t2, Assembler::t3, Assembler::t4,
-        Assembler::t5, Assembler::t6, Assembler::t7, Assembler::t8};
+    constexpr std::array<Register, 8> kValues = {Assembler::t1,
+                                                 Assembler::t2,
+                                                 Assembler::t3,
+                                                 Assembler::t4,
+                                                 Assembler::t5,
+                                                 Assembler::t6,
+                                                 Assembler::t7,
+                                                 Assembler::t8};
     const uint32_t value_count = register_count * 2;
     LoadXOrSp(rn, Assembler::t0);
     ApplyTbi(Assembler::t0);
@@ -3189,8 +3282,8 @@ class LiteTranslator {
     const uint32_t imm8 = (insn >> 13) & 0xff;
     const uint32_t rd = insn & 31;
     const uint32_t b6 = (imm8 >> 6) & 1;
-    const uint32_t bits = ((imm8 & 0x80) << 24) | ((b6 ^ 1) << 30) |
-                          (b6 ? 0x3e00'0000u : 0) | ((imm8 & 0x3f) << 19);
+    const uint32_t bits =
+        ((imm8 & 0x80) << 24) | ((b6 ^ 1) << 30) | (b6 ? 0x3e00'0000u : 0) | ((imm8 & 0x3f) << 19);
     as_.Li(Assembler::t0, bits);
     as_.StW(Assembler::t0, Assembler::s8, VOffset(rd));
     as_.StW(Assembler::zero, Assembler::s8, VOffset(rd) + 4);
@@ -3516,7 +3609,7 @@ class LiteTranslator {
     int64_t displacement = SignExtend(insn & 0x03ff'ffff, 26) * 4;
     if (link) {
       as_.Li(Assembler::t0, pc + 4);
-      as_.StD(Assembler::t0, Assembler::s8, XOffset(30));
+      StoreXOrDiscard(30, Assembler::t0);
     }
     Exit(pc + displacement);
   }
@@ -3711,7 +3804,7 @@ class LiteTranslator {
     LoadXOrZero(rn, Assembler::t1);
     if (link) {
       as_.Li(Assembler::t0, pc + 4);
-      as_.StD(Assembler::t0, Assembler::s8, XOffset(30));
+      StoreXOrDiscard(30, Assembler::t0);
     }
     ExitIndirect(Assembler::t1);
   }
@@ -3719,6 +3812,9 @@ class LiteTranslator {
   Assembler as_;
   bool enable_guest_memory_;
   bool allow_dispatch_;
+  CachedXRegisterMap cached_x_registers_;
+  std::array<uint8_t, kCachedXHostRegisters.size()> cached_x_guest_registers_{};
+  std::array<bool, kCachedXHostRegisters.size()> cached_x_dirty_{};
   bool region_end_reached_ = false;
 };
 
@@ -3735,7 +3831,13 @@ std::tuple<bool, GuestAddr> TryLiteTranslateRegion(GuestAddr start_pc,
     return {false, start_pc};
   }
 
-  LiteTranslator translator(machine_code, params.enable_guest_memory, params.allow_dispatch);
+  CachedXRegisterMap cached_x_registers{};
+  cached_x_registers.fill(-1);
+  if (params.enable_reg_mapping) {
+    cached_x_registers = SelectCachedXRegisters(start_pc, params.end_pc);
+  }
+  LiteTranslator translator(
+      machine_code, cached_x_registers, params.enable_guest_memory, params.allow_dispatch);
   GuestAddr pc = start_pc;
   while (pc < params.end_pc && !translator.region_end_reached()) {
     uint32_t insn = *ToHostAddr<const uint32_t>(pc);

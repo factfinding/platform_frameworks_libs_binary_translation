@@ -192,7 +192,7 @@ std::tuple<bool, HostCodePiece, size_t> TryLiteTranslateAndInstallRegion(GuestAd
   size_t max_size = kMaxGuestInstructionsPerRegion * sizeof(uint32_t);
   params.end_pc = pc + (executable_size < max_size ? executable_size : max_size);
   params.allow_dispatch = true;
-  params.enable_reg_mapping = false;
+  params.enable_reg_mapping = true;
   params.enable_guest_memory = true;
 
   MachineCode machine_code;
