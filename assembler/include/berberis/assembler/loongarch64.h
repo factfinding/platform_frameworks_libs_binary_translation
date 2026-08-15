@@ -280,6 +280,12 @@ class Assembler : public AssemblerBase {
   void FsubD(SimdRegister fd, SimdRegister fj, SimdRegister fk) {
     Emit32(0x0103'0000 | EncodeVk(fk) | EncodeVj(fj) | EncodeVd(fd));
   }
+  void FmaddS(SimdRegister fd, SimdRegister fj, SimdRegister fk, SimdRegister fa) {
+    Emit32(0x0810'0000 | EncodeVa(fa) | EncodeVk(fk) | EncodeVj(fj) | EncodeVd(fd));
+  }
+  void FmaddD(SimdRegister fd, SimdRegister fj, SimdRegister fk, SimdRegister fa) {
+    Emit32(0x0820'0000 | EncodeVa(fa) | EncodeVk(fk) | EncodeVj(fj) | EncodeVd(fd));
+  }
   void FtintrzWS(SimdRegister fd, SimdRegister fj) {
     Emit32(0x011a'8400 | EncodeVj(fj) | EncodeVd(fd));
   }
@@ -341,6 +347,18 @@ class Assembler : public AssemblerBase {
   void VreplveiW(SimdRegister vd, SimdRegister vj, uint32_t index) {
     CHECK_LT(index, 4u);
     Emit32(0x72f7'e000 | (index << 10) | EncodeVj(vj) | EncodeVd(vd));
+  }
+  void Vshuf4iB(SimdRegister vd, SimdRegister vj, uint32_t immediate) {
+    CHECK_LT(immediate, 256u);
+    Emit32(0x7390'0000 | (immediate << 10) | EncodeVj(vj) | EncodeVd(vd));
+  }
+  void Vshuf4iH(SimdRegister vd, SimdRegister vj, uint32_t immediate) {
+    CHECK_LT(immediate, 256u);
+    Emit32(0x7394'0000 | (immediate << 10) | EncodeVj(vj) | EncodeVd(vd));
+  }
+  void Vshuf4iW(SimdRegister vd, SimdRegister vj, uint32_t immediate) {
+    CHECK_LT(immediate, 256u);
+    Emit32(0x7398'0000 | (immediate << 10) | EncodeVj(vj) | EncodeVd(vd));
   }
 
   void SlliD(Register rd, Register rj, uint32_t shift) { Emit2RI6(0x0041'0000, rd, rj, shift); }

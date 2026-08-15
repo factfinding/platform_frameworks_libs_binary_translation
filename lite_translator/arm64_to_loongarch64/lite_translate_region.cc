@@ -16,6 +16,7 @@
 
 #include "berberis/lite_translator/lite_translate_region.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <tuple>
@@ -260,8 +261,11 @@ class LiteTranslator {
     if ((insn & 0xffff'fc00u) == 0x4e08'0c00u) {
       return TranslateDup2D(insn);
     }
-    if ((insn & 0xffe0'fc00u) == 0x6e00'4000u) {
-      return TranslateExt8(insn);
+    if ((insn & 0xbfe0'8400u) == 0x2e00'0000u) {
+      return TranslateExt(insn);
+    }
+    if ((insn & 0xbf3f'fc00u) == 0x0e20'0800u) {
+      return TranslateVectorRev64(insn);
     }
     // TBL Vd.16B, {Vn.16B ... V(n+len).16B}, Vm.16B.  HEVC's NEON
     // deblocking filters use the four-register form in their innermost byte
@@ -330,6 +334,9 @@ class LiteTranslator {
     if ((insn & 0xff20'0c00u) == 0x1e20'0800u) {
       return TranslateScalarFpBinary(insn);
     }
+    if ((insn & 0xff20'8000u) == 0x1f00'0000u) {
+      return TranslateScalarFmadd(insn);
+    }
     if ((insn & 0xffe0'fc07u) == 0x1e20'2000u) {
       return TranslateFcmpS(insn);
     }
@@ -364,6 +371,9 @@ class LiteTranslator {
     }
     if ((insn & 0xffff'fc00u) == 0x1e20'4000u) {
       return TranslateFmovS(insn);
+    }
+    if ((insn & 0xffff'fc00u) == 0x1e60'4000u) {
+      return TranslateFmovD(insn);
     }
     if ((insn & 0xffff'fc00u) == 0x1e27'0000u) {
       return TranslateFmovSFromW(insn);
@@ -2226,14 +2236,83 @@ class LiteTranslator {
     return true;
   }
 
-  bool TranslateExt8(uint32_t insn) {
-    uint32_t rm = (insn >> 16) & 31;
-    uint32_t rn = (insn >> 5) & 31;
-    uint32_t rd = insn & 31;
-    as_.LdD(Assembler::t0, Assembler::s8, VOffset(rn) + 8);
-    as_.LdD(Assembler::t1, Assembler::s8, VOffset(rm));
-    as_.StD(Assembler::t0, Assembler::s8, VOffset(rd));
-    as_.StD(Assembler::t1, Assembler::s8, VOffset(rd) + 8);
+  bool TranslateExt(uint32_t insn) {
+    const uint32_t rm = (insn >> 16) & 31;
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    const uint32_t byte_offset = (insn >> 11) & 15;
+    const bool is_128_bit = (insn & 0x4000'0000u) != 0;
+    if (!is_128_bit && byte_offset >= 8) {
+      return false;
+    }
+
+    // Load every source before writing Vd so Vd may alias either input.  EXT
+    // extracts from the 16/32-byte concatenation Vn:Vm at a constant byte
+    // offset; lowering the two 64-bit output chunks avoids a memory helper and
+    // works on hosts with or without LSX enabled at runtime.
+    as_.LdD(Assembler::t0, Assembler::s8, VOffset(rn));
+    as_.LdD(Assembler::t1, Assembler::s8, VOffset(rn) + 8);
+    as_.LdD(Assembler::t2, Assembler::s8, VOffset(rm));
+    as_.LdD(Assembler::t3, Assembler::s8, VOffset(rm) + 8);
+    const std::array<Register, 4> chunks = {
+        Assembler::t0, Assembler::t1, Assembler::t2, Assembler::t3};
+    const uint32_t chunk = byte_offset / 8;
+    const uint32_t shift = (byte_offset & 7) * 8;
+
+    if (shift == 0) {
+      as_.Move(Assembler::t4, chunks[chunk]);
+    } else {
+      as_.SrliD(Assembler::t4, chunks[chunk], shift);
+      // The 8-byte form concatenates Vn.low64:Vm.low64 rather than using
+      // Vn.high64 as the second chunk.
+      const Register next_chunk = is_128_bit ? chunks[chunk + 1] : Assembler::t2;
+      as_.SlliD(Assembler::t6, next_chunk, 64 - shift);
+      as_.Or(Assembler::t4, Assembler::t4, Assembler::t6);
+    }
+    if (is_128_bit) {
+      if (shift == 0) {
+        as_.Move(Assembler::t5, chunks[chunk + 1]);
+      } else {
+        as_.SrliD(Assembler::t5, chunks[chunk + 1], shift);
+        as_.SlliD(Assembler::t6, chunks[chunk + 2], 64 - shift);
+        as_.Or(Assembler::t5, Assembler::t5, Assembler::t6);
+      }
+      as_.StD(Assembler::t5, Assembler::s8, VOffset(rd) + 8);
+    } else {
+      as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
+    }
+    as_.StD(Assembler::t4, Assembler::s8, VOffset(rd));
+    return true;
+  }
+
+  bool TranslateVectorRev64(uint32_t insn) {
+    const uint32_t size = (insn >> 22) & 3;
+    const bool is_128_bit = (insn & 0x4000'0000u) != 0;
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    if (size == 3) {
+      return false;
+    }
+
+    LoadV(rn, Assembler::vr1);
+    switch (size) {
+      case 0:
+        // Reverse bytes in each word, then swap each pair of words.  Together
+        // these reverse the bytes independently in both 64-bit lanes.
+        as_.Vshuf4iB(Assembler::vr0, Assembler::vr1, 0x1b);
+        as_.Vshuf4iW(Assembler::vr0, Assembler::vr0, 0xb1);
+        break;
+      case 1:
+        as_.Vshuf4iH(Assembler::vr0, Assembler::vr1, 0x1b);
+        break;
+      case 2:
+        as_.Vshuf4iW(Assembler::vr0, Assembler::vr1, 0xb1);
+        break;
+    }
+    StoreV(rd, Assembler::vr0);
+    if (!is_128_bit) {
+      as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
+    }
     return true;
   }
 
@@ -2480,6 +2559,31 @@ class LiteTranslator {
     return true;
   }
 
+  bool TranslateScalarFmadd(uint32_t insn) {
+    const uint32_t ftype = (insn >> 22) & 3;
+    const uint32_t rm = (insn >> 16) & 31;
+    const uint32_t ra = (insn >> 10) & 31;
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    if (ftype > 1) {
+      return false;
+    }
+
+    LoadV(rn, Assembler::vr1);
+    LoadV(rm, Assembler::vr2);
+    LoadV(ra, Assembler::vr3);
+    if (ftype == 0) {
+      as_.FmaddS(Assembler::vr0, Assembler::vr1, Assembler::vr2, Assembler::vr3);
+      as_.Vst(Assembler::vr0, Assembler::s8, VOffset(rd));
+      as_.StW(Assembler::zero, Assembler::s8, VOffset(rd) + 4);
+    } else {
+      as_.FmaddD(Assembler::vr0, Assembler::vr1, Assembler::vr2, Assembler::vr3);
+      as_.Vst(Assembler::vr0, Assembler::s8, VOffset(rd));
+    }
+    as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
+    return true;
+  }
+
   bool TranslateFcmpS(uint32_t insn) {
     const uint32_t rm = (insn >> 16) & 31;
     const uint32_t rn = (insn >> 5) & 31;
@@ -2659,6 +2763,15 @@ class LiteTranslator {
     as_.LdWU(Assembler::t0, Assembler::s8, VOffset(rn));
     as_.StW(Assembler::t0, Assembler::s8, VOffset(rd));
     as_.StW(Assembler::zero, Assembler::s8, VOffset(rd) + 4);
+    as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
+    return true;
+  }
+
+  bool TranslateFmovD(uint32_t insn) {
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    as_.LdD(Assembler::t0, Assembler::s8, VOffset(rn));
+    as_.StD(Assembler::t0, Assembler::s8, VOffset(rd));
     as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
     return true;
   }

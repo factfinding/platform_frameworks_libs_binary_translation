@@ -1154,6 +1154,87 @@ TEST(LoongArch64RuntimeLibraryTest, LiteLsxVectorFloatMatchesInterpreter) {
   }
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteScalarFmaddAndFmovDMatchInterpreter) {
+  // fmadd s18, s19, s18, s20; fmadd d3, d4, d3, d0; fmov d0, d1
+  constexpr std::array<uint32_t, 3> kGuestCode = {0x1f12'5272, 0x1f43'0083, 0x1e60'4020};
+  for (uint32_t insn : kGuestCode) {
+    const std::array<uint32_t, 1> one_insn = {insn};
+    ThreadState interpreted{};
+    ThreadState translated{};
+    auto initialize = [](ThreadState* state) {
+      state->cpu.v[0] = MakeUint128(0x4008'0000'0000'0000, UINT64_MAX);  // 3.0
+      state->cpu.v[1] = MakeUint128(0xc02a'0000'0000'0000, UINT64_MAX);  // -13.0
+      state->cpu.v[3] = MakeUint128(0x4000'0000'0000'0000, UINT64_MAX);  // 2.0
+      state->cpu.v[4] = MakeUint128(0x3ff8'0000'0000'0000, UINT64_MAX);  // 1.5
+      state->cpu.v[18] = MakeUint32x4(0x4000'0000, UINT32_MAX, UINT32_MAX, UINT32_MAX);
+      state->cpu.v[19] = MakeUint32x4(0x3fc0'0000, UINT32_MAX, UINT32_MAX, UINT32_MAX);
+      state->cpu.v[20] = MakeUint32x4(0x4040'0000, UINT32_MAX, UINT32_MAX, UINT32_MAX);
+    };
+    initialize(&interpreted);
+    initialize(&translated);
+    SetInsnAddr(interpreted.cpu, ToGuestAddr(one_insn.data()));
+
+    InterpretInsn(&interpreted);
+    TranslateAndRun(one_insn, &translated);
+
+    const uint32_t rd = insn & 31;
+    SCOPED_TRACE(testing::Message() << "insn=" << std::hex << insn);
+    EXPECT_EQ(translated.cpu.v[rd], interpreted.cpu.v[rd]);
+  }
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteVectorRev64MatchesInterpreter) {
+  // rev64 v2.16b/v2.8h, v3; rev64 v0.4s, v0; rev64 v2.2s, v3.
+  constexpr std::array<uint32_t, 4> kGuestCode = {
+      0x4e20'0862, 0x4e60'0862, 0x4ea0'0800, 0x0ea0'0862};
+  for (uint32_t insn : kGuestCode) {
+    const std::array<uint32_t, 1> one_insn = {insn};
+    ThreadState interpreted{};
+    ThreadState translated{};
+    auto initialize = [](ThreadState* state) {
+      state->cpu.v[0] = MakeUint128(0x0011'2233'4455'6677, 0x8899'aabb'ccdd'eeff);
+      state->cpu.v[2] = MakeUint128(UINT64_MAX, UINT64_MAX);
+      state->cpu.v[3] = MakeUint128(0x0123'4567'89ab'cdef, 0xfedc'ba98'7654'3210);
+    };
+    initialize(&interpreted);
+    initialize(&translated);
+    SetInsnAddr(interpreted.cpu, ToGuestAddr(one_insn.data()));
+
+    InterpretInsn(&interpreted);
+    TranslateAndRun(one_insn, &translated);
+
+    const uint32_t rd = insn & 31;
+    SCOPED_TRACE(testing::Message() << "insn=" << std::hex << insn);
+    EXPECT_EQ(translated.cpu.v[rd], interpreted.cpu.v[rd]);
+  }
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteExtAllOffsetsMatchInterpreter) {
+  for (bool is_128_bit : {false, true}) {
+    const uint32_t limit = is_128_bit ? 16 : 8;
+    for (uint32_t byte_offset = 0; byte_offset < limit; ++byte_offset) {
+      // ext v1.{8b,16b}, v1.{8b,16b}, v2.{8b,16b}, #byte_offset.  Vd == Vn
+      // exercises the aliasing case in addition to every legal immediate.
+      const std::array<uint32_t, 1> guest_code = {0x2e00'0021u |
+                                                  (static_cast<uint32_t>(is_128_bit) << 30) |
+                                                  (2u << 16) | (byte_offset << 11)};
+      ThreadState interpreted{};
+      ThreadState translated{};
+      interpreted.cpu.v[1] = MakeUint128(0x0706'0504'0302'0100, 0x0f0e'0d0c'0b0a'0908);
+      interpreted.cpu.v[2] = MakeUint128(0x1716'1514'1312'1110, 0x1f1e'1d1c'1b1a'1918);
+      translated.cpu.v[1] = interpreted.cpu.v[1];
+      translated.cpu.v[2] = interpreted.cpu.v[2];
+      SetInsnAddr(interpreted.cpu, ToGuestAddr(guest_code.data()));
+
+      InterpretInsn(&interpreted);
+      TranslateAndRun(guest_code, &translated);
+
+      SCOPED_TRACE(testing::Message() << "q=" << is_128_bit << " byte_offset=" << byte_offset);
+      EXPECT_EQ(translated.cpu.v[1], interpreted.cpu.v[1]);
+    }
+  }
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteTbl16BMatchesInterpreterWithAliasedIndex) {
   // FFmpeg HEVC hot path: tbl v19.16b, {v8.16b-v11.16b}, v19.16b.
   // Vd == Vm is intentional and verifies that translation consumes every

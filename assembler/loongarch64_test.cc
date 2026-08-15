@@ -171,6 +171,25 @@ TEST(LoongArch64AssemblerTest, EncodesCountLeadingZerosAndWordReverse) {
   }
 }
 
+TEST(LoongArch64AssemblerTest, EncodesScalarFmaAndLsxImmediateShuffles) {
+  MachineCode code;
+  Assembler assembler(&code);
+
+  assembler.FmaddS(Assembler::vr2, Assembler::vr3, Assembler::vr4, Assembler::vr5);
+  assembler.FmaddD(Assembler::vr2, Assembler::vr3, Assembler::vr4, Assembler::vr5);
+  assembler.Vshuf4iB(Assembler::vr2, Assembler::vr3, 0x1b);
+  assembler.Vshuf4iH(Assembler::vr2, Assembler::vr3, 0x1b);
+  assembler.Vshuf4iW(Assembler::vr2, Assembler::vr3, 0xb1);
+
+  // Generated independently with LLVM 21 llvm-mc for LoongArch64 with LSX.
+  constexpr std::array<uint32_t, 5> kExpected = {
+      0x0812'9062, 0x0822'9062, 0x7390'6c62, 0x7394'6c62, 0x739a'c462};
+  ASSERT_EQ(code.install_size(), sizeof(kExpected));
+  for (size_t i = 0; i < kExpected.size(); ++i) {
+    EXPECT_EQ(*code.AddrAs<const uint32_t>(i * sizeof(uint32_t)), kExpected[i]) << i;
+  }
+}
+
 TEST(LoongArch64AssemblerTest, EncodesLsxFloatingPointInstructions) {
   MachineCode code;
   Assembler assembler(&code);
