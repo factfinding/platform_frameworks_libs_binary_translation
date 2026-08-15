@@ -36,6 +36,54 @@
 #include "berberis/guest_state/guest_addr.h"
 
 namespace berberis {
+namespace {
+
+constexpr uint32_t kExtractedLibMetadataMagic = 0x424c4331;  // "BLC1"
+
+struct ExtractedLibMetadata {
+  uint32_t magic;
+  uint32_t crc32;
+  uint32_t uncompressed_length;
+};
+
+bool ReadExtractedLibMetadata(const std::string& path, ExtractedLibMetadata* metadata) {
+  int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    return false;
+  }
+  ssize_t bytes_read;
+  do {
+    bytes_read = read(fd, metadata, sizeof(*metadata));
+  } while (bytes_read < 0 && errno == EINTR);
+  close(fd);
+  return bytes_read == sizeof(*metadata);
+}
+
+bool WriteExtractedLibMetadata(const std::string& path,
+                               const ExtractedLibMetadata& metadata) {
+  int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+  if (fd < 0) {
+    return false;
+  }
+  const char* data = reinterpret_cast<const char*>(&metadata);
+  size_t remaining = sizeof(metadata);
+  while (remaining > 0) {
+    ssize_t bytes_written = write(fd, data, remaining);
+    if (bytes_written < 0 && errno == EINTR) {
+      continue;
+    }
+    if (bytes_written <= 0) {
+      close(fd);
+      return false;
+    }
+    data += bytes_written;
+    remaining -= bytes_written;
+  }
+  close(fd);
+  return true;
+}
+
+}  // namespace
 
 // Extract <apk_path>!/<entry> to /data/data/<pkg>/cache/berberis_extract/<basename>
 // and return the extracted path on success. Used as a fallback when the guest
@@ -74,12 +122,6 @@ std::string ExtractInApkLibToCache(const char* libpath) {
 
   std::string out_path = cache_dir + "/" + basename;
 
-  // If a previous launch already extracted this lib, reuse it.
-  struct stat st_out;
-  if (stat(out_path.c_str(), &st_out) == 0 && st_out.st_size > 0) {
-    return out_path;
-  }
-
   ZipArchiveHandle zip = nullptr;
   if (OpenArchive(apk_path.c_str(), &zip) != 0) {
     DIGITALIS_LOG("ExtractInApkLibToCache: OpenArchive(%s) failed", apk_path.c_str());
@@ -93,9 +135,34 @@ std::string ExtractInApkLibToCache(const char* libpath) {
     CloseArchive(zip);
     return {};
   }
+
+  // Package updates may replace a library without clearing the application's
+  // cache directory.  Reusing a file based on its basename alone can then pair
+  // old native code with new Java bytecode.  Conscrypt, for example, aborts at
+  // JNI registration when its callback signatures change.  Persist the ZIP
+  // entry identity next to the extracted file and only reuse an exact match.
+  std::string metadata_path = out_path + ".meta";
+  ExtractedLibMetadata expected_metadata = {
+      .magic = kExtractedLibMetadataMagic,
+      .crc32 = entry.crc32,
+      .uncompressed_length = entry.uncompressed_length,
+  };
+  ExtractedLibMetadata cached_metadata;
+  struct stat st_out;
+  if (stat(out_path.c_str(), &st_out) == 0 &&
+      static_cast<uint64_t>(st_out.st_size) == entry.uncompressed_length &&
+      ReadExtractedLibMetadata(metadata_path, &cached_metadata) &&
+      cached_metadata.magic == expected_metadata.magic &&
+      cached_metadata.crc32 == expected_metadata.crc32 &&
+      cached_metadata.uncompressed_length == expected_metadata.uncompressed_length) {
+    CloseArchive(zip);
+    return out_path;
+  }
+
   // Extract to a temp file and rename so partial reads from concurrent
   // launches don't see a half-written .so.
-  std::string tmp_path = out_path + ".tmp";
+  std::string tmp_suffix = ".tmp." + std::to_string(getpid());
+  std::string tmp_path = out_path + tmp_suffix;
   int out_fd = open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
   if (out_fd < 0) {
     DIGITALIS_LOG("ExtractInApkLibToCache: open(%s) failed: %s", tmp_path.c_str(), strerror(errno));
@@ -115,6 +182,13 @@ std::string ExtractInApkLibToCache(const char* libpath) {
     DIGITALIS_LOG("ExtractInApkLibToCache: rename(%s,%s) failed: %s",
                   tmp_path.c_str(), out_path.c_str(), strerror(errno));
     return {};
+  }
+  std::string tmp_metadata_path = metadata_path + tmp_suffix;
+  if (!WriteExtractedLibMetadata(tmp_metadata_path, expected_metadata) ||
+      rename(tmp_metadata_path.c_str(), metadata_path.c_str()) != 0) {
+    unlink(tmp_metadata_path.c_str());
+    DIGITALIS_LOG("ExtractInApkLibToCache: failed to update metadata for %s: %s",
+                  out_path.c_str(), strerror(errno));
   }
   DIGITALIS_LOG("ExtractInApkLibToCache: %s -> %s", libpath, out_path.c_str());
   return out_path;
