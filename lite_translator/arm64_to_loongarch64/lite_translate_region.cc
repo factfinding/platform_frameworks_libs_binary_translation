@@ -324,6 +324,9 @@ class LiteTranslator {
     if ((insn & 0xffe0'fc00u) == 0x4e80'5800u) {
       return TranslatePermute4S(insn, 3);  // UZP2
     }
+    if ((insn & 0xffe0'fc00u) == 0x4e80'3800u) {
+      return TranslatePermute4S(insn, 4);  // ZIP1
+    }
     // MOVI Vd.2D, #0.  Compilers use this reserved modified-immediate form
     // as the canonical full-width vector clear.
     if ((insn & 0xffff'ffe0u) == 0x6f00'e400u) {
@@ -366,6 +369,11 @@ class LiteTranslator {
     if ((insn & 0xffff'fc00u) == 0x1e38'0000u) {
       return TranslateFcvtzsWS(insn);
     }
+    // FADDP shares the broad FADD opcode pattern, so recognize its 2S form
+    // before the generic vector floating-point matcher.
+    if ((insn & 0xffe0'fc00u) == 0x2e20'd400u) {
+      return TranslateFaddp2S(insn);
+    }
     // AdvSIMD floating-point add/sub and mul/div.  Q and size select 2S/4S/2D;
     // half-precision encodings remain in the interpreter.
     if ((insn & 0xbfa0'fc00u) == 0x0e20'd400u) {
@@ -373,6 +381,18 @@ class LiteTranslator {
     }
     if ((insn & 0xbfa0'fc00u) == 0x0ea0'd400u) {
       return TranslateVectorFpBinary(insn, 3);  // FSUB
+    }
+    if ((insn & 0xffff'fc00u) == 0x4ea0'd800u) {
+      return TranslateFcmeq4SZero(insn);
+    }
+    if ((insn & 0xffe0'fc00u) == 0x6e20'e400u) {
+      return TranslateFcmge4S(insn);
+    }
+    if ((insn & 0xffe0'fc00u) == 0x6e20'8c00u) {
+      return TranslateCmeq16B(insn);
+    }
+    if ((insn & 0xffff'fc00u) == 0x4e21'd800u) {
+      return TranslateScvtf4S(insn);
     }
     if ((insn & 0xbf20'fc00u) == 0x2e20'dc00u) {
       return TranslateVectorFpBinary(insn, 0);  // FMUL
@@ -2472,6 +2492,81 @@ class LiteTranslator {
     return true;
   }
 
+  bool TranslateFaddp2S(uint32_t insn) {
+    const uint32_t rm = (insn >> 16) & 31;
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+
+    // Snapshot both sources before writing Vd so every register-aliasing
+    // combination behaves like ARM.  Use scalar additions: the 2S form has
+    // only two architectural results, and inactive lanes must not raise FP
+    // exceptions.
+    as_.LdD(Assembler::t0, Assembler::s8, VOffset(rn));
+    as_.LdD(Assembler::t4, Assembler::s8, VOffset(rm));
+    as_.Move(Assembler::t1, Assembler::t0);
+    ZeroExtend32(Assembler::t1);
+    as_.SrliD(Assembler::t2, Assembler::t0, 32);
+    as_.Movgr2frW(Assembler::vr1, Assembler::t1);
+    as_.Movgr2frW(Assembler::vr2, Assembler::t2);
+    as_.FaddS(Assembler::vr0, Assembler::vr1, Assembler::vr2);
+    as_.Movfr2grS(Assembler::t3, Assembler::vr0);
+
+    as_.Move(Assembler::t1, Assembler::t4);
+    ZeroExtend32(Assembler::t1);
+    as_.SrliD(Assembler::t2, Assembler::t4, 32);
+    as_.Movgr2frW(Assembler::vr1, Assembler::t1);
+    as_.Movgr2frW(Assembler::vr2, Assembler::t2);
+    as_.FaddS(Assembler::vr0, Assembler::vr1, Assembler::vr2);
+    as_.Movfr2grS(Assembler::t5, Assembler::vr0);
+
+    as_.StW(Assembler::t3, Assembler::s8, VOffset(rd));
+    as_.StW(Assembler::t5, Assembler::s8, VOffset(rd) + 4);
+    as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
+    return true;
+  }
+
+  bool TranslateFcmeq4SZero(uint32_t insn) {
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    LoadV(rn, Assembler::vr1);
+    as_.VxorV(Assembler::vr2, Assembler::vr2, Assembler::vr2);
+    as_.VfcmpCeqS(Assembler::vr0, Assembler::vr1, Assembler::vr2);
+    StoreV(rd, Assembler::vr0);
+    return true;
+  }
+
+  bool TranslateFcmge4S(uint32_t insn) {
+    const uint32_t rm = (insn >> 16) & 31;
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    LoadV(rn, Assembler::vr1);
+    LoadV(rm, Assembler::vr2);
+    // ARM Vn >= Vm is the ordered comparison Vm <= Vn.
+    as_.VfcmpSleS(Assembler::vr0, Assembler::vr2, Assembler::vr1);
+    StoreV(rd, Assembler::vr0);
+    return true;
+  }
+
+  bool TranslateCmeq16B(uint32_t insn) {
+    const uint32_t rm = (insn >> 16) & 31;
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    LoadV(rn, Assembler::vr1);
+    LoadV(rm, Assembler::vr2);
+    as_.VseqB(Assembler::vr0, Assembler::vr1, Assembler::vr2);
+    StoreV(rd, Assembler::vr0);
+    return true;
+  }
+
+  bool TranslateScvtf4S(uint32_t insn) {
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    LoadV(rn, Assembler::vr1);
+    as_.VffintSW(Assembler::vr0, Assembler::vr1);
+    StoreV(rd, Assembler::vr0);
+    return true;
+  }
+
   bool TranslateSshll4S(uint32_t insn) {
     const uint32_t immh_immb = (insn >> 16) & 0x7f;
     const uint32_t shift = immh_immb - 16;
@@ -2570,7 +2665,7 @@ class LiteTranslator {
       source_lanes[2] = 2;
       source_regs[3] = rm;
       source_lanes[3] = 2;
-    } else {  // UZP2: n[1], n[3], m[1], m[3]
+    } else if (operation == 3) {  // UZP2: n[1], n[3], m[1], m[3]
       source_regs[0] = rn;
       source_lanes[0] = 1;
       source_regs[1] = rn;
@@ -2579,6 +2674,15 @@ class LiteTranslator {
       source_lanes[2] = 1;
       source_regs[3] = rm;
       source_lanes[3] = 3;
+    } else {  // ZIP1: n[0], m[0], n[1], m[1]
+      source_regs[0] = rn;
+      source_lanes[0] = 0;
+      source_regs[1] = rm;
+      source_lanes[1] = 0;
+      source_regs[2] = rn;
+      source_lanes[2] = 1;
+      source_regs[3] = rm;
+      source_lanes[3] = 1;
     }
     for (size_t lane = 0; lane < 4; ++lane) {
       as_.LdWU(outputs[lane],

@@ -2609,7 +2609,7 @@ TEST(LoongArch64RuntimeLibraryTest, LiteFcvtzuWSMatchesInterpreter) {
 }
 
 TEST(LoongArch64RuntimeLibraryTest, LiteCntAndHotPermutesMatchInterpreter) {
-  constexpr std::array<uint32_t, 7> kGuestCode = {
+  constexpr std::array<uint32_t, 9> kGuestCode = {
       0x0e20'5820,  // cnt v0.8b,v1.8b
       0x4e20'5862,  // cnt v2.16b,v3.16b
       0x4e82'1820,  // uzp1 v0.4s,v1.4s,v2.4s
@@ -2617,6 +2617,8 @@ TEST(LoongArch64RuntimeLibraryTest, LiteCntAndHotPermutesMatchInterpreter) {
       0x4e88'28e6,  // trn1 v6.4s,v7.4s,v8.4s
       0x4e80'1800,  // uzp1 v0.4s,v0.4s,v0.4s (all registers alias)
       0x4e88'58e9,  // uzp2 v9.4s,v7.4s,v8.4s
+      0x4e88'38ea,  // zip1 v10.4s,v7.4s,v8.4s
+      0x4e85'38a5,  // zip1 v5.4s,v5.4s,v5.4s (all registers alias)
   };
   for (uint32_t insn : kGuestCode) {
     const std::array<uint32_t, 1> one_insn = {insn};
@@ -2636,6 +2638,78 @@ TEST(LoongArch64RuntimeLibraryTest, LiteCntAndHotPermutesMatchInterpreter) {
     const uint32_t rd = insn & 31;
     SCOPED_TRACE(testing::Message() << "insn=" << std::hex << insn);
     EXPECT_EQ(translated.cpu.v[rd], interpreted.cpu.v[rd]);
+  }
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteFaddp2SMatchesInterpreter) {
+  constexpr std::array<uint32_t, 2> kGuestCode = {
+      0x2e22'd423,  // faddp v3.2s,v1.2s,v2.2s
+      0x2e20'd4e0,  // faddp v0.2s,v7.2s,v0.2s (destination aliases second source)
+  };
+  for (uint32_t insn : kGuestCode) {
+    const std::array<uint32_t, 1> one_insn = {insn};
+    ThreadState interpreted{};
+    ThreadState translated{};
+    auto initialize = [](ThreadState* state) {
+      state->cpu.v[0] = MakeUint32x4(0x8000'0000, 0x0000'0000, 0x1111'1111, 0x2222'2222);
+      state->cpu.v[1] = MakeUint32x4(0x3f80'0000, 0x4000'0000, 0x3333'3333, 0x4444'4444);
+      state->cpu.v[2] = MakeUint32x4(0x4040'0000, 0xc080'0000, 0x5555'5555, 0x6666'6666);
+      state->cpu.v[7] = MakeUint32x4(0x7fc1'2345, 0x3f80'0000, 0x7777'7777, 0x8888'8888);
+    };
+    initialize(&interpreted);
+    initialize(&translated);
+    SetInsnAddr(interpreted.cpu, ToGuestAddr(one_insn.data()));
+    InterpretInsn(&interpreted);
+    TranslateAndRun(one_insn, &translated);
+    const uint32_t rd = insn & 31;
+    SCOPED_TRACE(testing::Message() << "insn=" << std::hex << insn);
+    EXPECT_EQ(translated.cpu.v[rd], interpreted.cpu.v[rd]);
+  }
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteHotVectorComparisonsMatchInterpreter) {
+  constexpr std::array<uint32_t, 3> kGuestCode = {
+      0x4ea0'd800,  // fcmeq v0.4s,v0.4s,#0
+      0x6e21'e400,  // fcmge v0.4s,v0.4s,v1.4s
+      0x6e27'8e07,  // cmeq v7.16b,v16.16b,v7.16b (destination aliases second source)
+  };
+  for (uint32_t insn : kGuestCode) {
+    const std::array<uint32_t, 1> one_insn = {insn};
+    ThreadState interpreted{};
+    ThreadState translated{};
+    auto initialize = [](ThreadState* state) {
+      state->cpu.v[0] = MakeUint32x4(0x0000'0000, 0x8000'0000, 0x7fc1'2345, 0xbf80'0000);
+      state->cpu.v[1] = MakeUint32x4(0x8000'0000, 0x3f80'0000, 0x4000'0000, 0xc000'0000);
+      state->cpu.v[7] = MakeUint32x4(0x0001'0203, 0x0405'0607, 0x0809'0a0b, 0x0c0d'0e0f);
+      state->cpu.v[16] = MakeUint32x4(0x1001'0213, 0x1425'3607, 0x4809'5a0b, 0x6c7d'0e8f);
+    };
+    initialize(&interpreted);
+    initialize(&translated);
+    SetInsnAddr(interpreted.cpu, ToGuestAddr(one_insn.data()));
+    InterpretInsn(&interpreted);
+    TranslateAndRun(one_insn, &translated);
+    const uint32_t rd = insn & 31;
+    SCOPED_TRACE(testing::Message() << "insn=" << std::hex << insn);
+    EXPECT_EQ(translated.cpu.v[rd], interpreted.cpu.v[rd]);
+  }
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteScvtf4SMatchesInterpreter) {
+  constexpr std::array<uint32_t, 1> kGuestCode = {0x4e21'd800};  // scvtf v0.4s,v0.4s
+  constexpr std::array<__uint128_t, 3> kInputs = {
+      MakeUint32x4(0, 1, 0xffff'ffff, 0x8000'0000),
+      MakeUint32x4(0x7fff'ffff, 0x0100'0001, 0xfeff'ffff, 0x4000'0000),
+      MakeUint32x4(12345, 0xffff'cfc7, 0x00ff'ffff, 0xff00'0001),
+  };
+  for (__uint128_t input : kInputs) {
+    ThreadState interpreted{};
+    ThreadState translated{};
+    interpreted.cpu.v[0] = input;
+    translated.cpu.v[0] = input;
+    SetInsnAddr(interpreted.cpu, ToGuestAddr(kGuestCode.data()));
+    InterpretInsn(&interpreted);
+    TranslateAndRun(kGuestCode, &translated);
+    EXPECT_EQ(translated.cpu.v[0], interpreted.cpu.v[0]);
   }
 }
 

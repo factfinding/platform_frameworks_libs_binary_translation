@@ -256,6 +256,18 @@ class Assembler : public AssemblerBase {
   void VffintSWu(SimdRegister vd, SimdRegister vj) {
     Emit32(0x729e'0400 | EncodeVj(vj) | EncodeVd(vd));
   }
+  void VffintSW(SimdRegister vd, SimdRegister vj) {
+    Emit32(0x729e'0000 | EncodeVj(vj) | EncodeVd(vd));
+  }
+  void VfcmpCeqS(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
+    Emit32(0x0c52'0000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
+  }
+  void VfcmpSleS(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
+    Emit32(0x0c53'8000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
+  }
+  void VseqB(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
+    Emit32(0x7000'0000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
+  }
   void FmulS(SimdRegister fd, SimdRegister fj, SimdRegister fk) {
     Emit32(0x0104'8000 | EncodeVk(fk) | EncodeVj(fj) | EncodeVd(fd));
   }

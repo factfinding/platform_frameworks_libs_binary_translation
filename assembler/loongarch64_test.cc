@@ -208,6 +208,24 @@ TEST(LoongArch64AssemblerTest, EncodesHotScalarConversions) {
   }
 }
 
+TEST(LoongArch64AssemblerTest, EncodesHotLsxConversionsAndComparisons) {
+  MachineCode code;
+  Assembler assembler(&code);
+
+  assembler.VffintSW(Assembler::vr2, Assembler::vr3);
+  assembler.VfcmpCeqS(Assembler::vr2, Assembler::vr3, Assembler::vr4);
+  assembler.VfcmpSleS(Assembler::vr2, Assembler::vr3, Assembler::vr4);
+  assembler.VseqB(Assembler::vr2, Assembler::vr3, Assembler::vr4);
+
+  // Generated independently with LLVM 21 llvm-mc for LoongArch64 and LSX.
+  constexpr std::array<uint32_t, 4> kExpected = {
+      0x729e'0062, 0x0c52'1062, 0x0c53'9062, 0x7000'1062};
+  ASSERT_EQ(code.install_size(), sizeof(kExpected));
+  for (size_t i = 0; i < kExpected.size(); ++i) {
+    EXPECT_EQ(*code.AddrAs<const uint32_t>(i * sizeof(uint32_t)), kExpected[i]) << i;
+  }
+}
+
 TEST(LoongArch64AssemblerTest, EncodesLsxFloatingPointInstructions) {
   MachineCode code;
   Assembler assembler(&code);
