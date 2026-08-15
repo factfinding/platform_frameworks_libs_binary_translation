@@ -1681,6 +1681,72 @@ TEST(LoongArch64RuntimeLibraryTest, LiteLd1Two4SHasRecoveryPoints) {
   EXPECT_EQ(exec.recovery_map().size(), 4u);
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteLdSt1Multiple4SMatchesInterpreter) {
+  constexpr std::array<uint32_t, 6> kGuestCode = {
+      0x4c40'2820,  // ld1 {v0.4s-v3.4s},[x1]
+      0x4cc9'7820,  // ld1 {v0.4s},[x1],x9
+      0x4c89'7820,  // st1 {v0.4s},[x1],x9
+      0x4cdf'6820,  // ld1 {v0.4s-v2.4s},[x1],#48
+      0x4c9f'2820,  // st1 {v0.4s-v3.4s},[x1],#64
+      0x4c40'283e,  // ld1 {v30.4s,v31.4s,v0.4s,v1.4s},[x1]
+  };
+  constexpr uint64_t kTag = 0xab00'0000'0000'0000ULL;
+
+  for (uint32_t insn : kGuestCode) {
+    const std::array<uint32_t, 1> one_insn = {insn};
+    alignas(16) std::array<uint64_t, 12> interpreted_memory = {
+        0x0001'0203'0405'0607, 0x1011'1213'1415'1617, 0x2021'2223'2425'2627,
+        0x3031'3233'3435'3637, 0x4041'4243'4445'4647, 0x5051'5253'5455'5657,
+        0x6061'6263'6465'6667, 0x7071'7273'7475'7677, 0, 0, 0, 0};
+    alignas(16) std::array<uint64_t, 12> translated_memory = interpreted_memory;
+    ThreadState interpreted{};
+    ThreadState translated{};
+    auto initialize = [](ThreadState* state) {
+      for (uint32_t reg = 0; reg < 32; ++reg) {
+        state->cpu.v[reg] = MakeUint128(0x1111'0000'0000'0000ULL + reg,
+                                        0xaaaa'0000'0000'0000ULL + reg);
+      }
+      state->cpu.x[9] = 16;
+    };
+    initialize(&interpreted);
+    initialize(&translated);
+    interpreted.cpu.x[1] = ToGuestAddr(interpreted_memory.data()) | kTag;
+    translated.cpu.x[1] = ToGuestAddr(translated_memory.data()) | kTag;
+    SetInsnAddr(interpreted.cpu, ToGuestAddr(one_insn.data()));
+
+    InterpretInsn(&interpreted);
+    TranslateAndRun(one_insn, &translated);
+
+    SCOPED_TRACE(testing::Message() << "insn=" << std::hex << insn);
+    EXPECT_EQ(translated_memory, interpreted_memory);
+    EXPECT_EQ(translated.cpu.x[1] - ToGuestAddr(translated_memory.data()),
+              interpreted.cpu.x[1] - ToGuestAddr(interpreted_memory.data()));
+    for (uint32_t reg = 0; reg < 32; ++reg) {
+      EXPECT_EQ(translated.cpu.v[reg], interpreted.cpu.v[reg]) << reg;
+    }
+  }
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteLdSt1Multiple4SHasRecoveryPoints) {
+  constexpr std::array<uint32_t, 2> kGuestCode = {
+      0x4c40'2820,  // ld1 {v0.4s-v3.4s},[x1]
+      0x4c9f'2820,  // st1 {v0.4s-v3.4s},[x1],#64
+  };
+  for (uint32_t insn : kGuestCode) {
+    const std::array<uint32_t, 1> one_insn = {insn};
+    GuestAddr start_pc = ToGuestAddr(one_insn.data());
+    MachineCode code;
+    LiteTranslateParams params;
+    params.end_pc = start_pc + sizeof(one_insn);
+    params.allow_dispatch = false;
+    auto [success, stop_pc] = TryLiteTranslateRegion(start_pc, &code, params);
+    ASSERT_TRUE(success);
+    EXPECT_EQ(stop_pc, params.end_pc);
+    ScopedExecRegion exec(&code);
+    EXPECT_EQ(exec.recovery_map().size(), 8u);
+  }
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesSimd128LoadsAndStores) {
   // ldr q1, [x0, #16]; str q1, [x0, #32]
   // ldr q2, [x0, x3]; str q2, [x0, x4, lsl #4]
@@ -2191,8 +2257,9 @@ TEST(LoongArch64RuntimeLibraryTest, UnityInsGeneralToLiteVectorHandoffMatchesInt
 }
 
 TEST(LoongArch64RuntimeLibraryTest, LiteHotStructMemoryMatchesInterpreter) {
-  constexpr std::array<uint32_t, 4> kGuestCode = {
+  constexpr std::array<uint32_t, 5> kGuestCode = {
       0x4c9f'a820,  // st1 {v0.4s,v1.4s},[x1],#32
+      0x0ddf'8464,  // ld1 {v4.d}[0],[x3],#8
       0x4ddf'8464,  // ld1 {v4.d}[1],[x3],#8
       0x4d40'c930,  // ld1r {v16.4s},[x9]
       0x4d00'8121,  // st1 {v1.s}[2],[x9]
@@ -2542,13 +2609,14 @@ TEST(LoongArch64RuntimeLibraryTest, LiteFcvtzuWSMatchesInterpreter) {
 }
 
 TEST(LoongArch64RuntimeLibraryTest, LiteCntAndHotPermutesMatchInterpreter) {
-  constexpr std::array<uint32_t, 6> kGuestCode = {
+  constexpr std::array<uint32_t, 7> kGuestCode = {
       0x0e20'5820,  // cnt v0.8b,v1.8b
       0x4e20'5862,  // cnt v2.16b,v3.16b
       0x4e82'1820,  // uzp1 v0.4s,v1.4s,v2.4s
       0x4e85'7883,  // zip2 v3.4s,v4.4s,v5.4s
       0x4e88'28e6,  // trn1 v6.4s,v7.4s,v8.4s
       0x4e80'1800,  // uzp1 v0.4s,v0.4s,v0.4s (all registers alias)
+      0x4e88'58e9,  // uzp2 v9.4s,v7.4s,v8.4s
   };
   for (uint32_t insn : kGuestCode) {
     const std::array<uint32_t, 1> one_insn = {insn};

@@ -207,25 +207,18 @@ class LiteTranslator {
       }
       return TranslateStoreExclusive(insn, pc);
     }
-    if ((insn & 0xffff'fc00u) == 0x4cdf'a800u) {
+    // LD1/ST1 of one through four complete 4S vectors.  Unlike LD2/LD3/LD4,
+    // these forms transfer consecutive vectors without interleaving, so all
+    // list lengths share one lowering.  Accept both no-writeback and
+    // immediate/register post-index encodings.
+    if ((insn & 0xffbf'0c00u) == 0x4c00'0800u ||
+        (insn & 0xffa0'0c00u) == 0x4c80'0800u) {
       if (!enable_guest_memory_) {
         return false;
       }
-      return TranslateLd1Two4S(insn, pc, true);
+      return TranslateLdSt1Multiple4S(insn, pc);
     }
-    if ((insn & 0xffff'fc00u) == 0x4c40'a800u) {
-      if (!enable_guest_memory_) {
-        return false;
-      }
-      return TranslateLd1Two4S(insn, pc, false);
-    }
-    if ((insn & 0xffff'fc00u) == 0x4c9f'a800u) {
-      if (!enable_guest_memory_) {
-        return false;
-      }
-      return TranslateSt1Two4SPostIndex(insn, pc);
-    }
-    if ((insn & 0xffff'fc00u) == 0x4ddf'8400u) {
+    if ((insn & 0xbfff'fc00u) == 0x0ddf'8400u) {
       if (!enable_guest_memory_) {
         return false;
       }
@@ -327,6 +320,9 @@ class LiteTranslator {
     }
     if ((insn & 0xffe0'fc00u) == 0x4e80'2800u) {
       return TranslatePermute4S(insn, 2);  // TRN1
+    }
+    if ((insn & 0xffe0'fc00u) == 0x4e80'5800u) {
+      return TranslatePermute4S(insn, 3);  // UZP2
     }
     // MOVI Vd.2D, #0.  Compilers use this reserved modified-immediate form
     // as the canonical full-width vector clear.
@@ -2053,65 +2049,84 @@ class LiteTranslator {
     return true;
   }
 
-  bool TranslateLd1Two4S(uint32_t insn, GuestAddr pc, bool post_index) {
-    uint32_t rn = (insn >> 5) & 31;
-    uint32_t rt = insn & 31;
-    uint32_t rt2 = (rt + 1) & 31;
-    LoadXOrSp(rn, Assembler::t0);
-    ApplyTbi(Assembler::t0);
-    Assembler::Label* recovery = as_.MakeLabel();
-    Assembler::Label* done = as_.MakeLabel();
-    as_.SetRecoveryPoint(recovery);
-    as_.LdD(Assembler::t1, Assembler::t0, 0);
-    as_.SetRecoveryPoint(recovery);
-    as_.LdD(Assembler::t2, Assembler::t0, 8);
-    as_.SetRecoveryPoint(recovery);
-    as_.LdD(Assembler::t3, Assembler::t0, 16);
-    as_.SetRecoveryPoint(recovery);
-    as_.LdD(Assembler::t4, Assembler::t0, 24);
-    as_.StD(Assembler::t1, Assembler::s8, VOffset(rt));
-    as_.StD(Assembler::t2, Assembler::s8, VOffset(rt) + 8);
-    as_.StD(Assembler::t3, Assembler::s8, VOffset(rt2));
-    as_.StD(Assembler::t4, Assembler::s8, VOffset(rt2) + 8);
-    as_.B(*done);
-    as_.Bind(recovery);
-    ExitGeneratedCode(pc);
-    as_.Bind(done);
-    if (post_index) {
-      LoadXOrSp(rn, Assembler::t0);
-      as_.AddiD(Assembler::t0, Assembler::t0, 32);
-      StoreXOrSp(rn, Assembler::t0);
-    }
-    return true;
-  }
-
-  bool TranslateSt1Two4SPostIndex(uint32_t insn, GuestAddr pc) {
+  bool TranslateLdSt1Multiple4S(uint32_t insn, GuestAddr pc) {
+    const bool load = ((insn >> 22) & 1) != 0;
+    const bool post_index = ((insn >> 23) & 1) != 0;
+    const uint32_t rm = (insn >> 16) & 31;
+    const uint32_t opcode = (insn >> 12) & 15;
     const uint32_t rn = (insn >> 5) & 31;
     const uint32_t rt = insn & 31;
-    const uint32_t rt2 = (rt + 1) & 31;
+    uint32_t register_count;
+    switch (opcode) {
+      case 7:
+        register_count = 1;
+        break;
+      case 10:
+        register_count = 2;
+        break;
+      case 6:
+        register_count = 3;
+        break;
+      case 2:
+        register_count = 4;
+        break;
+      default:
+        // Interleaved LD2/LD3/LD4 encodings share this instruction class but
+        // require lane deinterleaving and are intentionally handled later.
+        return false;
+    }
+
+    constexpr std::array<Register, 8> kValues = {
+        Assembler::t1, Assembler::t2, Assembler::t3, Assembler::t4,
+        Assembler::t5, Assembler::t6, Assembler::t7, Assembler::t8};
+    const uint32_t value_count = register_count * 2;
     LoadXOrSp(rn, Assembler::t0);
     ApplyTbi(Assembler::t0);
-    as_.LdD(Assembler::t1, Assembler::s8, VOffset(rt));
-    as_.LdD(Assembler::t2, Assembler::s8, VOffset(rt) + 8);
-    as_.LdD(Assembler::t3, Assembler::s8, VOffset(rt2));
-    as_.LdD(Assembler::t4, Assembler::s8, VOffset(rt2) + 8);
     Assembler::Label* recovery = as_.MakeLabel();
     Assembler::Label* done = as_.MakeLabel();
-    as_.SetRecoveryPoint(recovery);
-    as_.StD(Assembler::t1, Assembler::t0, 0);
-    as_.SetRecoveryPoint(recovery);
-    as_.StD(Assembler::t2, Assembler::t0, 8);
-    as_.SetRecoveryPoint(recovery);
-    as_.StD(Assembler::t3, Assembler::t0, 16);
-    as_.SetRecoveryPoint(recovery);
-    as_.StD(Assembler::t4, Assembler::t0, 24);
+
+    if (load) {
+      // Delay every architectural V-register write until all potentially
+      // faulting loads succeed.  Recovery can therefore re-enter the
+      // interpreter at the original instruction without partial register
+      // updates.
+      for (uint32_t value = 0; value < value_count; ++value) {
+        as_.SetRecoveryPoint(recovery);
+        as_.LdD(kValues[value], Assembler::t0, value * 8);
+      }
+      for (uint32_t reg = 0; reg < register_count; ++reg) {
+        const uint32_t destination = (rt + reg) & 31;
+        as_.StD(kValues[reg * 2], Assembler::s8, VOffset(destination));
+        as_.StD(kValues[reg * 2 + 1], Assembler::s8, VOffset(destination) + 8);
+      }
+    } else {
+      // Snapshot all vector sources before touching guest memory.  This also
+      // handles lists that wrap from V31 to V0.
+      for (uint32_t reg = 0; reg < register_count; ++reg) {
+        const uint32_t source = (rt + reg) & 31;
+        as_.LdD(kValues[reg * 2], Assembler::s8, VOffset(source));
+        as_.LdD(kValues[reg * 2 + 1], Assembler::s8, VOffset(source) + 8);
+      }
+      for (uint32_t value = 0; value < value_count; ++value) {
+        as_.SetRecoveryPoint(recovery);
+        as_.StD(kValues[value], Assembler::t0, value * 8);
+      }
+    }
     as_.B(*done);
     as_.Bind(recovery);
     ExitGeneratedCode(pc);
     as_.Bind(done);
-    LoadXOrSp(rn, Assembler::t0);
-    as_.AddiD(Assembler::t0, Assembler::t0, 32);
-    StoreXOrSp(rn, Assembler::t0);
+
+    if (post_index) {
+      LoadXOrSp(rn, Assembler::t0);
+      if (rm == 31) {
+        as_.AddiD(Assembler::t0, Assembler::t0, register_count * 16);
+      } else {
+        LoadXOrZero(rm, Assembler::t1);
+        as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
+      }
+      StoreXOrSp(rn, Assembler::t0);
+    }
     return true;
   }
 
@@ -2124,7 +2139,8 @@ class LiteTranslator {
     Assembler::Label* done = as_.MakeLabel();
     as_.SetRecoveryPoint(recovery);
     as_.LdD(Assembler::t1, Assembler::t0, 0);
-    as_.StD(Assembler::t1, Assembler::s8, VOffset(rt) + 8);
+    const int32_t lane_offset = ((insn >> 30) & 1) * 8;
+    as_.StD(Assembler::t1, Assembler::s8, VOffset(rt) + lane_offset);
     as_.B(*done);
     as_.Bind(recovery);
     ExitGeneratedCode(pc);
@@ -2545,7 +2561,7 @@ class LiteTranslator {
       source_lanes[2] = 3;
       source_regs[3] = rm;
       source_lanes[3] = 3;
-    } else {  // TRN1: n[0], m[0], n[2], m[2]
+    } else if (operation == 2) {  // TRN1: n[0], m[0], n[2], m[2]
       source_regs[0] = rn;
       source_lanes[0] = 0;
       source_regs[1] = rm;
@@ -2554,6 +2570,15 @@ class LiteTranslator {
       source_lanes[2] = 2;
       source_regs[3] = rm;
       source_lanes[3] = 2;
+    } else {  // UZP2: n[1], n[3], m[1], m[3]
+      source_regs[0] = rn;
+      source_lanes[0] = 1;
+      source_regs[1] = rn;
+      source_lanes[1] = 3;
+      source_regs[2] = rm;
+      source_lanes[2] = 1;
+      source_regs[3] = rm;
+      source_lanes[3] = 3;
     }
     for (size_t lane = 0; lane < 4; ++lane) {
       as_.LdWU(outputs[lane],
