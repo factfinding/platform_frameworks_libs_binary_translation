@@ -35,38 +35,44 @@ namespace {
 // word   name            description
 // 0      sigflag/cookie  setjmp cookie in top 63 bits, signal mask flag in low bit
 // 1      sigmask         64-bit signal mask
-// 2      x19
-// 3      x20
-// 4      x21
-// 5      x22
-// 6      x23
-// 7      x24
-// 8      x25
-// 9      x26
-// 10     x27
-// 11     x28
-// 12     x29 (FP)
-// 13     x30 (LR)
-// 14     SP
-// 15     d8
-// 16     d9
-// 17     d10
-// 18     d11
-// 19     d12
-// 20     d13
-// 21     d14
-// 22     d15
-// 23     checksum
+// 2      x30 (LR)
+// 3      SP
+// 4      x28
+// 5      x29 (FP)
+// 6      x26
+// 7      x27
+// 8      x24
+// 9      x25
+// 10     x22
+// 11     x23
+// 12     x20
+// 13     x21
+// 14     low bits of x18 (shadow-call-stack pointer)
+// 15     x19
+// 16     d14
+// 17     d15
+// 18     d12
+// 19     d13
+// 20     d10
+// 21     d11
+// 22     d8
+// 23     d9
+// 24     checksum
 // _JBLEN: defined in bionic/libc/include/setjmp.h (32 for arm64)
 
 const int kJmpBufSigFlagAndCookieWord = 0;
 const int kJmpBufSigMaskWord = 1;
-const int kJmpBufCoreBaseWord = 2;     // x19-x28 start here (10 regs)
-const int kJmpBufFPWord = 12;          // x29
-const int kJmpBufLRWord = 13;          // x30
-const int kJmpBufSPWord = 14;          // SP
-const int kJmpBufFloatingPointBaseWord = 15;  // d8-d15 (8 regs)
-const int kJmpBufChecksumWord = 23;
+const int kJmpBufLRWord = 2;
+const int kJmpBufSPWord = 3;
+const int kJmpBufX28Word = 4;
+const int kJmpBufX26Word = 6;
+const int kJmpBufX24Word = 8;
+const int kJmpBufX22Word = 10;
+const int kJmpBufX20Word = 12;
+const int kJmpBufSCSWord = 14;
+const int kJmpBufX19Word = 15;
+const int kJmpBufFloatingPointBaseWord = 16;
+const int kJmpBufChecksumWord = 24;
 // jmp_buf should be at least 32 words long.
 // Use the last word to store the address of the host jmp_buf.
 const int kJmpBufHostBufWord = 31;
@@ -74,6 +80,7 @@ const int kJmpBufHostBufWord = 31;
 // jmp_buf cookie can be anything but 0 (see bionic/tests/setjmp_test.cpp: setjmp_cookie)
 // ATTENTION: Keep low bit 0 for signal mask flag.
 const uint64_t kJmpBufCookie = 0x12'3210ULL;
+const uint64_t kShadowCallStackMask = 16 * 1024 - 1;
 
 uint64_t CalcJumpBufChecksum(const uint64_t* buf) {
   uint64_t res = 0;
@@ -99,22 +106,29 @@ void SaveRegsToJumpBuf(const ThreadState* state, void* guest_jmp_buf, int save_s
         SIG_SETMASK, nullptr, reinterpret_cast<HostSigset*>(buf + kJmpBufSigMaskWord));
   }
 
-  // x19-x28 (callee-saved general registers)
-  for (int i = 0; i < 10; ++i) {
-    buf[kJmpBufCoreBaseWord + i] = state->cpu.x[19 + i];
-  }
+  // Match Android 16 bionic's layout and pointer mangling.  Keeping this
+  // layout exact matters for code that inspects or copies jmp_buf itself.
+  const uint64_t cookie = buf[kJmpBufSigFlagAndCookieWord] & ~0x1ULL;
+  buf[kJmpBufLRWord] = state->cpu.x[30] ^ cookie;
+  buf[kJmpBufSPWord] = state->cpu.sp ^ cookie;
+  buf[kJmpBufX28Word] = state->cpu.x[28] ^ cookie;
+  buf[kJmpBufX28Word + 1] = state->cpu.x[29] ^ cookie;
+  buf[kJmpBufX26Word] = state->cpu.x[26] ^ cookie;
+  buf[kJmpBufX26Word + 1] = state->cpu.x[27] ^ cookie;
+  buf[kJmpBufX24Word] = state->cpu.x[24] ^ cookie;
+  buf[kJmpBufX24Word + 1] = state->cpu.x[25] ^ cookie;
+  buf[kJmpBufX22Word] = state->cpu.x[22] ^ cookie;
+  buf[kJmpBufX22Word + 1] = state->cpu.x[23] ^ cookie;
+  buf[kJmpBufX20Word] = state->cpu.x[20] ^ cookie;
+  buf[kJmpBufX20Word + 1] = state->cpu.x[21] ^ cookie;
+  buf[kJmpBufSCSWord] = (state->cpu.x[18] & kShadowCallStackMask) ^ cookie;
+  buf[kJmpBufX19Word] = state->cpu.x[19] ^ cookie;
 
-  // x29 (FP), x30 (LR)
-  buf[kJmpBufFPWord] = state->cpu.x[29];
-  buf[kJmpBufLRWord] = state->cpu.x[30];
-
-  // SP
-  buf[kJmpBufSPWord] = state->cpu.sp;
-
-  // d8-d15 (callee-saved FP registers, lower 64 bits of v8-v15)
+  // d14, d15, d12, d13, d10, d11, d8, d9.
+  constexpr int kFloatingPointRegisterOrder[] = {14, 15, 12, 13, 10, 11, 8, 9};
   for (int i = 0; i < 8; ++i) {
     uint64_t low64;
-    memcpy(&low64, &state->cpu.v[8 + i], sizeof(low64));
+    memcpy(&low64, &state->cpu.v[kFloatingPointRegisterOrder[i]], sizeof(low64));
     buf[kJmpBufFloatingPointBaseWord + i] = low64;
   }
 
@@ -141,22 +155,29 @@ void RestoreRegsFromJumpBuf(ThreadState* state, void* guest_jmp_buf, int retval)
         SIG_SETMASK, reinterpret_cast<const HostSigset*>(buf + kJmpBufSigMaskWord), nullptr);
   }
 
-  // x19-x28
-  for (int i = 0; i < 10; ++i) {
-    state->cpu.x[19 + i] = buf[kJmpBufCoreBaseWord + i];
-  }
+  const uint64_t cookie = buf[kJmpBufSigFlagAndCookieWord] & ~0x1ULL;
+  state->cpu.x[30] = buf[kJmpBufLRWord] ^ cookie;
+  state->cpu.sp = buf[kJmpBufSPWord] ^ cookie;
+  state->cpu.x[28] = buf[kJmpBufX28Word] ^ cookie;
+  state->cpu.x[29] = buf[kJmpBufX28Word + 1] ^ cookie;
+  state->cpu.x[26] = buf[kJmpBufX26Word] ^ cookie;
+  state->cpu.x[27] = buf[kJmpBufX26Word + 1] ^ cookie;
+  state->cpu.x[24] = buf[kJmpBufX24Word] ^ cookie;
+  state->cpu.x[25] = buf[kJmpBufX24Word + 1] ^ cookie;
+  state->cpu.x[22] = buf[kJmpBufX22Word] ^ cookie;
+  state->cpu.x[23] = buf[kJmpBufX22Word + 1] ^ cookie;
+  state->cpu.x[20] = buf[kJmpBufX20Word] ^ cookie;
+  state->cpu.x[21] = buf[kJmpBufX20Word + 1] ^ cookie;
+  state->cpu.x[18] =
+      (state->cpu.x[18] & ~kShadowCallStackMask) |
+      ((buf[kJmpBufSCSWord] ^ cookie) & kShadowCallStackMask);
+  state->cpu.x[19] = buf[kJmpBufX19Word] ^ cookie;
 
-  // x29 (FP), x30 (LR)
-  state->cpu.x[29] = buf[kJmpBufFPWord];
-  state->cpu.x[30] = buf[kJmpBufLRWord];
-
-  // SP
-  state->cpu.sp = buf[kJmpBufSPWord];
-
-  // d8-d15 (restore lower 64 bits, zero upper)
+  // Restore d14, d15, d12, d13, d10, d11, d8, d9 (lower 64 bits, zero upper).
+  constexpr int kFloatingPointRegisterOrder[] = {14, 15, 12, 13, 10, 11, 8, 9};
   for (int i = 0; i < 8; ++i) {
     __uint128_t val = buf[kJmpBufFloatingPointBaseWord + i];
-    state->cpu.v[8 + i] = val;
+    state->cpu.v[kFloatingPointRegisterOrder[i]] = val;
   }
 
   // Function return: set x0 = retval, pc = lr
