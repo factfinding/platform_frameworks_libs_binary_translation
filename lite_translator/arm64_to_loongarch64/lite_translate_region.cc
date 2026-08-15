@@ -313,6 +313,21 @@ class LiteTranslator {
     if ((insn & 0xffff'fc00u) == 0x4ea0'f800u) {
       return TranslateFabs4S(insn);
     }
+    if ((insn & 0xbfff'fc00u) == 0x0e20'5800u) {
+      return TranslateCnt8B16B(insn);
+    }
+    // 32-bit lane permutations.  These are common in Unity math and texture
+    // conversion code.  The scalar implementation preserves all source lanes
+    // before writing Vd, so register aliases have the architectural behavior.
+    if ((insn & 0xffe0'fc00u) == 0x4e80'1800u) {
+      return TranslatePermute4S(insn, 0);  // UZP1
+    }
+    if ((insn & 0xffe0'fc00u) == 0x4e80'7800u) {
+      return TranslatePermute4S(insn, 1);  // ZIP2
+    }
+    if ((insn & 0xffe0'fc00u) == 0x4e80'2800u) {
+      return TranslatePermute4S(insn, 2);  // TRN1
+    }
     // MOVI Vd.2D, #0.  Compilers use this reserved modified-immediate form
     // as the canonical full-width vector clear.
     if ((insn & 0xffff'ffe0u) == 0x6f00'e400u) {
@@ -336,6 +351,15 @@ class LiteTranslator {
     }
     if ((insn & 0xff20'8000u) == 0x1f00'0000u) {
       return TranslateScalarFmadd(insn);
+    }
+    if ((insn & 0xff20'0c00u) == 0x1e20'0c00u) {
+      return TranslateScalarFcsel(insn);
+    }
+    if ((insn & 0xffff'fc00u) == 0x1e22'c000u) {
+      return TranslateFcvtDS(insn);
+    }
+    if ((insn & 0xffff'fc00u) == 0x1e39'0000u) {
+      return TranslateFcvtzuWS(insn);
     }
     if ((insn & 0xffe0'fc07u) == 0x1e20'2000u) {
       return TranslateFcmpS(insn);
@@ -2480,6 +2504,68 @@ class LiteTranslator {
     return true;
   }
 
+  bool TranslateCnt8B16B(uint32_t insn) {
+    const bool is_128_bit = (insn & 0x4000'0000u) != 0;
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    LoadV(rn, Assembler::vr1);
+    as_.VpcntB(Assembler::vr0, Assembler::vr1);
+    if (is_128_bit) {
+      StoreV(rd, Assembler::vr0);
+    } else {
+      as_.Vst(Assembler::vr0, Assembler::s8, VOffset(rd));
+      as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
+    }
+    return true;
+  }
+
+  bool TranslatePermute4S(uint32_t insn, uint32_t operation) {
+    const uint32_t rm = (insn >> 16) & 31;
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    const Register outputs[4] = {Assembler::t0, Assembler::t1, Assembler::t2, Assembler::t3};
+    uint32_t source_regs[4];
+    uint32_t source_lanes[4];
+
+    if (operation == 0) {  // UZP1: n[0], n[2], m[0], m[2]
+      source_regs[0] = rn;
+      source_lanes[0] = 0;
+      source_regs[1] = rn;
+      source_lanes[1] = 2;
+      source_regs[2] = rm;
+      source_lanes[2] = 0;
+      source_regs[3] = rm;
+      source_lanes[3] = 2;
+    } else if (operation == 1) {  // ZIP2: n[2], m[2], n[3], m[3]
+      source_regs[0] = rn;
+      source_lanes[0] = 2;
+      source_regs[1] = rm;
+      source_lanes[1] = 2;
+      source_regs[2] = rn;
+      source_lanes[2] = 3;
+      source_regs[3] = rm;
+      source_lanes[3] = 3;
+    } else {  // TRN1: n[0], m[0], n[2], m[2]
+      source_regs[0] = rn;
+      source_lanes[0] = 0;
+      source_regs[1] = rm;
+      source_lanes[1] = 0;
+      source_regs[2] = rn;
+      source_lanes[2] = 2;
+      source_regs[3] = rm;
+      source_lanes[3] = 2;
+    }
+    for (size_t lane = 0; lane < 4; ++lane) {
+      as_.LdWU(outputs[lane],
+               Assembler::s8,
+               VOffset(source_regs[lane]) + static_cast<int32_t>(source_lanes[lane] * 4));
+    }
+    for (size_t lane = 0; lane < 4; ++lane) {
+      as_.StW(outputs[lane], Assembler::s8, VOffset(rd) + static_cast<int32_t>(lane * 4));
+    }
+    return true;
+  }
+
   bool TranslateMovi16BOne(uint32_t insn) {
     uint32_t rd = insn & 31;
     as_.Li(Assembler::t0, 0x0101'0101'0101'0101ULL);
@@ -2581,6 +2667,84 @@ class LiteTranslator {
       as_.Vst(Assembler::vr0, Assembler::s8, VOffset(rd));
     }
     as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
+    return true;
+  }
+
+  bool TranslateScalarFcsel(uint32_t insn) {
+    const uint32_t ftype = (insn >> 22) & 3;
+    const uint32_t rm = (insn >> 16) & 31;
+    const uint32_t condition = (insn >> 12) & 15;
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    if (ftype > 1) {
+      return false;
+    }
+
+    EmitCondition(condition);
+    Assembler::Label* use_false = as_.MakeLabel();
+    Assembler::Label* done = as_.MakeLabel();
+    as_.Beqz(Assembler::t2, *use_false);
+    if (ftype == 0) {
+      as_.LdWU(Assembler::t0, Assembler::s8, VOffset(rn));
+    } else {
+      as_.LdD(Assembler::t0, Assembler::s8, VOffset(rn));
+    }
+    as_.B(*done);
+    as_.Bind(use_false);
+    if (ftype == 0) {
+      as_.LdWU(Assembler::t0, Assembler::s8, VOffset(rm));
+    } else {
+      as_.LdD(Assembler::t0, Assembler::s8, VOffset(rm));
+    }
+    as_.Bind(done);
+    as_.StD(Assembler::t0, Assembler::s8, VOffset(rd));
+    as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
+    return true;
+  }
+
+  bool TranslateFcvtDS(uint32_t insn) {
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    LoadV(rn, Assembler::vr1);
+    as_.FcvtDS(Assembler::vr0, Assembler::vr1);
+    as_.Vst(Assembler::vr0, Assembler::s8, VOffset(rd));
+    as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
+    return true;
+  }
+
+  bool TranslateFcvtzuWS(uint32_t insn) {
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    Assembler::Label* fast_path = as_.MakeLabel();
+    Assembler::Label* nan_or_negative = as_.MakeLabel();
+    Assembler::Label* done = as_.MakeLabel();
+
+    // ARM FCVTZU returns zero for negative inputs and NaNs, saturates positive
+    // overflow to UINT32_MAX, and truncates ordinary positive values.  LA64
+    // has no scalar unsigned single-to-integer conversion, but every finite
+    // input below 2^32 fits in FTINTRZ.L.S and can then be narrowed exactly.
+    as_.LdWU(Assembler::t0, Assembler::s8, VOffset(rn));
+    as_.SrliD(Assembler::t1, Assembler::t0, 31);
+    as_.Bnez(Assembler::t1, *nan_or_negative);
+    as_.Li(Assembler::t1, 0x4f80'0000u);  // 2^32
+    as_.Bltu(Assembler::t0, Assembler::t1, *fast_path);
+    as_.Li(Assembler::t1, 0x7f80'0000u);  // +infinity
+    as_.Bltu(Assembler::t1, Assembler::t0, *nan_or_negative);
+    as_.Li(Assembler::t0, UINT32_MAX);
+    as_.B(*done);
+
+    as_.Bind(nan_or_negative);
+    as_.Move(Assembler::t0, Assembler::zero);
+    as_.B(*done);
+
+    as_.Bind(fast_path);
+    as_.Movgr2frW(Assembler::vr0, Assembler::t0);
+    as_.FtintrzLS(Assembler::vr0, Assembler::vr0);
+    as_.Movfr2grD(Assembler::t0, Assembler::vr0);
+    ZeroExtend32(Assembler::t0);
+
+    as_.Bind(done);
+    StoreXOrDiscard(rd, Assembler::t0);
     return true;
   }
 

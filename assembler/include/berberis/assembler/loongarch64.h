@@ -286,11 +286,20 @@ class Assembler : public AssemblerBase {
   void FmaddD(SimdRegister fd, SimdRegister fj, SimdRegister fk, SimdRegister fa) {
     Emit32(0x0820'0000 | EncodeVa(fa) | EncodeVk(fk) | EncodeVj(fj) | EncodeVd(fd));
   }
+  void FcvtDS(SimdRegister fd, SimdRegister fj) {
+    Emit32(0x0119'2400 | EncodeVj(fj) | EncodeVd(fd));
+  }
+  void FtintrzLS(SimdRegister fd, SimdRegister fj) {
+    Emit32(0x011a'a400 | EncodeVj(fj) | EncodeVd(fd));
+  }
   void FtintrzWS(SimdRegister fd, SimdRegister fj) {
     Emit32(0x011a'8400 | EncodeVj(fj) | EncodeVd(fd));
   }
   void Movfr2grS(Register rd, SimdRegister fj) {
     Emit32(0x0114'b400 | EncodeVj(fj) | EncodeRd(rd));
+  }
+  void Movfr2grD(Register rd, SimdRegister fj) {
+    Emit32(0x0114'b800 | EncodeVj(fj) | EncodeRd(rd));
   }
   void Movgr2frW(SimdRegister fd, Register rj) {
     Emit32(0x0114'a400 | EncodeRj(rj) | EncodeVd(fd));
@@ -347,6 +356,9 @@ class Assembler : public AssemblerBase {
   void VreplveiW(SimdRegister vd, SimdRegister vj, uint32_t index) {
     CHECK_LT(index, 4u);
     Emit32(0x72f7'e000 | (index << 10) | EncodeVj(vj) | EncodeVd(vd));
+  }
+  void VpcntB(SimdRegister vd, SimdRegister vj) {
+    Emit32(0x729c'2000 | EncodeVj(vj) | EncodeVd(vd));
   }
   void Vshuf4iB(SimdRegister vd, SimdRegister vj, uint32_t immediate) {
     CHECK_LT(immediate, 256u);
