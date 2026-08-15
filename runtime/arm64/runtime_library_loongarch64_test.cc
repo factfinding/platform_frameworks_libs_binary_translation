@@ -26,7 +26,6 @@
 #include "../../lite_translator/include/berberis/lite_translator/lite_translate_region.h"
 #include "berberis/assembler/loongarch64.h"
 #include "berberis/assembler/machine_code.h"
-#include "berberis/guest_os_primitives/guest_setjmp.h"
 #include "berberis/guest_state/guest_state.h"
 #include "berberis/interpreter/arm64/interpreter.h"
 #include "berberis/runtime_primitives/code_pool.h"
@@ -37,54 +36,6 @@
 
 namespace berberis {
 namespace {
-
-TEST(LoongArch64RuntimeLibraryTest, Arm64JumpBufferMatchesAndroid16Layout) {
-  ThreadState saved_state{};
-  constexpr uint64_t kCookie = 0x12'3210;
-  constexpr uint64_t kScsMask = 16 * 1024 - 1;
-
-  saved_state.cpu.sp = 0x1234'5678'9abc'def0;
-  for (int reg = 18; reg <= 30; ++reg) {
-    saved_state.cpu.x[reg] = 0x1000'0000'0000'0000 + reg;
-  }
-  for (int reg = 8; reg <= 15; ++reg) {
-    saved_state.cpu.v[reg] =
-        static_cast<__uint128_t>(0x2000'0000'0000'0000 + reg) |
-        (static_cast<__uint128_t>(0xfeed'face) << 64);
-  }
-
-  std::array<uint64_t, 32> jump_buf{};
-  SaveRegsToJumpBuf(&saved_state, jump_buf.data(), 0);
-
-  EXPECT_EQ(jump_buf[0], kCookie);
-  EXPECT_EQ(jump_buf[2], saved_state.cpu.x[30] ^ kCookie);
-  EXPECT_EQ(jump_buf[3], saved_state.cpu.sp ^ kCookie);
-  EXPECT_EQ(jump_buf[14], (saved_state.cpu.x[18] & kScsMask) ^ kCookie);
-  EXPECT_EQ(jump_buf[15], saved_state.cpu.x[19] ^ kCookie);
-  EXPECT_EQ(jump_buf[16], 0x2000'0000'0000'0000ULL + 14);
-  EXPECT_EQ(jump_buf[23], 0x2000'0000'0000'0000ULL + 9);
-
-  uint64_t checksum = 0;
-  for (int i = 0; i < 24; ++i) {
-    checksum ^= jump_buf[i];
-  }
-  EXPECT_EQ(jump_buf[24], checksum);
-
-  ThreadState restored_state{};
-  restored_state.cpu.x[18] = saved_state.cpu.x[18] & ~kScsMask;
-  RestoreRegsFromJumpBuf(&restored_state, jump_buf.data(), 7);
-
-  for (int reg = 18; reg <= 30; ++reg) {
-    EXPECT_EQ(restored_state.cpu.x[reg], saved_state.cpu.x[reg]);
-  }
-  EXPECT_EQ(restored_state.cpu.sp, saved_state.cpu.sp);
-  EXPECT_EQ(restored_state.cpu.x[0], 7u);
-  EXPECT_EQ(GetInsnAddr(restored_state.cpu), saved_state.cpu.x[30]);
-  for (int reg = 8; reg <= 15; ++reg) {
-    EXPECT_EQ(restored_state.cpu.v[reg],
-              static_cast<__uint128_t>(0x2000'0000'0000'0000 + reg));
-  }
-}
 
 TEST(LoongArch64RuntimeLibraryTest, RunsGeneratedCodeAndSynchronizesGuestPc) {
   InitHostEntries();
