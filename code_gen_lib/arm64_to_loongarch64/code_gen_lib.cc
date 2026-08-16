@@ -19,10 +19,8 @@
 
 #include <ffi.h>
 
-#include <sys/mman.h>
-#include <unistd.h>
-
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -50,28 +48,33 @@ extern "C" __attribute__((visibility("hidden"))) void __clear_cache(void*, void*
   __asm__ volatile("ibar 0" ::: "memory");
 }
 
-ffi_closure* AllocateExecutableClosure(void** code) {
-  const size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
-  int fd = memfd_create("berberis-ffi-closure", MFD_CLOEXEC);
-  if (fd == -1 || ftruncate(fd, page_size) == -1) {
-    if (fd != -1) close(fd);
-    return nullptr;
-  }
+// Each entry is four LoongArch64 instructions.  The table lives in the text
+// segment of libberberis_arm64.so, whose CFI shadow is kUncheckedShadow, so a
+// CFI-instrumented host library can safely call a wrapper without teaching the
+// dynamic linker about anonymous executable mappings.
+constexpr size_t kStaticClosureTrampolineSize = 16;
+constexpr size_t kStaticClosureTrampolineCount = 16384;
 
-  void* writable = mmap(nullptr, page_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-  if (writable == MAP_FAILED) {
-    close(fd);
-    return nullptr;
-  }
-  void* executable = mmap(nullptr, page_size, PROT_READ | PROT_EXEC, MAP_SHARED, fd, 0);
-  close(fd);
-  if (executable == MAP_FAILED) {
-    munmap(writable, page_size);
-    return nullptr;
-  }
+extern "C" {
+__attribute__((visibility("hidden"))) extern const uint8_t __berberis_ffi_trampoline_table[];
 
-  *code = executable;
-  return static_cast<ffi_closure*>(writable);
+// Written once before the corresponding trampoline address is published.
+// The assembly dispatcher performs the matching acquire barrier after loading
+// an entry.
+__attribute__((visibility("hidden")))
+ffi_closure* __berberis_ffi_closure_slots[kStaticClosureTrampolineCount] = {};
+}
+
+std::atomic<size_t> g_next_static_closure_slot{0};
+
+size_t AllocateStaticClosureSlot(void** code) {
+  const size_t slot = g_next_static_closure_slot.fetch_add(1, std::memory_order_relaxed);
+  LOG_ALWAYS_FATAL_IF(slot >= kStaticClosureTrampolineCount,
+                      "Berberis static closure trampoline pool exhausted (%zu entries)",
+                      kStaticClosureTrampolineCount);
+  *code =
+      const_cast<uint8_t*>(__berberis_ffi_trampoline_table) + slot * kStaticClosureTrampolineSize;
+  return slot;
 }
 
 struct ClosureData {
@@ -80,7 +83,7 @@ struct ClosureData {
   std::string signature;
   GuestAddr pc;
   GuestRunnerFunc runner;
-  ffi_closure* closure;
+  ffi_closure closure;
   void* code;
 };
 
@@ -274,11 +277,15 @@ HostCode CreateGuestFunctionWrapper(GuestAddr pc,
                                    ToFfiType(data->signature[0]),
                                    data->arg_types.data());
   CHECK_EQ(status, FFI_OK);
-  data->closure = AllocateExecutableClosure(&data->code);
-  CHECK(data->closure);
+  const size_t slot = AllocateStaticClosureSlot(&data->code);
   status =
-      ffi_prep_closure_loc(data->closure, &data->cif, InvokeGuestClosure, data.get(), data->code);
+      ffi_prep_closure_loc(&data->closure, &data->cif, InvokeGuestClosure, data.get(), data->code);
   CHECK_EQ(status, FFI_OK);
+
+  // The trampoline becomes callable only after its closure has been fully
+  // initialized.  Wrappers are process-lifetime objects, so slots are never
+  // cleared or reused.
+  __atomic_store_n(&__berberis_ffi_closure_slots[slot], &data->closure, __ATOMIC_RELEASE);
 
   HostCode result = data->code;
   data.release();  // Wrappers are process-lifetime objects, like the existing code-pool entries.

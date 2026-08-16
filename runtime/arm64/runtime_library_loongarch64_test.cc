@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -26,6 +28,8 @@
 #include "../../lite_translator/include/berberis/lite_translator/lite_translate_region.h"
 #include "berberis/assembler/loongarch64.h"
 #include "berberis/assembler/machine_code.h"
+#include "berberis/code_gen_lib/gen_wrapper.h"
+#include "berberis/guest_abi/guest_arguments_arch.h"
 #include "berberis/guest_state/guest_state.h"
 #include "berberis/interpreter/arm64/interpreter.h"
 #include "berberis/runtime_primitives/code_pool.h"
@@ -36,6 +40,91 @@
 
 namespace berberis {
 namespace {
+
+void RunIntegerClosure(GuestAddr pc, GuestArgumentBuffer* buffer) {
+  buffer->argv[0] = buffer->argv[0] + buffer->argv[1] + buffer->argv[2] + pc;
+}
+
+void RunFloatingClosure(GuestAddr pc, GuestArgumentBuffer* buffer) {
+  float first;
+  float second;
+  double third;
+  memcpy(&first, &buffer->simd_argv[0], sizeof(first));
+  memcpy(&second, &buffer->simd_argv[1], sizeof(second));
+  memcpy(&third, &buffer->simd_argv[2], sizeof(third));
+  const double result = first + second + third + static_cast<double>(pc);
+  memcpy(&buffer->simd_argv[0], &result, sizeof(result));
+}
+
+void RunStackClosure(GuestAddr pc, GuestArgumentBuffer* buffer) {
+  uint64_t result = pc;
+  for (size_t i = 0; i < 8; ++i) {
+    result += buffer->argv[i];
+  }
+  result += buffer->stack_argv[0];
+  result += buffer->stack_argv[1];
+  buffer->argv[0] = result;
+}
+
+void RunConcurrentClosure(GuestAddr pc, GuestArgumentBuffer* buffer) {
+  buffer->argv[0] += pc;
+}
+
+TEST(LoongArch64RuntimeLibraryTest, StaticClosureTrampolinePreservesArguments) {
+  using IntegerCallback = int64_t (*)(int32_t, int32_t, int64_t);
+  IntegerCallback integer_callback = AsFuncPtr<IntegerCallback>(CreateGuestFunctionWrapper(
+      7, "liil", AsHostCode(&RunIntegerClosure), "integer_closure_test"));
+  EXPECT_EQ(integer_callback(11, -3, 100), 115);
+
+  using FloatingCallback = double (*)(float, float, double);
+  FloatingCallback floating_callback = AsFuncPtr<FloatingCallback>(CreateGuestFunctionWrapper(
+      5, "dffd", AsHostCode(&RunFloatingClosure), "floating_closure_test"));
+  EXPECT_DOUBLE_EQ(floating_callback(1.25f, 2.5f, 3.75), 12.5);
+
+  using StackCallback = uint64_t (*)(uint64_t,
+                                     uint64_t,
+                                     uint64_t,
+                                     uint64_t,
+                                     uint64_t,
+                                     uint64_t,
+                                     uint64_t,
+                                     uint64_t,
+                                     uint64_t,
+                                     uint64_t);
+  StackCallback stack_callback = AsFuncPtr<StackCallback>(CreateGuestFunctionWrapper(
+      10, "lllllllllll", AsHostCode(&RunStackClosure), "stack_closure_test"));
+  EXPECT_EQ(stack_callback(1, 2, 3, 4, 5, 6, 7, 8, 9, 10), 65u);
+}
+
+TEST(LoongArch64RuntimeLibraryTest, StaticClosureTrampolineAllocationIsConcurrent) {
+  constexpr size_t kThreadCount = 64;
+  std::array<uintptr_t, kThreadCount> wrappers{};
+  std::array<int64_t, kThreadCount> results{};
+  std::vector<std::thread> threads;
+  threads.reserve(kThreadCount);
+  for (size_t i = 0; i < kThreadCount; ++i) {
+    threads.emplace_back([i, &wrappers, &results]() {
+      using Callback = int64_t (*)(int64_t);
+      HostCode wrapper = CreateGuestFunctionWrapper(
+          i + 1, "ll", AsHostCode(&RunConcurrentClosure), "concurrent_closure_test");
+      wrappers[i] = reinterpret_cast<uintptr_t>(wrapper);
+      Callback callback = AsFuncPtr<Callback>(wrapper);
+      results[i] = callback(1000);
+    });
+  }
+  for (std::thread& thread : threads) {
+    thread.join();
+  }
+
+  for (size_t i = 0; i < kThreadCount; ++i) {
+    EXPECT_EQ(results[i], static_cast<int64_t>(1001 + i));
+  }
+  std::sort(wrappers.begin(), wrappers.end());
+  EXPECT_EQ(std::adjacent_find(wrappers.begin(), wrappers.end()), wrappers.end());
+  for (size_t i = 1; i < wrappers.size(); ++i) {
+    EXPECT_EQ(wrappers[i] - wrappers[i - 1], 16u);
+  }
+}
 
 TEST(LoongArch64RuntimeLibraryTest, RunsGeneratedCodeAndSynchronizesGuestPc) {
   InitHostEntries();

@@ -69,7 +69,10 @@ filegroup {
 
 filegroup {
     name: "berberis_code_gen_lib_arm64_to_loongarch64_files",
-    srcs: ["arm64_to_loongarch64/code_gen_lib.cc"],
+    srcs: [
+        "arm64_to_loongarch64/code_gen_lib.cc",
+        "arm64_to_loongarch64/ffi_trampoline.S",
+    ],
 }
 
 cc_defaults {
