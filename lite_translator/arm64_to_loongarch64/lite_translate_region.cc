@@ -327,7 +327,10 @@ class LiteTranslator {
     if ((insn & 0xffe0'fc00u) == 0x4ea0'1c00u) {
       return TranslateVectorLogical(insn, 1);
     }
-    if ((insn & 0xffe0'fc00u) == 0x6e20'1c00u) {
+    // EOR Vd.{8B,16B}, Vn.{8B,16B}, Vm.{8B,16B}.  Resource verification in
+    // UE4 uses the 8-byte form in a very hot loop.  Q=0 still clears the
+    // destination's upper 64 bits, as required for every 64-bit AdvSIMD write.
+    if ((insn & 0xbfe0'fc00u) == 0x2e20'1c00u) {
       return TranslateVectorLogical(insn, 2);
     }
     if ((insn & 0xffe0'fc00u) == 0x4ea0'8400u) {
@@ -338,6 +341,11 @@ class LiteTranslator {
     }
     if ((insn & 0xffe0'fc00u) == 0x6ea0'8400u) {
       return TranslateVectorAddSub4S(insn, true);  // SUB
+    }
+    // NEG Vd.{2S,4S}, Vn.{2S,4S}.  The 2S form is another dominant UE4
+    // resource-analysis fallback.  Lower it to a packed subtract from zero.
+    if ((insn & 0xbfff'fc00u) == 0x2ea0'b800u) {
+      return TranslateVectorNeg32(insn);
     }
     if ((insn & 0xffe0'fc00u) == 0x4ea0'9c00u) {
       return TranslateVectorMulAcc4S(insn, 0);  // MUL
@@ -2763,6 +2771,7 @@ class LiteTranslator {
   }
 
   bool TranslateVectorLogical(uint32_t insn, uint32_t operation) {
+    const bool is_128_bit = (insn & 0x4000'0000u) != 0;
     uint32_t rm = (insn >> 16) & 31;
     uint32_t rn = (insn >> 5) & 31;
     uint32_t rd = insn & 31;
@@ -2781,7 +2790,25 @@ class LiteTranslator {
       as_.Xor(Assembler::t1, Assembler::t1, Assembler::t3);
     }
     as_.StD(Assembler::t0, Assembler::s8, VOffset(rd));
-    as_.StD(Assembler::t1, Assembler::s8, VOffset(rd) + 8);
+    if (is_128_bit) {
+      as_.StD(Assembler::t1, Assembler::s8, VOffset(rd) + 8);
+    } else {
+      as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
+    }
+    return true;
+  }
+
+  bool TranslateVectorNeg32(uint32_t insn) {
+    const bool is_128_bit = (insn & 0x4000'0000u) != 0;
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    LoadV(rn, Assembler::vr1);
+    as_.VxorV(Assembler::vr2, Assembler::vr2, Assembler::vr2);
+    as_.VsubW(Assembler::vr0, Assembler::vr2, Assembler::vr1);
+    StoreV(rd, Assembler::vr0);
+    if (!is_128_bit) {
+      as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
+    }
     return true;
   }
 

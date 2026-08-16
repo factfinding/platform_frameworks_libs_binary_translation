@@ -1431,6 +1431,58 @@ TEST(LoongArch64RuntimeLibraryTest, LiteVectorRev64MatchesInterpreter) {
   }
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteVectorEorMatchesInterpreter) {
+  // Exercise both vector widths and destination aliasing with either source.
+  constexpr std::array<uint32_t, 4> kGuestCode = {
+      0x2e22'1c20,  // eor v0.8b, v1.8b, v2.8b
+      0x6e22'1c20,  // eor v0.16b, v1.16b, v2.16b
+      0x2e22'1c21,  // eor v1.8b, v1.8b, v2.8b
+      0x6e22'1c22,  // eor v2.16b, v1.16b, v2.16b
+  };
+  for (uint32_t insn : kGuestCode) {
+    const std::array<uint32_t, 1> one_insn = {insn};
+    ThreadState interpreted{};
+    ThreadState translated{};
+    interpreted.cpu.v[0] = MakeUint128(UINT64_MAX, UINT64_MAX);
+    interpreted.cpu.v[1] = MakeUint128(0x0123'4567'89ab'cdef, 0xfedc'ba98'7654'3210);
+    interpreted.cpu.v[2] = MakeUint128(0xf0f0'0f0f'55aa'aa55, 0x0ff0'f00f'a5a5'5a5a);
+    translated.cpu = interpreted.cpu;
+    SetInsnAddr(interpreted.cpu, ToGuestAddr(one_insn.data()));
+
+    InterpretInsn(&interpreted);
+    TranslateAndRun(one_insn, &translated);
+
+    const uint32_t rd = insn & 31;
+    SCOPED_TRACE(testing::Message() << "insn=" << std::hex << insn);
+    EXPECT_EQ(translated.cpu.v[rd], interpreted.cpu.v[rd]);
+  }
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteVectorNeg2S4SMatchesInterpreter) {
+  // Include the exact Mingchao hot form and an in-place destination.
+  constexpr std::array<uint32_t, 3> kGuestCode = {
+      0x2ea0'b820,  // neg v0.2s, v1.2s
+      0x6ea0'b820,  // neg v0.4s, v1.4s
+      0x2ea0'b821,  // neg v1.2s, v1.2s
+  };
+  for (uint32_t insn : kGuestCode) {
+    const std::array<uint32_t, 1> one_insn = {insn};
+    ThreadState interpreted{};
+    ThreadState translated{};
+    interpreted.cpu.v[0] = MakeUint128(UINT64_MAX, UINT64_MAX);
+    interpreted.cpu.v[1] = MakeUint32x4(0, 1, 0x8000'0000, 0xffff'ffff);
+    translated.cpu = interpreted.cpu;
+    SetInsnAddr(interpreted.cpu, ToGuestAddr(one_insn.data()));
+
+    InterpretInsn(&interpreted);
+    TranslateAndRun(one_insn, &translated);
+
+    const uint32_t rd = insn & 31;
+    SCOPED_TRACE(testing::Message() << "insn=" << std::hex << insn);
+    EXPECT_EQ(translated.cpu.v[rd], interpreted.cpu.v[rd]);
+  }
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteExtAllOffsetsMatchInterpreter) {
   for (bool is_128_bit : {false, true}) {
     const uint32_t limit = is_128_bit ? 16 : 8;
