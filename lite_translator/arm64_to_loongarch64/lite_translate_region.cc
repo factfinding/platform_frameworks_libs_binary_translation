@@ -42,7 +42,8 @@ constexpr int32_t kFlagsOffset = offsetof(ThreadState, cpu) + offsetof(CPUState,
 constexpr int32_t kTlsOffset = offsetof(ThreadState, tls);
 // Logical-immediate operations are enabled independently.  Validate each
 // opcode in production workloads before adding it to this mask.
-constexpr uint32_t kLogicalImmediateOpcMask = (1u << 0) | (1u << 1) | (1u << 3);  // AND, ORR, ANDS
+constexpr uint32_t kLogicalImmediateOpcMask =
+    (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3);  // AND, ORR, EOR, ANDS
 
 constexpr int64_t SignExtend(uint64_t value, uint32_t width) {
   uint64_t sign = uint64_t{1} << (width - 1);
@@ -266,8 +267,7 @@ class LiteTranslator {
     // these forms transfer consecutive vectors without interleaving, so all
     // list lengths share one lowering.  Accept both no-writeback and
     // immediate/register post-index encodings.
-    if ((insn & 0xffbf'0c00u) == 0x4c00'0800u ||
-        (insn & 0xffa0'0c00u) == 0x4c80'0800u) {
+    if ((insn & 0xffbf'0c00u) == 0x4c00'0800u || (insn & 0xffa0'0c00u) == 0x4c80'0800u) {
       if (!enable_guest_memory_) {
         return false;
       }
@@ -350,15 +350,13 @@ class LiteTranslator {
     }
     // SSHLL/SSHLL2 Vd.4S, Vn.4H/8H, #shift.  These widening shifts are hot in
     // HEVC inverse transforms.  immh=001x selects the 16-to-32-bit form.
-    if ((insn & 0xbf80'fc00u) == 0x0f00'a400u &&
-        (((insn >> 19) & 0xeu) == 0x2u)) {
+    if ((insn & 0xbf80'fc00u) == 0x0f00'a400u && (((insn >> 19) & 0xeu) == 0x2u)) {
       return TranslateSshll4S(insn);
     }
     // SQRSHRN/SQRSHRN2 Vd.4H/8H, Vn.4S, #shift.  LSX performs the same
     // rounding signed-saturating narrow; the Q form additionally preserves
     // Vd's low 64 bits and inserts the narrowed lanes into the high half.
-    if ((insn & 0xbf80'fc00u) == 0x0f00'9c00u &&
-        (((insn >> 19) & 0xeu) == 0x2u)) {
+    if ((insn & 0xbf80'fc00u) == 0x0f00'9c00u && (((insn >> 19) & 0xeu) == 0x2u)) {
       return TranslateSqrshrn4H(insn);
     }
     if ((insn & 0xffff'fc00u) == 0x4ea0'f800u) {
@@ -409,8 +407,7 @@ class LiteTranslator {
       return TranslateMoviConstant(insn, 0x0000'0001'0000'0001ULL, 0);
     }
     // Bit 23 distinguishes FMLA (0) from FMLS (1).
-    if ((insn & 0xffa0'fc00u) == 0x4e20'cc00u ||
-        (insn & 0xffa0'fc00u) == 0x4ea0'cc00u) {
+    if ((insn & 0xffa0'fc00u) == 0x4e20'cc00u || (insn & 0xffa0'fc00u) == 0x4ea0'cc00u) {
       return TranslateFmlaFmls4S(insn);
     }
     // Scalar FP arithmetic is pervasive in Unity startup code.  Use scalar
@@ -2149,10 +2146,10 @@ class LiteTranslator {
 
   bool TranslateAtomicMemory(uint32_t insn, GuestAddr pc, AtomicMemoryOp operation) {
     const uint32_t size = insn >> 30;
-    const bool acquire = operation == AtomicMemoryOp::kCas ? ((insn >> 22) & 1) != 0
-                                                           : ((insn >> 23) & 1) != 0;
-    const bool release = operation == AtomicMemoryOp::kCas ? ((insn >> 15) & 1) != 0
-                                                           : ((insn >> 22) & 1) != 0;
+    const bool acquire =
+        operation == AtomicMemoryOp::kCas ? ((insn >> 22) & 1) != 0 : ((insn >> 23) & 1) != 0;
+    const bool release =
+        operation == AtomicMemoryOp::kCas ? ((insn >> 15) & 1) != 0 : ((insn >> 22) & 1) != 0;
     const uint32_t rs = (insn >> 16) & 31;
     const uint32_t rn = (insn >> 5) & 31;
     const uint32_t rt = insn & 31;
@@ -2422,9 +2419,14 @@ class LiteTranslator {
         return false;
     }
 
-    constexpr std::array<Register, 8> kValues = {
-        Assembler::t1, Assembler::t2, Assembler::t3, Assembler::t4,
-        Assembler::t5, Assembler::t6, Assembler::t7, Assembler::t8};
+    constexpr std::array<Register, 8> kValues = {Assembler::t1,
+                                                 Assembler::t2,
+                                                 Assembler::t3,
+                                                 Assembler::t4,
+                                                 Assembler::t5,
+                                                 Assembler::t6,
+                                                 Assembler::t7,
+                                                 Assembler::t8};
     const uint32_t value_count = register_count * 2;
     LoadXOrSp(rn, Assembler::t0);
     ApplyTbi(Assembler::t0);
@@ -3267,8 +3269,8 @@ class LiteTranslator {
     const uint32_t imm8 = (insn >> 13) & 0xff;
     const uint32_t rd = insn & 31;
     const uint32_t b6 = (imm8 >> 6) & 1;
-    const uint32_t bits = ((imm8 & 0x80) << 24) | ((b6 ^ 1) << 30) |
-                          (b6 ? 0x3e00'0000u : 0) | ((imm8 & 0x3f) << 19);
+    const uint32_t bits =
+        ((imm8 & 0x80) << 24) | ((b6 ^ 1) << 30) | (b6 ? 0x3e00'0000u : 0) | ((imm8 & 0x3f) << 19);
     as_.Li(Assembler::t0, bits);
     as_.StW(Assembler::t0, Assembler::s8, VOffset(rd));
     as_.StW(Assembler::zero, Assembler::s8, VOffset(rd) + 4);

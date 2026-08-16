@@ -913,6 +913,90 @@ TEST(LoongArch64RuntimeLibraryTest, LiteLogicalImmediateOrrMatchesInterpreterFor
   }
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesLogicalImmediateEor) {
+  // eor w16, w9, #1; eor x11, x8, #1
+  constexpr std::array<uint32_t, 2> kGuestCode = {0x5200'0130, 0xd240'010b};
+
+  ThreadState state{};
+  state.cpu.x[8] = 0x1234'5678'9abc'def0u;
+  state.cpu.x[9] = 0xffff'ffff'1234'5679u;
+  TranslateAndRun(kGuestCode, &state);
+
+  EXPECT_EQ(state.cpu.x[16], 0x1234'5678u);
+  EXPECT_EQ(state.cpu.x[11], 0x1234'5678'9abc'def1u);
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteLogicalImmediateEorMatchesInterpreterExhaustively) {
+  constexpr uint64_t kInput = 0xa55a'f00f'963c'c369;
+  for (uint32_t is_64_bit = 0; is_64_bit < 2; ++is_64_bit) {
+    for (uint32_t n = 0; n < 2; ++n) {
+      for (uint32_t immr = 0; immr < 64; ++immr) {
+        for (uint32_t imms = 0; imms < 64; ++imms) {
+          const uint32_t len_source = (n << 6) | (~imms & 0x3f);
+          int32_t len = -1;
+          for (int32_t bit = 6; bit >= 0; --bit) {
+            if ((len_source & (uint32_t{1} << bit)) != 0) {
+              len = bit;
+              break;
+            }
+          }
+          if (len < 1 || (!is_64_bit && n != 0) || (uint32_t{1} << len) > (32u << is_64_bit)) {
+            continue;
+          }
+          const uint32_t levels = (uint32_t{1} << len) - 1;
+          if ((imms & levels) == levels) {
+            continue;
+          }
+
+          const uint32_t sf = is_64_bit << 31;
+          const std::array<uint32_t, 1> guest_code = {0x5200'0001u | sf | (n << 22) | (immr << 16) |
+                                                      (imms << 10)};
+          ThreadState interpreted{};
+          interpreted.cpu.x[0] = kInput;
+          SetInsnAddr(interpreted.cpu, ToGuestAddr(guest_code.data()));
+          InterpretInsn(&interpreted);
+
+          ThreadState translated{};
+          translated.cpu.x[0] = kInput;
+          TranslateAndRun(guest_code, &translated);
+
+          SCOPED_TRACE(testing::Message()
+                       << "sf=" << is_64_bit << " n=" << n << " immr=" << immr << " imms=" << imms);
+          EXPECT_EQ(translated.cpu.x[1], interpreted.cpu.x[1]);
+        }
+      }
+    }
+  }
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteLogicalImmediateEorMatchesInterpreterForAllRegisters) {
+  // Immediate fields from "eor w16, w9, #1", Mingchao's hottest EOR fallback.
+  constexpr uint32_t kInsnTemplate = 0x5200'0000u;
+  for (uint32_t rn = 0; rn < 32; ++rn) {
+    for (uint32_t rd = 0; rd < 32; ++rd) {
+      const std::array<uint32_t, 1> guest_code = {kInsnTemplate | (rn << 5) | rd};
+      ThreadState interpreted{};
+      ThreadState translated{};
+      for (uint32_t reg = 0; reg < 31; ++reg) {
+        const uint64_t value = 0xa55a'f00f'963c'c369u ^ (uint64_t{reg} * 0x0101'0101'0101'0101u);
+        interpreted.cpu.x[reg] = value;
+        translated.cpu.x[reg] = value;
+      }
+      interpreted.cpu.sp = 0x1234'5678'9abc'def0u;
+      translated.cpu.sp = interpreted.cpu.sp;
+      SetInsnAddr(interpreted.cpu, ToGuestAddr(guest_code.data()));
+      InterpretInsn(&interpreted);
+      TranslateAndRun(guest_code, &translated);
+
+      SCOPED_TRACE(testing::Message() << "rn=" << rn << " rd=" << rd);
+      for (uint32_t reg = 0; reg < 31; ++reg) {
+        EXPECT_EQ(translated.cpu.x[reg], interpreted.cpu.x[reg]);
+      }
+      EXPECT_EQ(translated.cpu.sp, interpreted.cpu.sp);
+    }
+  }
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesLogicalImmediateAndsAndTst) {
   // ands x3, x1, #0xfffffffffffffffc
   constexpr std::array<uint32_t, 1> kAndsCode = {0xf27e'f423};
@@ -1138,8 +1222,7 @@ TEST(LoongArch64RuntimeLibraryTest, LiteMemoryInstructionsHaveRecoveryPoints) {
 
 TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesMteTagLoadsAndWriteback) {
   // ldg x0, [x1, #16]; stg x2, [x3], #16; st2g x4, [x5, #-32]!
-  constexpr std::array<uint32_t, 3> kGuestCode = {
-      0xd960'1020, 0xd920'1462, 0xd9bf'eca4};
+  constexpr std::array<uint32_t, 3> kGuestCode = {0xd960'1020, 0xd920'1462, 0xd9bf'eca4};
   alignas(32) std::array<uint8_t, 64> memory{};
   constexpr uint64_t kTag = UINT64_C(0xab00'0000'0000'0000);
 
@@ -1449,8 +1532,7 @@ TEST(LoongArch64RuntimeLibraryTest, LiteIntegerAddSub4SMatchInterpreter) {
       0x6ea2'8422,  // sub v2.4s, v1.4s, v2.4s (rd == rm)
   };
   constexpr std::array<std::array<__uint128_t, 2>, 3> kInputs = {{
-      {MakeUint32x4(0, 1, 0xffff'ffff, 0x8000'0000),
-       MakeUint32x4(0, 0xffff'ffff, 1, 0x8000'0000)},
+      {MakeUint32x4(0, 1, 0xffff'ffff, 0x8000'0000), MakeUint32x4(0, 0xffff'ffff, 1, 0x8000'0000)},
       {MakeUint32x4(0x7fff'ffff, 0x8000'0000, 0xdead'beef, 0x1234'5678),
        MakeUint32x4(1, 1, 0x2152'4111, 0xedcb'a988)},
       {MakeUint32x4(0xffff'fff0, 0x0000'0010, 0xaaaa'5555, 0x5555'aaaa),
@@ -1528,8 +1610,7 @@ TEST(LoongArch64RuntimeLibraryTest, LiteSqrshrn4HMatchesInterpreter) {
       MakeUint32x4(0x8000'0000, 0x0000'7fff, 0xffff'8000, 0x4000'0800),
       MakeUint32x4(0xffff'f800, 0x07ff'ffff, 0xf800'0000, 0x0000'1800),
   };
-  constexpr __uint128_t kOldDestination =
-      MakeUint128(0x7654'fedc'8000'7fff, 0xaaaa'bbbb'cccc'dddd);
+  constexpr __uint128_t kOldDestination = MakeUint128(0x7654'fedc'8000'7fff, 0xaaaa'bbbb'cccc'dddd);
 
   for (uint32_t insn : kGuestCode) {
     for (const __uint128_t input : kInputs) {
@@ -1833,17 +1914,25 @@ TEST(LoongArch64RuntimeLibraryTest, LiteLdSt1Multiple4SMatchesInterpreter) {
 
   for (uint32_t insn : kGuestCode) {
     const std::array<uint32_t, 1> one_insn = {insn};
-    alignas(16) std::array<uint64_t, 12> interpreted_memory = {
-        0x0001'0203'0405'0607, 0x1011'1213'1415'1617, 0x2021'2223'2425'2627,
-        0x3031'3233'3435'3637, 0x4041'4243'4445'4647, 0x5051'5253'5455'5657,
-        0x6061'6263'6465'6667, 0x7071'7273'7475'7677, 0, 0, 0, 0};
+    alignas(16) std::array<uint64_t, 12> interpreted_memory = {0x0001'0203'0405'0607,
+                                                               0x1011'1213'1415'1617,
+                                                               0x2021'2223'2425'2627,
+                                                               0x3031'3233'3435'3637,
+                                                               0x4041'4243'4445'4647,
+                                                               0x5051'5253'5455'5657,
+                                                               0x6061'6263'6465'6667,
+                                                               0x7071'7273'7475'7677,
+                                                               0,
+                                                               0,
+                                                               0,
+                                                               0};
     alignas(16) std::array<uint64_t, 12> translated_memory = interpreted_memory;
     ThreadState interpreted{};
     ThreadState translated{};
     auto initialize = [](ThreadState* state) {
       for (uint32_t reg = 0; reg < 32; ++reg) {
-        state->cpu.v[reg] = MakeUint128(0x1111'0000'0000'0000ULL + reg,
-                                        0xaaaa'0000'0000'0000ULL + reg);
+        state->cpu.v[reg] =
+            MakeUint128(0x1111'0000'0000'0000ULL + reg, 0xaaaa'0000'0000'0000ULL + reg);
       }
       state->cpu.x[9] = 16;
     };
@@ -2231,8 +2320,7 @@ TEST(LoongArch64RuntimeLibraryTest, LitePairExclusiveRoundTripAndFailure) {
   // ldxp w1,w2,[x0]; stxp w3,w4,w5,[x0]
   constexpr uint32_t kLdxpW = 0x887f'0801;
   constexpr uint32_t kStxpW = 0x8823'1404;
-  alignas(16) std::array<uint64_t, 2> memory = {
-      0x1122'3344'5566'7788ULL, 0x99aa'bbcc'ddee'ff00ULL};
+  alignas(16) std::array<uint64_t, 2> memory = {0x1122'3344'5566'7788ULL, 0x99aa'bbcc'ddee'ff00ULL};
   ThreadState word_state{};
   word_state.cpu.x[0] = ToGuestAddr(memory.data()) | 0xab00'0000'0000'0000ULL;
   TranslateAndRun(std::array<uint32_t, 1>{kLdxpW}, &word_state);
@@ -2264,8 +2352,7 @@ TEST(LoongArch64RuntimeLibraryTest, LitePairExclusiveRoundTripAndFailure) {
 
 TEST(LoongArch64RuntimeLibraryTest, LitePairExclusiveIsAtomicUnderContention) {
   // ldaxp x1,x2,[x0]; add x1,x1,#1; stlxp w3,x1,x2,[x0]
-  constexpr std::array<uint32_t, 3> kGuestCode = {
-      0xc87f'8801, 0x9100'0421, 0xc823'8801};
+  constexpr std::array<uint32_t, 3> kGuestCode = {0xc87f'8801, 0x9100'0421, 0xc823'8801};
   alignas(16) std::array<uint64_t, 2> counter{};
   auto increment = [&] {
     InitHostEntries();
@@ -2402,8 +2489,8 @@ TEST(LoongArch64RuntimeLibraryTest, LiteFcmpSMatchesInterpreter) {
 
       InterpretInsn(&interpreted);
       TranslateAndRun(one_insn, &translated);
-      SCOPED_TRACE(testing::Message() << "insn=" << std::hex << insn << " lhs=" << lhs
-                                      << " rhs=" << rhs);
+      SCOPED_TRACE(testing::Message()
+                   << "insn=" << std::hex << insn << " lhs=" << lhs << " rhs=" << rhs);
       EXPECT_EQ(translated.cpu.flags, interpreted.cpu.flags);
     }
   }
@@ -2429,14 +2516,12 @@ TEST(LoongArch64RuntimeLibraryTest, LiteInsElementAndDup4SMatchInterpreter) {
   std::vector<uint32_t> instructions;
   for (uint32_t dst = 0; dst < 4; ++dst) {
     for (uint32_t src = 0; src < 4; ++src) {
-      instructions.push_back(0x6e00'0400 | (((dst << 3) | 4) << 16) | (src << 13) |
-                             (1 << 5));
+      instructions.push_back(0x6e00'0400 | (((dst << 3) | 4) << 16) | (src << 13) | (1 << 5));
     }
   }
   for (uint32_t dst = 0; dst < 2; ++dst) {
     for (uint32_t src = 0; src < 2; ++src) {
-      instructions.push_back(0x6e00'0400 | (((dst << 4) | 8) << 16) | (src << 14) |
-                             (1 << 5));
+      instructions.push_back(0x6e00'0400 | (((dst << 4) | 8) << 16) | (src << 14) | (1 << 5));
     }
   }
   for (uint32_t src = 0; src < 4; ++src) {
@@ -2499,9 +2584,15 @@ TEST(LoongArch64RuntimeLibraryTest, UnityInsGeneralToLiteVectorHandoffMatchesInt
       0x6e31'de10,  // fmul v16.4s,v16.4s,v17.4s
   };
   constexpr std::array<uint32_t, 9> kFullSequence = {
-      kInterpretedPrefix[0], kInterpretedPrefix[1], kInterpretedPrefix[2],
-      kInterpretedPrefix[3], kLiteSuffix[0],        kLiteSuffix[1],
-      kLiteSuffix[2],        kLiteSuffix[3],        kLiteSuffix[4],
+      kInterpretedPrefix[0],
+      kInterpretedPrefix[1],
+      kInterpretedPrefix[2],
+      kInterpretedPrefix[3],
+      kLiteSuffix[0],
+      kLiteSuffix[1],
+      kLiteSuffix[2],
+      kLiteSuffix[3],
+      kLiteSuffix[4],
   };
 
   auto initialize = [](ThreadState* state) {
@@ -2549,8 +2640,7 @@ TEST(LoongArch64RuntimeLibraryTest, LiteHotStructMemoryMatchesInterpreter) {
   for (size_t i = 0; i < kGuestCode.size(); ++i) {
     const std::array<uint32_t, 1> one_insn = {kGuestCode[i]};
     alignas(16) std::array<uint64_t, 4> interpreted_memory = {
-        0x0123'4567'89ab'cdef, 0x1122'3344'5566'7788,
-        0x99aa'bbcc'ddee'ff00, 0xfedc'ba98'7654'3210};
+        0x0123'4567'89ab'cdef, 0x1122'3344'5566'7788, 0x99aa'bbcc'ddee'ff00, 0xfedc'ba98'7654'3210};
     alignas(16) std::array<uint64_t, 4> translated_memory = interpreted_memory;
     ThreadState interpreted{};
     ThreadState translated{};
