@@ -106,6 +106,19 @@ TEST(LoongArch64AssemblerTest, ResolvesForwardAndBackwardLabels) {
   EXPECT_EQ(*code.AddrAs<const uint32_t>(8), 0x43fff89fu);
 }
 
+TEST(LoongArch64AssemblerTest, EncodesVectorOr) {
+  MachineCode code;
+  Assembler assembler(&code);
+
+  assembler.VorV(Assembler::vr4, Assembler::vr1, Assembler::vr1);
+  assembler.VorV(Assembler::vr8, Assembler::vr3, Assembler::vr3);
+  assembler.Finalize();
+
+  ASSERT_EQ(code.install_size(), 2 * sizeof(uint32_t));
+  EXPECT_EQ(*code.AddrAs<const uint32_t>(0), 0x7126'8424u);
+  EXPECT_EQ(*code.AddrAs<const uint32_t>(4), 0x7126'8c68u);
+}
+
 TEST(LoongArch64AssemblerTest, EncodesVariableShiftsAndDivision) {
   MachineCode code;
   Assembler assembler(&code);

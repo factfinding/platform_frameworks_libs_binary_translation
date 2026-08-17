@@ -36,6 +36,7 @@ using Assembler = loongarch64::Assembler;
 using Register = loongarch64::Register;
 using SimdRegister = loongarch64::SimdRegister;
 using CachedXRegisterMap = std::array<int8_t, 32>;
+using CachedVRegisterMap = std::array<int8_t, 32>;
 
 constexpr int32_t kSpOffset = offsetof(ThreadState, cpu) + offsetof(CPUState, sp);
 constexpr int32_t kFlagsOffset = offsetof(ThreadState, cpu) + offsetof(CPUState, flags);
@@ -76,6 +77,89 @@ CachedXRegisterMap SelectCachedXRegisters(GuestAddr start_pc, GuestAddr end_pc) 
     }
     result[best_reg] = slot;
     uses[best_reg] = 0;
+  }
+  return result;
+}
+
+CachedVRegisterMap SelectCachedVRegisters(GuestAddr start_pc, GuestAddr end_pc) {
+  std::array<uint16_t, 32> reads{};
+  std::array<bool, 32> written{};
+  auto mark_written = [&written](uint32_t reg) { written[reg & 31] = true; };
+  auto mark_read = [&reads](uint32_t reg) { ++reads[reg & 31]; };
+
+  for (GuestAddr pc = start_pc; pc < end_pc; pc += sizeof(uint32_t)) {
+    uint32_t insn = *ToHostAddr<const uint32_t>(pc);
+
+    // SIMD and scalar floating-point data-processing instructions use Rd in
+    // bits 4:0.  Count the possible source fields conservatively; false
+    // positives only waste a cache slot, while every possible destination is
+    // excluded below to keep partial vector writes coherent.
+    if ((insn & 0x0e00'0000u) == 0x0e00'0000u) {
+      mark_written(insn);
+      mark_read(insn >> 5);
+      mark_read(insn >> 16);
+      continue;
+    }
+
+    // SIMD load/store pairs encode Rt2 in bits 14:10.  Loads write both
+    // vectors; stores read both vectors.
+    if ((insn & 0x3e00'0000u) == 0x2c00'0000u) {
+      uint32_t rt = insn & 31;
+      uint32_t rt2 = (insn >> 10) & 31;
+      if ((insn & (1u << 22)) != 0) {
+        mark_written(rt);
+        mark_written(rt2);
+      } else {
+        mark_read(rt);
+        mark_read(rt2);
+      }
+      continue;
+    }
+
+    // Advanced SIMD structure transfers may touch one through four
+    // consecutive registers.  Treat all four as live to cover every list
+    // length without duplicating the architectural list decoder here.
+    if ((insn & 0xbe00'0000u) == 0x0c00'0000u) {
+      uint32_t rt = insn & 31;
+      for (uint32_t i = 0; i < 4; ++i) {
+        if ((insn & (1u << 22)) != 0) {
+          mark_written(rt + i);
+        } else {
+          mark_read(rt + i);
+        }
+      }
+      continue;
+    }
+
+    // Ordinary scalar/vector FP loads and stores use the normal load/store
+    // encodings with the V bit set.  Rt is a destination for loads and a
+    // source for stores.
+    bool ordinary_load_store = (insn & 0x3b00'0000u) == 0x3900'0000u ||
+                               (insn & 0x3b20'0000u) == 0x3800'0000u ||
+                               (insn & 0x3b20'0c00u) == 0x3820'0800u;
+    if (ordinary_load_store && (insn & (1u << 26)) != 0) {
+      if ((insn & (1u << 22)) != 0) {
+        mark_written(insn);
+      } else {
+        mark_read(insn);
+      }
+    }
+  }
+
+  CachedVRegisterMap result{};
+  result.fill(-1);
+  for (int8_t slot = 0; slot < 5; ++slot) {
+    uint32_t best_reg = 32;
+    for (uint32_t reg = 0; reg < reads.size(); ++reg) {
+      if (!written[reg] && reads[reg] >= 2 && (best_reg == 32 || reads[reg] > reads[best_reg])) {
+        best_reg = reg;
+      }
+    }
+    if (best_reg == 32) {
+      break;
+    }
+    result[best_reg] = slot;
+    reads[best_reg] = 0;
   }
   return result;
 }
@@ -125,16 +209,24 @@ class LiteTranslator {
  public:
   explicit LiteTranslator(MachineCode* machine_code,
                           CachedXRegisterMap cached_x_registers,
+                          CachedVRegisterMap cached_v_registers,
                           bool enable_guest_memory,
                           bool allow_dispatch)
       : as_(machine_code),
         enable_guest_memory_(enable_guest_memory),
         allow_dispatch_(allow_dispatch),
-        cached_x_registers_(cached_x_registers) {
+        cached_x_registers_(cached_x_registers),
+        cached_v_registers_(cached_v_registers) {
     for (uint32_t guest_reg = 0; guest_reg < cached_x_registers_.size(); ++guest_reg) {
       int slot = cached_x_registers_[guest_reg];
       if (slot >= 0) {
         as_.LdD(kCachedXHostRegisters[slot], Assembler::s8, XOffset(guest_reg));
+      }
+    }
+    for (uint32_t guest_reg = 0; guest_reg < cached_v_registers_.size(); ++guest_reg) {
+      int slot = cached_v_registers_[guest_reg];
+      if (slot >= 0) {
+        as_.Vld(kCachedVHostRegisters[slot], Assembler::s8, VOffset(guest_reg));
       }
     }
   }
@@ -690,11 +782,35 @@ class LiteTranslator {
       Assembler::s6,
   };
 
+  static constexpr std::array<SimdRegister, 5> kCachedVHostRegisters = {
+      Assembler::vr4,
+      Assembler::vr5,
+      Assembler::vr6,
+      Assembler::vr7,
+      Assembler::vr8,
+  };
+
   int FindCachedXRegister(uint32_t guest_reg) const { return cached_x_registers_[guest_reg]; }
 
-  void LoadV(uint32_t reg, SimdRegister dst) { as_.Vld(dst, Assembler::s8, VOffset(reg)); }
+  int FindCachedVRegister(uint32_t guest_reg) const { return cached_v_registers_[guest_reg]; }
 
-  void StoreV(uint32_t reg, SimdRegister src) { as_.Vst(src, Assembler::s8, VOffset(reg)); }
+  void LoadV(uint32_t reg, SimdRegister dst) {
+    int slot = FindCachedVRegister(reg);
+    if (slot < 0) {
+      as_.Vld(dst, Assembler::s8, VOffset(reg));
+    } else if (dst != kCachedVHostRegisters[slot]) {
+      as_.VorV(dst, kCachedVHostRegisters[slot], kCachedVHostRegisters[slot]);
+    }
+  }
+
+  void StoreV(uint32_t reg, SimdRegister src) {
+    // ThreadState remains authoritative at every instruction boundary.
+    as_.Vst(src, Assembler::s8, VOffset(reg));
+    int slot = FindCachedVRegister(reg);
+    if (slot >= 0 && src != kCachedVHostRegisters[slot]) {
+      as_.VorV(kCachedVHostRegisters[slot], src, src);
+    }
+  }
 
   void LoadXOrZero(uint32_t reg, Register dst) {
     if (reg == 31) {
@@ -3821,6 +3937,7 @@ class LiteTranslator {
   bool enable_guest_memory_;
   bool allow_dispatch_;
   CachedXRegisterMap cached_x_registers_;
+  CachedVRegisterMap cached_v_registers_;
   bool region_end_reached_ = false;
 };
 
@@ -3839,11 +3956,17 @@ std::tuple<bool, GuestAddr> TryLiteTranslateRegion(GuestAddr start_pc,
 
   CachedXRegisterMap cached_x_registers{};
   cached_x_registers.fill(-1);
+  CachedVRegisterMap cached_v_registers{};
+  cached_v_registers.fill(-1);
   if (params.enable_reg_mapping) {
     cached_x_registers = SelectCachedXRegisters(start_pc, params.end_pc);
+    cached_v_registers = SelectCachedVRegisters(start_pc, params.end_pc);
   }
-  LiteTranslator translator(
-      machine_code, cached_x_registers, params.enable_guest_memory, params.allow_dispatch);
+  LiteTranslator translator(machine_code,
+                            cached_x_registers,
+                            cached_v_registers,
+                            params.enable_guest_memory,
+                            params.allow_dispatch);
   GuestAddr pc = start_pc;
   while (pc < params.end_pc && !translator.region_end_reached()) {
     uint32_t insn = *ToHostAddr<const uint32_t>(pc);

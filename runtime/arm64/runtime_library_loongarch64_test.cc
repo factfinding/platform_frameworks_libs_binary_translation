@@ -1540,6 +1540,86 @@ TEST(LoongArch64RuntimeLibraryTest, LiteVectorEorMatchesInterpreter) {
   }
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteCachesReadOnlyVectorSources) {
+  // Reuse v1 and v7 as sources while writing distinct destinations.  A mapped
+  // region should load each source once and copy it from vr4-vr8 thereafter.
+  constexpr std::array<uint32_t, 5> kGuestCode = {
+      0x6e27'dc22,  // fmul v2.4s, v1.4s, v7.4s
+      0x6e27'dc23,  // fmul v3.4s, v1.4s, v7.4s
+      0x6e27'dc24,  // fmul v4.4s, v1.4s, v7.4s
+      0x6e27'dc25,  // fmul v5.4s, v1.4s, v7.4s
+      0x6e27'dc26,  // fmul v6.4s, v1.4s, v7.4s
+  };
+  InitHostEntries();
+  GuestAddr start_pc = ToGuestAddr(kGuestCode.data());
+
+  LiteTranslateParams params;
+  params.end_pc = start_pc + sizeof(kGuestCode);
+  params.allow_dispatch = false;
+  params.enable_reg_mapping = false;
+  MachineCode uncached_code;
+  auto [uncached_success, uncached_stop_pc] =
+      TryLiteTranslateRegion(start_pc, &uncached_code, params);
+  ASSERT_TRUE(uncached_success);
+  ASSERT_EQ(uncached_stop_pc, params.end_pc);
+
+  params.enable_reg_mapping = true;
+  MachineCode cached_code;
+  auto [cached_success, cached_stop_pc] = TryLiteTranslateRegion(start_pc, &cached_code, params);
+  ASSERT_TRUE(cached_success);
+  ASSERT_EQ(cached_stop_pc, params.end_pc);
+
+  auto count_vector_loads = [](const MachineCode& code) {
+    size_t count = 0;
+    for (size_t offset = 0; offset < code.install_size(); offset += sizeof(uint32_t)) {
+      uint32_t insn = *code.AddrAs<const uint32_t>(offset);
+      if ((insn & 0xffc0'0000u) == 0x2c00'0000u) {
+        ++count;
+      }
+    }
+    return count;
+  };
+  EXPECT_EQ(count_vector_loads(uncached_code), 10u);
+  EXPECT_EQ(count_vector_loads(cached_code), 2u);
+
+  ThreadState state{};
+  state.cpu.v[1] = MakeUint32x4(0x3f80'0000, 0x4000'0000, 0x4040'0000, 0x4080'0000);
+  state.cpu.v[7] = MakeUint32x4(0x4000'0000, 0x4040'0000, 0x4080'0000, 0x40a0'0000);
+  const __uint128_t expected = MakeUint32x4(0x4000'0000, 0x40c0'0000, 0x4140'0000, 0x41a0'0000);
+  ScopedExecRegion exec(&cached_code);
+  SetInsnAddr(state.cpu, start_pc);
+  SetResidence(state, kOutsideGeneratedCode);
+  berberis_RunGeneratedCode(&state, AsHostCode(exec.GetHostCodeAddr()));
+  for (uint32_t reg = 2; reg <= 6; ++reg) {
+    EXPECT_EQ(state.cpu.v[reg], expected) << reg;
+  }
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteVectorCacheObservesLd1rWrites) {
+  // LD1R writes v1 before the repeated FMUL sources read it.  Structure-load
+  // destinations must therefore be excluded from the region's vector cache.
+  constexpr std::array<uint32_t, 5> kGuestCode = {
+      0x4d40'c801,  // ld1r {v1.4s}, [x0]
+      0x6e27'dc22,  // fmul v2.4s, v1.4s, v7.4s
+      0x6e27'dc23,  // fmul v3.4s, v1.4s, v7.4s
+      0x6e27'dc24,  // fmul v4.4s, v1.4s, v7.4s
+      0x6e27'dc25,  // fmul v5.4s, v1.4s, v7.4s
+  };
+  uint32_t source = 0x4000'0000;  // 2.0f
+  ThreadState state{};
+  state.cpu.x[0] = reinterpret_cast<uintptr_t>(&source);
+  state.cpu.v[1] = MakeUint32x4(0x42c8'0000, 0x42c8'0000, 0x42c8'0000, 0x42c8'0000);
+  state.cpu.v[7] = MakeUint32x4(0x3f80'0000, 0x4000'0000, 0x4040'0000, 0x4080'0000);
+
+  TranslateAndRun(kGuestCode, &state);
+
+  const __uint128_t expected =
+      MakeUint32x4(0x4000'0000, 0x4080'0000, 0x40c0'0000, 0x4100'0000);
+  for (uint32_t reg = 2; reg <= 5; ++reg) {
+    EXPECT_EQ(state.cpu.v[reg], expected) << reg;
+  }
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteVectorNeg2S4SMatchesInterpreter) {
   // Include the exact Mingchao hot form and an in-place destination.
   constexpr std::array<uint32_t, 3> kGuestCode = {
