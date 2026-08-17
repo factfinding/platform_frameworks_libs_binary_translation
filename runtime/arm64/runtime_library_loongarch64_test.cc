@@ -243,8 +243,8 @@ TEST(LoongArch64RuntimeLibraryTest, LiteWriteThroughRegisterMappingPreservesInte
 }
 
 TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesCompareAndBranch) {
-  // cbz x0, +8.  The following words only provide valid branch destinations;
-  // the translated region ends at the conditional branch.
+  // cbz x0, +8.  Taken dispatches to the target while the fallthrough remains
+  // in the current region and executes both following instructions.
   constexpr std::array<uint32_t, 3> kGuestCode = {0xb400'0040, 0xd280'0021, 0xd280'0041};
 
   ThreadState zero_state{};
@@ -254,7 +254,29 @@ TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesCompareAndBranch) {
   ThreadState nonzero_state{};
   nonzero_state.cpu.x[0] = 1;
   TranslateAndRun(kGuestCode, &nonzero_state);
-  EXPECT_EQ(GetInsnAddr(nonzero_state.cpu), ToGuestAddr(kGuestCode.data() + 1));
+  EXPECT_EQ(nonzero_state.cpu.x[1], 2u);
+  EXPECT_EQ(GetInsnAddr(nonzero_state.cpu), ToGuestAddr(kGuestCode.data() + 3));
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteConditionalFallthroughExtendsRegion) {
+  // cbnz x0, +8; add x1, x1, #1; add x2, x2, #1.  A conditional branch must
+  // leave its not-taken path open so the linear fallthrough is translated as
+  // part of the same region.
+  constexpr std::array<uint32_t, 3> kGuestCode = {0xb500'0040, 0x9100'0421, 0x9100'0442};
+  GuestAddr start_pc = ToGuestAddr(kGuestCode.data());
+  MachineCode code;
+  LiteTranslateParams params;
+  params.end_pc = start_pc + sizeof(kGuestCode);
+  params.allow_dispatch = false;
+  auto [success, stop_pc] = TryLiteTranslateRegion(start_pc, &code, params);
+  ASSERT_TRUE(success);
+  EXPECT_EQ(stop_pc, params.end_pc);
+
+  ThreadState state{};
+  TranslateAndRun(kGuestCode, &state);
+  EXPECT_EQ(state.cpu.x[1], 1u);
+  EXPECT_EQ(state.cpu.x[2], 1u);
+  EXPECT_EQ(GetInsnAddr(state.cpu), params.end_pc);
 }
 
 TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesTestAndBranch) {
@@ -267,7 +289,7 @@ TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesTestAndBranch) {
   ThreadState set_state{};
   set_state.cpu.x[0] = (uint64_t{1} << 63) | (uint64_t{1} << 5);
   TranslateAndRun(kTbzCode, &set_state);
-  EXPECT_EQ(GetInsnAddr(set_state.cpu), ToGuestAddr(kTbzCode.data() + 1));
+  EXPECT_EQ(GetInsnAddr(set_state.cpu), ToGuestAddr(kTbzCode.data() + 3));
 
   ThreadState high_bits_only_state{};
   high_bits_only_state.cpu.x[0] = uint64_t{1} << 63;
@@ -284,7 +306,7 @@ TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesTestAndBranch) {
   ThreadState w31_state{};
   w31_state.cpu.x[0] = uint64_t{1} << 31;
   TranslateAndRun(kTbzW31Code, &w31_state);
-  EXPECT_EQ(GetInsnAddr(w31_state.cpu), ToGuestAddr(kTbzW31Code.data() + 1));
+  EXPECT_EQ(GetInsnAddr(w31_state.cpu), ToGuestAddr(kTbzW31Code.data() + 3));
 
   constexpr std::array<uint32_t, 3> kTbnzX63Code = {0xb7f8'0040, 0xd503'201f, 0xd503'201f};
   ThreadState x63_state{};
@@ -359,6 +381,66 @@ TEST(LoongArch64RuntimeLibraryTest, LiteDirectDispatchLinksCachedRegion) {
   berberis_RunGeneratedCode(&pending_state, AsHostCode(source_exec.GetHostCodeAddr()));
   EXPECT_EQ(pending_state.cpu.x[0], 0u);
   EXPECT_EQ(GetInsnAddr(pending_state.cpu), target_pc);
+
+  cache->InvalidateGuestRange(target_pc, target_pc + sizeof(uint32_t));
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteConditionalSideExitAndFallthroughDispatch) {
+  // cbz x0, +8; mov x1, #1; <cached target>.  Taken must side-exit directly
+  // to the cached target, while not-taken executes the fallthrough in this
+  // region before its final dispatch reaches that same target.
+  constexpr std::array<uint32_t, 3> kGuestCode = {0xb400'0040, 0xd280'0021, 0xd503'201f};
+  GuestAddr source_pc = ToGuestAddr(kGuestCode.data());
+  GuestAddr target_pc = ToGuestAddr(kGuestCode.data() + 2);
+  GuestAddr exit_pc = ToGuestAddr(kGuestCode.data() + 3);
+
+  InitHostEntries();
+  MachineCode target_code;
+  loongarch64::Assembler target_as(&target_code);
+  target_as.Li(loongarch64::Assembler::t0, 0x55aa);
+  target_as.StD(loongarch64::Assembler::t0,
+                loongarch64::Assembler::s8,
+                offsetof(ThreadState, cpu) + offsetof(CPUState, x[2]));
+  target_as.Li(loongarch64::Assembler::s7, exit_pc);
+  target_as.Li(loongarch64::Assembler::t0, kEntryExitGeneratedCode);
+  target_as.Jirl(loongarch64::Assembler::zero, loongarch64::Assembler::t0, 0);
+  target_as.Finalize();
+
+  TranslationCache* cache = TranslationCache::GetInstance();
+  GuestCodeEntry* target_entry = cache->AddAndLockForTranslation(target_pc, 0);
+  ASSERT_NE(target_entry, nullptr);
+  HostCodeAddr target_host_code = GetDefaultCodePoolInstance()->Add(&target_code);
+  cache->SetTranslatedAndUnlock(target_pc,
+                                target_entry,
+                                sizeof(uint32_t),
+                                GuestCodeEntry::Kind::kLiteTranslated,
+                                {target_host_code, target_code.install_size()});
+
+  MachineCode source_code;
+  LiteTranslateParams params;
+  params.end_pc = target_pc;
+  params.allow_dispatch = true;
+  auto [success, stop_pc] = TryLiteTranslateRegion(source_pc, &source_code, params);
+  ASSERT_TRUE(success);
+  ASSERT_EQ(stop_pc, target_pc);
+  ScopedExecRegion source_exec(&source_code);
+
+  ThreadState taken_state{};
+  SetInsnAddr(taken_state.cpu, source_pc);
+  SetResidence(taken_state, kOutsideGeneratedCode);
+  berberis_RunGeneratedCode(&taken_state, AsHostCode(source_exec.GetHostCodeAddr()));
+  EXPECT_EQ(taken_state.cpu.x[1], 0u);
+  EXPECT_EQ(taken_state.cpu.x[2], 0x55aau);
+  EXPECT_EQ(GetInsnAddr(taken_state.cpu), exit_pc);
+
+  ThreadState fallthrough_state{};
+  fallthrough_state.cpu.x[0] = 1;
+  SetInsnAddr(fallthrough_state.cpu, source_pc);
+  SetResidence(fallthrough_state, kOutsideGeneratedCode);
+  berberis_RunGeneratedCode(&fallthrough_state, AsHostCode(source_exec.GetHostCodeAddr()));
+  EXPECT_EQ(fallthrough_state.cpu.x[1], 1u);
+  EXPECT_EQ(fallthrough_state.cpu.x[2], 0x55aau);
+  EXPECT_EQ(GetInsnAddr(fallthrough_state.cpu), exit_pc);
 
   cache->InvalidateGuestRange(target_pc, target_pc + sizeof(uint32_t));
 }
@@ -2840,7 +2922,8 @@ TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesCmpAndConditionalBranch) {
   unequal_state.cpu.x[0] = 3;
   TranslateAndRun(kEqCode, &unequal_state);
   EXPECT_EQ(unequal_state.cpu.flags, 8u);  // N
-  EXPECT_EQ(GetInsnAddr(unequal_state.cpu), ToGuestAddr(kEqCode.data() + 2));
+  EXPECT_EQ(unequal_state.cpu.x[1], 2u);
+  EXPECT_EQ(GetInsnAddr(unequal_state.cpu), ToGuestAddr(kEqCode.data() + 4));
 
   // cmp x0, #1; b.lt +8.  INT64_MIN - 1 overflows to INT64_MAX,
   // so signed LT is true because N != V.

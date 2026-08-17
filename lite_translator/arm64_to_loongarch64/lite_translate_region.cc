@@ -550,17 +550,14 @@ class LiteTranslator {
     }
     if ((insn & 0x7e00'0000u) == 0x3400'0000u) {
       TranslateCompareAndBranch(insn, pc);
-      region_end_reached_ = true;
       return true;
     }
     if ((insn & 0x7e00'0000u) == 0x3600'0000u) {
       TranslateTestAndBranch(insn, pc);
-      region_end_reached_ = true;
       return true;
     }
     if ((insn & 0xff00'0010u) == 0x5400'0000u) {
       TranslateConditionalBranch(insn, pc);
-      region_end_reached_ = true;
       return true;
     }
     if ((insn & 0xffff'fc1fu) == 0xd61f'0000u || (insn & 0xffff'fc1fu) == 0xd63f'0000u ||
@@ -3638,15 +3635,14 @@ class LiteTranslator {
     if (!is_64_bit) {
       ZeroExtend32(Assembler::t1);
     }
-    Assembler::Label* taken = as_.MakeLabel();
+    Assembler::Label* fallthrough = as_.MakeLabel();
     if (nonzero) {
-      as_.Bnez(Assembler::t1, *taken);
+      as_.Beqz(Assembler::t1, *fallthrough);
     } else {
-      as_.Beqz(Assembler::t1, *taken);
+      as_.Bnez(Assembler::t1, *fallthrough);
     }
-    Exit(pc + 4);
-    as_.Bind(taken);
     Exit(pc + displacement);
+    as_.Bind(fallthrough);
   }
 
   void TranslateTestAndBranch(uint32_t insn, GuestAddr pc) {
@@ -3661,26 +3657,24 @@ class LiteTranslator {
     // would incorrectly include every bit above the requested position.
     as_.AddiD(Assembler::t0, Assembler::zero, 1);
     as_.And(Assembler::t1, Assembler::t1, Assembler::t0);
-    Assembler::Label* taken = as_.MakeLabel();
+    Assembler::Label* fallthrough = as_.MakeLabel();
     if (nonzero) {
-      as_.Bnez(Assembler::t1, *taken);
+      as_.Beqz(Assembler::t1, *fallthrough);
     } else {
-      as_.Beqz(Assembler::t1, *taken);
+      as_.Bnez(Assembler::t1, *fallthrough);
     }
-    Exit(pc + 4);
-    as_.Bind(taken);
     Exit(pc + displacement);
+    as_.Bind(fallthrough);
   }
 
   void TranslateConditionalBranch(uint32_t insn, GuestAddr pc) {
     int64_t displacement = SignExtend((insn >> 5) & 0x7ffff, 19) * 4;
     EmitCondition(insn & 0xf);
 
-    Assembler::Label* taken = as_.MakeLabel();
-    as_.Bnez(Assembler::t2, *taken);
-    Exit(pc + 4);
-    as_.Bind(taken);
+    Assembler::Label* fallthrough = as_.MakeLabel();
+    as_.Beqz(Assembler::t2, *fallthrough);
     Exit(pc + displacement);
+    as_.Bind(fallthrough);
   }
 
   void EmitCondition(uint32_t condition) {
