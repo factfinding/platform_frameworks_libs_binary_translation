@@ -103,6 +103,10 @@ class Assembler : public AssemblerBase {
   BERBERIS_DEFINE_LOONGARCH_SIMD_REGISTER(vr6, 6);
   BERBERIS_DEFINE_LOONGARCH_SIMD_REGISTER(vr7, 7);
   BERBERIS_DEFINE_LOONGARCH_SIMD_REGISTER(vr8, 8);
+  BERBERIS_DEFINE_LOONGARCH_SIMD_REGISTER(vr9, 9);
+  BERBERIS_DEFINE_LOONGARCH_SIMD_REGISTER(vr10, 10);
+  BERBERIS_DEFINE_LOONGARCH_SIMD_REGISTER(vr11, 11);
+  BERBERIS_DEFINE_LOONGARCH_SIMD_REGISTER(vr12, 12);
 #undef BERBERIS_DEFINE_LOONGARCH_SIMD_REGISTER
 
   // LoongArch ELF psABI aliases.
@@ -281,6 +285,9 @@ class Assembler : public AssemblerBase {
   void VfcmpSleS(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
     Emit32(0x0c53'8000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
   }
+  void VfcmpCltS(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
+    Emit32(0x0c51'0000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
+  }
   void VseqB(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
     Emit32(0x7000'0000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
   }
@@ -345,6 +352,9 @@ class Assembler : public AssemblerBase {
   void VfmaddS(SimdRegister vd, SimdRegister vj, SimdRegister vk, SimdRegister va) {
     Emit32(0x0910'0000 | EncodeVa(va) | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
   }
+  void VbitselV(SimdRegister vd, SimdRegister vj, SimdRegister vk, SimdRegister va) {
+    Emit32(0x0d10'0000 | EncodeVa(va) | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
+  }
   void VandV(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
     Emit32(0x7126'0000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
   }
@@ -400,8 +410,14 @@ class Assembler : public AssemblerBase {
   void VilvlW(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
     Emit32(0x711b'0000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
   }
+  void VilvlD(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
+    Emit32(0x711b'8000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
+  }
   void VilvhW(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
     Emit32(0x711d'0000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
+  }
+  void VilvhD(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
+    Emit32(0x711d'8000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
   }
   void Vreplgr2vrW(SimdRegister vd, Register rj) {
     Emit32(0x729f'0800 | EncodeRj(rj) | EncodeVd(vd));

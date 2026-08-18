@@ -90,10 +90,10 @@ CachedVRegisterMap SelectCachedVRegisters(GuestAddr start_pc, GuestAddr end_pc) 
   for (GuestAddr pc = start_pc; pc < end_pc; pc += sizeof(uint32_t)) {
     uint32_t insn = *ToHostAddr<const uint32_t>(pc);
 
-    // FABS Vd.4S, Vn.4S is unary.  Its bits 20:16 are part of the opcode, not
-    // Rm; handling it before the conservative SIMD rule avoids loading a
-    // phantom v0 into the region cache.
-    if ((insn & 0xffff'fc00u) == 0x4ea0'f800u) {
+    // FABS/FNEG Vd.4S, Vn.4S are unary.  Their bits 20:16 are part of the
+    // opcode, not Rm; handling them before the conservative SIMD rule avoids
+    // loading a phantom v0 into the region cache.
+    if ((insn & 0xdfff'fc00u) == 0x4ea0'f800u) {
       mark_written(insn);
       mark_read(insn >> 5);
       continue;
@@ -364,6 +364,15 @@ class LiteTranslator {
       }
       return TranslateStoreExclusivePair(insn, pc);
     }
+    // LD4 of four complete 4S vectors.  Handle this before the broader LD1
+    // class below, whose decoder rejects interleaved structure opcodes.
+    if ((insn & 0xffff'fc00u) == 0x4c40'0800u ||
+        (insn & 0xffe0'fc00u) == 0x4cc0'0800u) {
+      if (!enable_guest_memory_) {
+        return false;
+      }
+      return TranslateLd4Multiple4S(insn, pc);
+    }
     // LD1/ST1 of one through four complete 4S vectors.  Unlike LD2/LD3/LD4,
     // these forms transfer consecutive vectors without interleaving, so all
     // list lengths share one lowering.  Accept both no-writeback and
@@ -386,17 +395,23 @@ class LiteTranslator {
       }
       return TranslateLd1r4S(insn, pc);
     }
-    if ((insn & 0xffff'fc00u) == 0x4d00'8000u) {
+    // LD1/ST1 of one 32-bit lane without writeback.  Q and S encode the lane.
+    if ((insn & 0xbfff'ec00u) == 0x0d40'8000u ||
+        (insn & 0xbfff'ec00u) == 0x0d00'8000u) {
       if (!enable_guest_memory_) {
         return false;
       }
-      return TranslateSt1S2(insn, pc);
+      return TranslateLdSt1SNoWriteback(insn, pc);
     }
     if ((insn & 0xffe0'8400u) == 0x6e00'0400u) {
       return TranslateInsElement(insn);
     }
     if ((insn & 0xffe0'fc00u) == 0x4e00'0400u) {
       return TranslateDupElement4S(insn);
+    }
+    // Scalar MOV Sd, Vn.S[index] is the scalar DUP (element) encoding.
+    if ((insn & 0xffe0'fc00u) == 0x5e00'0400u && (((insn >> 16) & 7) == 4)) {
+      return TranslateMovSFromElement(insn);
     }
     // DUP Vd.16B, Wn.  This is the hottest SIMD-copy form in the current
     // Unity workload.  Keep the initial LA64 implementation deliberately
@@ -433,6 +448,11 @@ class LiteTranslator {
     // destination's upper 64 bits, as required for every 64-bit AdvSIMD write.
     if ((insn & 0xbfe0'fc00u) == 0x2e20'1c00u) {
       return TranslateVectorLogical(insn, 2);
+    }
+    // BSL Vd.16B, Vn.16B, Vm.16B uses the old Vd as its bit mask.  Restrict
+    // the first lowering to the full-width form observed in Unity.
+    if ((insn & 0xffe0'fc00u) == 0x6e60'1c00u) {
+      return TranslateBsl16B(insn);
     }
     if ((insn & 0xffe0'fc00u) == 0x4ea0'8400u) {
       return TranslateVectorAddSub4S(insn, false);  // ADD
@@ -471,6 +491,9 @@ class LiteTranslator {
     if ((insn & 0xffff'fc00u) == 0x4ea0'f800u) {
       return TranslateFabs4S(insn);
     }
+    if ((insn & 0xffff'fc00u) == 0x6ea0'f800u) {
+      return TranslateFneg4S(insn);
+    }
     if ((insn & 0xbfff'fc00u) == 0x0e20'5800u) {
       return TranslateCnt8B16B(insn);
     }
@@ -486,11 +509,17 @@ class LiteTranslator {
     if ((insn & 0xffe0'fc00u) == 0x4e80'2800u) {
       return TranslatePermute4S(insn, 2);  // TRN1
     }
+    if ((insn & 0xffe0'fc00u) == 0x4e80'6800u) {
+      return TranslatePermute4S(insn, 5);  // TRN2
+    }
     if ((insn & 0xffe0'fc00u) == 0x4e80'5800u) {
       return TranslatePermute4S(insn, 3);  // UZP2
     }
     if ((insn & 0xffe0'fc00u) == 0x4e80'3800u) {
       return TranslatePermute4S(insn, 4);  // ZIP1
+    }
+    if ((insn & 0xffe0'fc00u) == 0x4ec0'7800u) {
+      return TranslateZip2D(insn);
     }
     // MOVI Vd.2D, #0.  Compilers use this reserved modified-immediate form
     // as the canonical full-width vector clear.
@@ -563,6 +592,9 @@ class LiteTranslator {
     }
     if ((insn & 0xffe0'fc00u) == 0x6e20'e400u) {
       return TranslateFcmge4S(insn);
+    }
+    if ((insn & 0xffe0'fc00u) == 0x6ea0'e400u) {
+      return TranslateFcmgt4S(insn);
     }
     if ((insn & 0xffe0'fc00u) == 0x6e20'8c00u) {
       return TranslateCmeq16B(insn);
@@ -2608,6 +2640,58 @@ class LiteTranslator {
     return true;
   }
 
+  bool TranslateLd4Multiple4S(uint32_t insn, GuestAddr pc) {
+    const bool post_index = ((insn >> 23) & 1) != 0;
+    const uint32_t rm = (insn >> 16) & 31;
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rt = insn & 31;
+    LoadXOrSp(rn, Assembler::t0);
+    ApplyTbi(Assembler::t0);
+    Assembler::Label* recovery = as_.MakeLabel();
+    Assembler::Label* done = as_.MakeLabel();
+
+    // Memory holds four interleaved 4S vectors as four 16-byte rows.  Keep
+    // every row in scratch LSX registers until all accesses have succeeded,
+    // then transpose the 4x4 matrix and commit the architectural registers.
+    as_.SetRecoveryPoint(recovery);
+    as_.Vld(Assembler::vr0, Assembler::t0, 0);
+    as_.SetRecoveryPoint(recovery);
+    as_.Vld(Assembler::vr1, Assembler::t0, 16);
+    as_.SetRecoveryPoint(recovery);
+    as_.Vld(Assembler::vr2, Assembler::t0, 32);
+    as_.SetRecoveryPoint(recovery);
+    as_.Vld(Assembler::vr3, Assembler::t0, 48);
+
+    as_.VilvlW(Assembler::vr9, Assembler::vr1, Assembler::vr0);
+    as_.VilvhW(Assembler::vr10, Assembler::vr1, Assembler::vr0);
+    as_.VilvlW(Assembler::vr11, Assembler::vr3, Assembler::vr2);
+    as_.VilvhW(Assembler::vr12, Assembler::vr3, Assembler::vr2);
+    as_.VilvlD(Assembler::vr0, Assembler::vr11, Assembler::vr9);
+    as_.VilvhD(Assembler::vr1, Assembler::vr11, Assembler::vr9);
+    as_.VilvlD(Assembler::vr2, Assembler::vr12, Assembler::vr10);
+    as_.VilvhD(Assembler::vr3, Assembler::vr12, Assembler::vr10);
+    StoreV(rt, Assembler::vr0);
+    StoreV((rt + 1) & 31, Assembler::vr1);
+    StoreV((rt + 2) & 31, Assembler::vr2);
+    StoreV((rt + 3) & 31, Assembler::vr3);
+    as_.B(*done);
+    as_.Bind(recovery);
+    ExitGeneratedCode(pc);
+    as_.Bind(done);
+
+    if (post_index) {
+      LoadXOrSp(rn, Assembler::t0);
+      if (rm == 31) {
+        as_.AddiD(Assembler::t0, Assembler::t0, 64);
+      } else {
+        LoadXOrZero(rm, Assembler::t1);
+        as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
+      }
+      StoreXOrSp(rn, Assembler::t0);
+    }
+    return true;
+  }
+
   bool TranslateLd1D1PostIndex(uint32_t insn, GuestAddr pc) {
     const uint32_t rn = (insn >> 5) & 31;
     const uint32_t rt = insn & 31;
@@ -2647,20 +2731,42 @@ class LiteTranslator {
     return true;
   }
 
-  bool TranslateSt1S2(uint32_t insn, GuestAddr pc) {
+  bool TranslateLdSt1SNoWriteback(uint32_t insn, GuestAddr pc) {
+    const bool load = (insn & (1u << 22)) != 0;
     const uint32_t rn = (insn >> 5) & 31;
     const uint32_t rt = insn & 31;
+    const uint32_t lane = (((insn >> 30) & 1) << 1) | ((insn >> 12) & 1);
     LoadXOrSp(rn, Assembler::t0);
     ApplyTbi(Assembler::t0);
-    as_.LdWU(Assembler::t1, Assembler::s8, VOffset(rt) + 8);
     Assembler::Label* recovery = as_.MakeLabel();
     Assembler::Label* done = as_.MakeLabel();
-    as_.SetRecoveryPoint(recovery);
-    as_.StW(Assembler::t1, Assembler::t0, 0);
+    if (load) {
+      // Do not modify the destination until the potentially faulting access
+      // succeeds, so interpreter recovery can restart the instruction.
+      as_.SetRecoveryPoint(recovery);
+      as_.LdWU(Assembler::t1, Assembler::t0, 0);
+      as_.StW(Assembler::t1, Assembler::s8, VOffset(rt) + lane * 4);
+    } else {
+      as_.LdWU(Assembler::t1, Assembler::s8, VOffset(rt) + lane * 4);
+      as_.SetRecoveryPoint(recovery);
+      as_.StW(Assembler::t1, Assembler::t0, 0);
+    }
     as_.B(*done);
     as_.Bind(recovery);
     ExitGeneratedCode(pc);
     as_.Bind(done);
+    return true;
+  }
+
+  bool TranslateMovSFromElement(uint32_t insn) {
+    const uint32_t index = ((insn >> 16) & 31) >> 3;
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    LoadV(rn, Assembler::vr1);
+    as_.VreplveiW(Assembler::vr0, Assembler::vr1, index);
+    as_.Vst(Assembler::vr0, Assembler::s8, VOffset(rd));
+    as_.StW(Assembler::zero, Assembler::s8, VOffset(rd) + 4);
+    as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
     return true;
   }
 
@@ -2896,6 +3002,21 @@ class LiteTranslator {
     return true;
   }
 
+  bool TranslateBsl16B(uint32_t insn) {
+    const uint32_t rm = (insn >> 16) & 31;
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    // Snapshot every input before overwriting Vd.  This preserves all alias
+    // combinations, including Vd == Vn and Vd == Vm.
+    LoadV(rd, Assembler::vr0);
+    LoadV(rn, Assembler::vr1);
+    LoadV(rm, Assembler::vr2);
+    // LSX VBITSEL computes (Va & Vk) | (~Va & Vj), where Va is the mask.
+    as_.VbitselV(Assembler::vr0, Assembler::vr2, Assembler::vr1, Assembler::vr0);
+    StoreV(rd, Assembler::vr0);
+    return true;
+  }
+
   bool TranslateVectorNeg32(uint32_t insn) {
     const bool is_128_bit = (insn & 0x4000'0000u) != 0;
     const uint32_t rn = (insn >> 5) & 31;
@@ -2997,6 +3118,18 @@ class LiteTranslator {
     return true;
   }
 
+  bool TranslateFcmgt4S(uint32_t insn) {
+    const uint32_t rm = (insn >> 16) & 31;
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    LoadV(rn, Assembler::vr1);
+    LoadV(rm, Assembler::vr2);
+    // ARM Vn > Vm is the ordered comparison Vm < Vn.
+    as_.VfcmpCltS(Assembler::vr0, Assembler::vr2, Assembler::vr1);
+    StoreV(rd, Assembler::vr0);
+    return true;
+  }
+
   bool TranslateCmeq16B(uint32_t insn) {
     const uint32_t rm = (insn >> 16) & 31;
     const uint32_t rn = (insn >> 5) & 31;
@@ -3062,6 +3195,19 @@ class LiteTranslator {
     return true;
   }
 
+  bool TranslateFneg4S(uint32_t insn) {
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    LoadV(rn, Assembler::vr1);
+    // FNEG is a pure sign-bit operation.  XOR preserves NaN payloads and
+    // signed-zero behavior without raising host floating-point exceptions.
+    as_.Li(Assembler::t0, 0x8000'0000u);
+    as_.Vreplgr2vrW(Assembler::vr2, Assembler::t0);
+    as_.VxorV(Assembler::vr0, Assembler::vr1, Assembler::vr2);
+    StoreV(rd, Assembler::vr0);
+    return true;
+  }
+
   bool TranslateCnt8B16B(uint32_t insn) {
     const bool is_128_bit = (insn & 0x4000'0000u) != 0;
     const uint32_t rn = (insn >> 5) & 31;
@@ -3094,9 +3240,24 @@ class LiteTranslator {
       as_.Vshuf4iW(Assembler::vr0, Assembler::vr0, 0xd8);
     } else if (operation == 3) {  // UZP2: n[1], n[3], m[1], m[3]
       as_.VpickodW(Assembler::vr0, Assembler::vr2, Assembler::vr1);
-    } else {  // ZIP1: n[0], m[0], n[1], m[1]
+    } else if (operation == 4) {  // ZIP1: n[0], m[0], n[1], m[1]
       as_.VilvlW(Assembler::vr0, Assembler::vr2, Assembler::vr1);
+    } else {  // TRN2: n[1], m[1], n[3], m[3]
+      as_.VpickodW(Assembler::vr0, Assembler::vr2, Assembler::vr1);
+      as_.Vshuf4iW(Assembler::vr0, Assembler::vr0, 0xd8);
     }
+    StoreV(rd, Assembler::vr0);
+    return true;
+  }
+
+  bool TranslateZip2D(uint32_t insn) {
+    const uint32_t rm = (insn >> 16) & 31;
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    LoadV(rn, Assembler::vr1);
+    LoadV(rm, Assembler::vr2);
+    // LSX takes Vk's high doubleword before Vj's high doubleword.
+    as_.VilvhD(Assembler::vr0, Assembler::vr2, Assembler::vr1);
     StoreV(rd, Assembler::vr0);
     return true;
   }
