@@ -3476,6 +3476,59 @@ TEST(LoongArch64RuntimeLibraryTest, LiteFaddp2SMatchesInterpreter) {
   }
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteFaddp2SUsesSourceCache) {
+  constexpr std::array<uint32_t, 5> kGuestCode = {
+      0x2e21'd402,  // faddp v2.2s, v0.2s, v1.2s
+      0x2e21'd403,  // faddp v3.2s, v0.2s, v1.2s
+      0x2e21'd404,  // faddp v4.2s, v0.2s, v1.2s
+      0x2e21'd405,  // faddp v5.2s, v0.2s, v1.2s
+      0x2e21'd406,  // faddp v6.2s, v0.2s, v1.2s
+  };
+  InitHostEntries();
+  GuestAddr start_pc = ToGuestAddr(kGuestCode.data());
+
+  LiteTranslateParams params;
+  params.end_pc = start_pc + sizeof(kGuestCode);
+  params.allow_dispatch = false;
+  params.enable_reg_mapping = false;
+  MachineCode uncached_code;
+  auto [uncached_success, uncached_stop_pc] =
+      TryLiteTranslateRegion(start_pc, &uncached_code, params);
+  ASSERT_TRUE(uncached_success);
+  ASSERT_EQ(uncached_stop_pc, params.end_pc);
+
+  params.enable_reg_mapping = true;
+  MachineCode cached_code;
+  auto [cached_success, cached_stop_pc] = TryLiteTranslateRegion(start_pc, &cached_code, params);
+  ASSERT_TRUE(cached_success);
+  ASSERT_EQ(cached_stop_pc, params.end_pc);
+
+  auto count_vector_loads = [](const MachineCode& code) {
+    size_t count = 0;
+    for (size_t offset = 0; offset < code.install_size(); offset += sizeof(uint32_t)) {
+      uint32_t insn = *code.AddrAs<const uint32_t>(offset);
+      if ((insn & 0xffc0'0000u) == 0x2c00'0000u) {
+        ++count;
+      }
+    }
+    return count;
+  };
+  EXPECT_EQ(count_vector_loads(uncached_code), 10u);
+  EXPECT_EQ(count_vector_loads(cached_code), 2u);
+
+  ThreadState state{};
+  state.cpu.v[0] = MakeUint32x4(0x3f80'0000, 0x4000'0000, 0x7f80'0000, 0xff80'0000);
+  state.cpu.v[1] = MakeUint32x4(0x4040'0000, 0xc080'0000, 0x7fc1'2345, 0xffc5'4321);
+  const __uint128_t expected = MakeUint32x4(0x4040'0000, 0xbf80'0000, 0, 0);
+  ScopedExecRegion exec(&cached_code);
+  SetInsnAddr(state.cpu, start_pc);
+  SetResidence(state, kOutsideGeneratedCode);
+  berberis_RunGeneratedCode(&state, AsHostCode(exec.GetHostCodeAddr()));
+  for (uint32_t reg = 2; reg <= 6; ++reg) {
+    EXPECT_EQ(state.cpu.v[reg], expected) << reg;
+  }
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteHotVectorComparisonsMatchInterpreter) {
   constexpr std::array<uint32_t, 3> kGuestCode = {
       0x4ea0'd800,  // fcmeq v0.4s,v0.4s,#0

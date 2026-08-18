@@ -2961,31 +2961,17 @@ class LiteTranslator {
     const uint32_t rn = (insn >> 5) & 31;
     const uint32_t rd = insn & 31;
 
-    // Snapshot both sources before writing Vd so every register-aliasing
-    // combination behaves like ARM.  Use scalar additions: the 2S form has
-    // only two architectural results, and inactive lanes must not raise FP
-    // exceptions.
-    as_.LdD(Assembler::t0, Assembler::s8, VOffset(rn));
-    as_.LdD(Assembler::t4, Assembler::s8, VOffset(rm));
-    as_.Move(Assembler::t1, Assembler::t0);
-    ZeroExtend32(Assembler::t1);
-    as_.SrliD(Assembler::t2, Assembler::t0, 32);
-    as_.Movgr2frW(Assembler::vr1, Assembler::t1);
-    as_.Movgr2frW(Assembler::vr2, Assembler::t2);
-    as_.FaddS(Assembler::vr0, Assembler::vr1, Assembler::vr2);
-    as_.Movfr2grS(Assembler::t3, Assembler::vr0);
-
-    as_.Move(Assembler::t1, Assembler::t4);
-    ZeroExtend32(Assembler::t1);
-    as_.SrliD(Assembler::t2, Assembler::t4, 32);
-    as_.Movgr2frW(Assembler::vr1, Assembler::t1);
-    as_.Movgr2frW(Assembler::vr2, Assembler::t2);
-    as_.FaddS(Assembler::vr0, Assembler::vr1, Assembler::vr2);
-    as_.Movfr2grS(Assembler::t5, Assembler::vr0);
-
-    as_.StW(Assembler::t3, Assembler::s8, VOffset(rd));
-    as_.StW(Assembler::t5, Assembler::s8, VOffset(rd) + 4);
-    as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
+    LoadV(rn, Assembler::vr1);
+    LoadV(rm, Assembler::vr2);
+    // Interleave the active pairs as [n0, m0, n1, m1], then split them into
+    // [n0, m0, 0, 0] and [n1, m1, 0, 0].  This preserves FADDP's two active
+    // additions without letting inactive source lanes raise FP exceptions.
+    as_.VilvlW(Assembler::vr0, Assembler::vr2, Assembler::vr1);
+    as_.VbsrlV(Assembler::vr3, Assembler::vr0, 8);
+    as_.VxorV(Assembler::vr2, Assembler::vr2, Assembler::vr2);
+    as_.VpickevD(Assembler::vr0, Assembler::vr2, Assembler::vr0);
+    as_.VfaddS(Assembler::vr0, Assembler::vr0, Assembler::vr3);
+    StoreV(rd, Assembler::vr0);
     return true;
   }
 
