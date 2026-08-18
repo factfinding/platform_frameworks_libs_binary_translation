@@ -1840,6 +1840,60 @@ TEST(LoongArch64RuntimeLibraryTest, LiteExtAllOffsetsMatchInterpreter) {
   }
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteExtUsesSourceCache) {
+  constexpr std::array<uint32_t, 5> kGuestCode = {
+      0x6e01'3802,  // ext v2.16b, v0.16b, v1.16b, #7
+      0x6e01'3803,  // ext v3.16b, v0.16b, v1.16b, #7
+      0x6e01'3804,  // ext v4.16b, v0.16b, v1.16b, #7
+      0x6e01'3805,  // ext v5.16b, v0.16b, v1.16b, #7
+      0x6e01'3806,  // ext v6.16b, v0.16b, v1.16b, #7
+  };
+  InitHostEntries();
+  GuestAddr start_pc = ToGuestAddr(kGuestCode.data());
+
+  LiteTranslateParams params;
+  params.end_pc = start_pc + sizeof(kGuestCode);
+  params.allow_dispatch = false;
+  params.enable_reg_mapping = false;
+  MachineCode uncached_code;
+  auto [uncached_success, uncached_stop_pc] =
+      TryLiteTranslateRegion(start_pc, &uncached_code, params);
+  ASSERT_TRUE(uncached_success);
+  ASSERT_EQ(uncached_stop_pc, params.end_pc);
+
+  params.enable_reg_mapping = true;
+  MachineCode cached_code;
+  auto [cached_success, cached_stop_pc] = TryLiteTranslateRegion(start_pc, &cached_code, params);
+  ASSERT_TRUE(cached_success);
+  ASSERT_EQ(cached_stop_pc, params.end_pc);
+
+  auto count_vector_loads = [](const MachineCode& code) {
+    size_t count = 0;
+    for (size_t offset = 0; offset < code.install_size(); offset += sizeof(uint32_t)) {
+      uint32_t insn = *code.AddrAs<const uint32_t>(offset);
+      if ((insn & 0xffc0'0000u) == 0x2c00'0000u) {
+        ++count;
+      }
+    }
+    return count;
+  };
+  EXPECT_EQ(count_vector_loads(uncached_code), 10u);
+  EXPECT_EQ(count_vector_loads(cached_code), 2u);
+
+  ThreadState state{};
+  state.cpu.v[0] = MakeUint128(0x0706'0504'0302'0100, 0x0f0e'0d0c'0b0a'0908);
+  state.cpu.v[1] = MakeUint128(0x1716'1514'1312'1110, 0x1f1e'1d1c'1b1a'1918);
+  const __uint128_t expected =
+      MakeUint128(0x0e0d'0c0b'0a09'0807, 0x1615'1413'1211'100f);
+  ScopedExecRegion exec(&cached_code);
+  SetInsnAddr(state.cpu, start_pc);
+  SetResidence(state, kOutsideGeneratedCode);
+  berberis_RunGeneratedCode(&state, AsHostCode(exec.GetHostCodeAddr()));
+  for (uint32_t reg = 2; reg <= 6; ++reg) {
+    EXPECT_EQ(state.cpu.v[reg], expected) << reg;
+  }
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteTbl16BMatchesInterpreterWithAliasedIndex) {
   // FFmpeg HEVC hot path: tbl v19.16b, {v8.16b-v11.16b}, v19.16b.
   // Vd == Vm is intentional and verifies that translation consumes every

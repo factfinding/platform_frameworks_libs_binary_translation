@@ -2760,42 +2760,27 @@ class LiteTranslator {
       return false;
     }
 
-    // Load every source before writing Vd so Vd may alias either input.  EXT
-    // extracts from the 16/32-byte concatenation Vn:Vm at a constant byte
-    // offset; lowering the two 64-bit output chunks avoids a memory helper and
-    // works on hosts with or without LSX enabled at runtime.
-    as_.LdD(Assembler::t0, Assembler::s8, VOffset(rn));
-    as_.LdD(Assembler::t1, Assembler::s8, VOffset(rn) + 8);
-    as_.LdD(Assembler::t2, Assembler::s8, VOffset(rm));
-    as_.LdD(Assembler::t3, Assembler::s8, VOffset(rm) + 8);
-    const std::array<Register, 4> chunks = {
-        Assembler::t0, Assembler::t1, Assembler::t2, Assembler::t3};
-    const uint32_t chunk = byte_offset / 8;
-    const uint32_t shift = (byte_offset & 7) * 8;
-
-    if (shift == 0) {
-      as_.Move(Assembler::t4, chunks[chunk]);
-    } else {
-      as_.SrliD(Assembler::t4, chunks[chunk], shift);
-      // The 8-byte form concatenates Vn.low64:Vm.low64 rather than using
-      // Vn.high64 as the second chunk.
-      const Register next_chunk = is_128_bit ? chunks[chunk + 1] : Assembler::t2;
-      as_.SlliD(Assembler::t6, next_chunk, 64 - shift);
-      as_.Or(Assembler::t4, Assembler::t4, Assembler::t6);
-    }
+    LoadV(rn, Assembler::vr1);
+    LoadV(rm, Assembler::vr2);
     if (is_128_bit) {
-      if (shift == 0) {
-        as_.Move(Assembler::t5, chunks[chunk + 1]);
+      if (byte_offset == 0) {
+        as_.VorV(Assembler::vr0, Assembler::vr1, Assembler::vr1);
       } else {
-        as_.SrliD(Assembler::t5, chunks[chunk + 1], shift);
-        as_.SlliD(Assembler::t6, chunks[chunk + 2], 64 - shift);
-        as_.Or(Assembler::t5, Assembler::t5, Assembler::t6);
+        as_.VbsrlV(Assembler::vr0, Assembler::vr1, byte_offset);
+        as_.VbsllV(Assembler::vr3, Assembler::vr2, 16 - byte_offset);
+        as_.VorV(Assembler::vr0, Assembler::vr0, Assembler::vr3);
       }
-      as_.StD(Assembler::t5, Assembler::s8, VOffset(rd) + 8);
     } else {
-      as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
+      // The 8-byte form concatenates only the low 64-bit lanes.  VPICKEV.D
+      // creates [Vn.low64, Vm.low64], then a final pick clears the upper half.
+      as_.VpickevD(Assembler::vr0, Assembler::vr2, Assembler::vr1);
+      if (byte_offset != 0) {
+        as_.VbsrlV(Assembler::vr0, Assembler::vr0, byte_offset);
+      }
+      as_.VxorV(Assembler::vr3, Assembler::vr3, Assembler::vr3);
+      as_.VpickevD(Assembler::vr0, Assembler::vr3, Assembler::vr0);
     }
-    as_.StD(Assembler::t4, Assembler::s8, VOffset(rd));
+    StoreV(rd, Assembler::vr0);
     return true;
   }
 

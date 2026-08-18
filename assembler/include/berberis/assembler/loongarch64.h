@@ -376,6 +376,10 @@ class Assembler : public AssemblerBase {
     CHECK_LT(bytes, 16u);
     Emit32(0x728e'8000 | (bytes << 10) | EncodeVj(vj) | EncodeVd(vd));
   }
+  void VbsllV(SimdRegister vd, SimdRegister vj, uint32_t bytes) {
+    CHECK_LT(bytes, 16u);
+    Emit32(0x728e'0000 | (bytes << 10) | EncodeVj(vj) | EncodeVd(vd));
+  }
   void VsllwilWH(SimdRegister vd, SimdRegister vj, uint32_t shift) {
     CHECK_LT(shift, 16u);
     Emit32(0x7308'4000 | (shift << 10) | EncodeVj(vj) | EncodeVd(vd));
