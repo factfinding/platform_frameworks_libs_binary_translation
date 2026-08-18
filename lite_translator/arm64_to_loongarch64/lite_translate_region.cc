@@ -413,10 +413,10 @@ class LiteTranslator {
     if ((insn & 0xffc0'9c00u) == 0x4e00'0000u) {
       return TranslateTbl16B(insn);
     }
-    if ((insn & 0xffe0'fc00u) == 0x4e20'1c00u) {
+    if ((insn & 0xbfe0'fc00u) == 0x0e20'1c00u) {
       return TranslateVectorLogical(insn, 0);
     }
-    if ((insn & 0xffe0'fc00u) == 0x4ea0'1c00u) {
+    if ((insn & 0xbfe0'fc00u) == 0x0ea0'1c00u) {
       return TranslateVectorLogical(insn, 1);
     }
     // EOR Vd.{8B,16B}, Vn.{8B,16B}, Vm.{8B,16B}.  Resource verification in
@@ -2888,24 +2888,19 @@ class LiteTranslator {
     uint32_t rm = (insn >> 16) & 31;
     uint32_t rn = (insn >> 5) & 31;
     uint32_t rd = insn & 31;
-    as_.LdD(Assembler::t0, Assembler::s8, VOffset(rn));
-    as_.LdD(Assembler::t1, Assembler::s8, VOffset(rn) + 8);
-    as_.LdD(Assembler::t2, Assembler::s8, VOffset(rm));
-    as_.LdD(Assembler::t3, Assembler::s8, VOffset(rm) + 8);
+    LoadV(rn, Assembler::vr1);
+    LoadV(rm, Assembler::vr2);
     if (operation == 0) {
-      as_.And(Assembler::t0, Assembler::t0, Assembler::t2);
-      as_.And(Assembler::t1, Assembler::t1, Assembler::t3);
+      as_.VandV(Assembler::vr0, Assembler::vr1, Assembler::vr2);
     } else if (operation == 1) {
-      as_.Or(Assembler::t0, Assembler::t0, Assembler::t2);
-      as_.Or(Assembler::t1, Assembler::t1, Assembler::t3);
+      as_.VorV(Assembler::vr0, Assembler::vr1, Assembler::vr2);
     } else {
-      as_.Xor(Assembler::t0, Assembler::t0, Assembler::t2);
-      as_.Xor(Assembler::t1, Assembler::t1, Assembler::t3);
+      as_.VxorV(Assembler::vr0, Assembler::vr1, Assembler::vr2);
     }
-    as_.StD(Assembler::t0, Assembler::s8, VOffset(rd));
-    if (is_128_bit) {
-      as_.StD(Assembler::t1, Assembler::s8, VOffset(rd) + 8);
-    } else {
+    StoreV(rd, Assembler::vr0);
+    if (!is_128_bit) {
+      // Every 64-bit AdvSIMD write clears the destination's upper half.  Rd
+      // is excluded from the read-only SIMD cache by region analysis.
       as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
     }
     return true;

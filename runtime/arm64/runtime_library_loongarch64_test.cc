@@ -1513,9 +1513,18 @@ TEST(LoongArch64RuntimeLibraryTest, LiteVectorRev64MatchesInterpreter) {
   }
 }
 
-TEST(LoongArch64RuntimeLibraryTest, LiteVectorEorMatchesInterpreter) {
-  // Exercise both vector widths and destination aliasing with either source.
-  constexpr std::array<uint32_t, 4> kGuestCode = {
+TEST(LoongArch64RuntimeLibraryTest, LiteVectorLogicalMatchesInterpreter) {
+  // Exercise all logical operations, both vector widths, and destination
+  // aliasing with either source.
+  constexpr std::array<uint32_t, 12> kGuestCode = {
+      0x0e22'1c20,  // and v0.8b, v1.8b, v2.8b
+      0x4e22'1c20,  // and v0.16b, v1.16b, v2.16b
+      0x0e22'1c21,  // and v1.8b, v1.8b, v2.8b
+      0x4e22'1c22,  // and v2.16b, v1.16b, v2.16b
+      0x0ea2'1c20,  // orr v0.8b, v1.8b, v2.8b
+      0x4ea2'1c20,  // orr v0.16b, v1.16b, v2.16b
+      0x0ea2'1c21,  // orr v1.8b, v1.8b, v2.8b
+      0x4ea2'1c22,  // orr v2.16b, v1.16b, v2.16b
       0x2e22'1c20,  // eor v0.8b, v1.8b, v2.8b
       0x6e22'1c20,  // eor v0.16b, v1.16b, v2.16b
       0x2e22'1c21,  // eor v1.8b, v1.8b, v2.8b
@@ -1537,6 +1546,59 @@ TEST(LoongArch64RuntimeLibraryTest, LiteVectorEorMatchesInterpreter) {
     const uint32_t rd = insn & 31;
     SCOPED_TRACE(testing::Message() << "insn=" << std::hex << insn);
     EXPECT_EQ(translated.cpu.v[rd], interpreted.cpu.v[rd]);
+  }
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteVectorLogicalUsesSourceCache) {
+  constexpr std::array<uint32_t, 5> kGuestCode = {
+      0x6e27'1c22,  // eor v2.16b, v1.16b, v7.16b
+      0x6e27'1c23,  // eor v3.16b, v1.16b, v7.16b
+      0x6e27'1c24,  // eor v4.16b, v1.16b, v7.16b
+      0x6e27'1c25,  // eor v5.16b, v1.16b, v7.16b
+      0x6e27'1c26,  // eor v6.16b, v1.16b, v7.16b
+  };
+  InitHostEntries();
+  GuestAddr start_pc = ToGuestAddr(kGuestCode.data());
+
+  LiteTranslateParams params;
+  params.end_pc = start_pc + sizeof(kGuestCode);
+  params.allow_dispatch = false;
+  params.enable_reg_mapping = false;
+  MachineCode uncached_code;
+  auto [uncached_success, uncached_stop_pc] =
+      TryLiteTranslateRegion(start_pc, &uncached_code, params);
+  ASSERT_TRUE(uncached_success);
+  ASSERT_EQ(uncached_stop_pc, params.end_pc);
+
+  params.enable_reg_mapping = true;
+  MachineCode cached_code;
+  auto [cached_success, cached_stop_pc] = TryLiteTranslateRegion(start_pc, &cached_code, params);
+  ASSERT_TRUE(cached_success);
+  ASSERT_EQ(cached_stop_pc, params.end_pc);
+
+  auto count_vector_loads = [](const MachineCode& code) {
+    size_t count = 0;
+    for (size_t offset = 0; offset < code.install_size(); offset += sizeof(uint32_t)) {
+      uint32_t insn = *code.AddrAs<const uint32_t>(offset);
+      if ((insn & 0xffc0'0000u) == 0x2c00'0000u) {
+        ++count;
+      }
+    }
+    return count;
+  };
+  EXPECT_EQ(count_vector_loads(uncached_code), 10u);
+  EXPECT_EQ(count_vector_loads(cached_code), 2u);
+
+  ThreadState state{};
+  state.cpu.v[1] = MakeUint128(0x0123'4567'89ab'cdef, 0xfedc'ba98'7654'3210);
+  state.cpu.v[7] = MakeUint128(0xf0f0'0f0f'55aa'aa55, 0x0ff0'f00f'a5a5'5a5a);
+  const __uint128_t expected = state.cpu.v[1] ^ state.cpu.v[7];
+  ScopedExecRegion exec(&cached_code);
+  SetInsnAddr(state.cpu, start_pc);
+  SetResidence(state, kOutsideGeneratedCode);
+  berberis_RunGeneratedCode(&state, AsHostCode(exec.GetHostCodeAddr()));
+  for (uint32_t reg = 2; reg <= 6; ++reg) {
+    EXPECT_EQ(state.cpu.v[reg], expected) << reg;
   }
 }
 

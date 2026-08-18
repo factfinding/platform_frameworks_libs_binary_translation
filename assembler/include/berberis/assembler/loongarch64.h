@@ -345,6 +345,9 @@ class Assembler : public AssemblerBase {
   void VfmaddS(SimdRegister vd, SimdRegister vj, SimdRegister vk, SimdRegister va) {
     Emit32(0x0910'0000 | EncodeVa(va) | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
   }
+  void VandV(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
+    Emit32(0x7126'0000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
+  }
   void VxorV(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
     Emit32(0x7127'0000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
   }
