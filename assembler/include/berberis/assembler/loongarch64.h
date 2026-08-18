@@ -390,6 +390,12 @@ class Assembler : public AssemblerBase {
   void Vreplgr2vrW(SimdRegister vd, Register rj) {
     Emit32(0x729f'0800 | EncodeRj(rj) | EncodeVd(vd));
   }
+  void Vreplgr2vrB(SimdRegister vd, Register rj) {
+    Emit32(0x729f'0000 | EncodeRj(rj) | EncodeVd(vd));
+  }
+  void Vreplgr2vrD(SimdRegister vd, Register rj) {
+    Emit32(0x729f'0c00 | EncodeRj(rj) | EncodeVd(vd));
+  }
   void VreplveiW(SimdRegister vd, SimdRegister vj, uint32_t index) {
     CHECK_LT(index, 4u);
     Emit32(0x72f7'e000 | (index << 10) | EncodeVj(vj) | EncodeVd(vd));

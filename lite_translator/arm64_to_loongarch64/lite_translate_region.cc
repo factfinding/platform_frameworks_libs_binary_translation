@@ -90,6 +90,15 @@ CachedVRegisterMap SelectCachedVRegisters(GuestAddr start_pc, GuestAddr end_pc) 
   for (GuestAddr pc = start_pc; pc < end_pc; pc += sizeof(uint32_t)) {
     uint32_t insn = *ToHostAddr<const uint32_t>(pc);
 
+    // FABS Vd.4S, Vn.4S is unary.  Its bits 20:16 are part of the opcode, not
+    // Rm; handling it before the conservative SIMD rule avoids loading a
+    // phantom v0 into the region cache.
+    if ((insn & 0xffff'fc00u) == 0x4ea0'f800u) {
+      mark_written(insn);
+      mark_read(insn >> 5);
+      continue;
+    }
+
     // SIMD and scalar floating-point data-processing instructions use Rd in
     // bits 4:0.  Count the possible source fields conservatively; false
     // positives only waste a cache slot, while every possible destination is
@@ -2659,19 +2668,15 @@ class LiteTranslator {
     uint32_t rn = (insn >> 5) & 31;
     uint32_t rd = insn & 31;
     LoadXOrZero(rn, Assembler::t0);
-    as_.Li(Assembler::t1, 0xff);
-    as_.And(Assembler::t0, Assembler::t0, Assembler::t1);
-    as_.Li(Assembler::t1, 0x0101'0101'0101'0101ULL);
-    as_.MulD(Assembler::t0, Assembler::t0, Assembler::t1);
-    as_.StD(Assembler::t0, Assembler::s8, VOffset(rd));
-    as_.StD(Assembler::t0, Assembler::s8, VOffset(rd) + 8);
+    as_.Vreplgr2vrB(Assembler::vr0, Assembler::t0);
+    StoreV(rd, Assembler::vr0);
     return true;
   }
 
   bool TranslateMovi2DZero(uint32_t insn) {
     uint32_t rd = insn & 31;
-    as_.StD(Assembler::zero, Assembler::s8, VOffset(rd));
-    as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
+    as_.VxorV(Assembler::vr0, Assembler::vr0, Assembler::vr0);
+    StoreV(rd, Assembler::vr0);
     return true;
   }
 
@@ -2740,8 +2745,8 @@ class LiteTranslator {
     uint32_t rn = (insn >> 5) & 31;
     uint32_t rd = insn & 31;
     LoadXOrZero(rn, Assembler::t0);
-    as_.StD(Assembler::t0, Assembler::s8, VOffset(rd));
-    as_.StD(Assembler::t0, Assembler::s8, VOffset(rd) + 8);
+    as_.Vreplgr2vrD(Assembler::vr0, Assembler::t0);
+    StoreV(rd, Assembler::vr0);
     return true;
   }
 
@@ -3078,14 +3083,11 @@ class LiteTranslator {
   bool TranslateFabs4S(uint32_t insn) {
     uint32_t rn = (insn >> 5) & 31;
     uint32_t rd = insn & 31;
-    constexpr uint64_t kClearFloatSign = 0x7fff'ffff'7fff'ffffULL;
-    as_.LdD(Assembler::t0, Assembler::s8, VOffset(rn));
-    as_.LdD(Assembler::t1, Assembler::s8, VOffset(rn) + 8);
-    as_.Li(Assembler::t2, kClearFloatSign);
-    as_.And(Assembler::t0, Assembler::t0, Assembler::t2);
-    as_.And(Assembler::t1, Assembler::t1, Assembler::t2);
-    as_.StD(Assembler::t0, Assembler::s8, VOffset(rd));
-    as_.StD(Assembler::t1, Assembler::s8, VOffset(rd) + 8);
+    LoadV(rn, Assembler::vr1);
+    as_.Li(Assembler::t0, 0x7fff'ffffu);
+    as_.Vreplgr2vrW(Assembler::vr2, Assembler::t0);
+    as_.VandV(Assembler::vr0, Assembler::vr1, Assembler::vr2);
+    StoreV(rd, Assembler::vr0);
     return true;
   }
 
@@ -3171,9 +3173,9 @@ class LiteTranslator {
 
   bool TranslateMovi16BOne(uint32_t insn) {
     uint32_t rd = insn & 31;
-    as_.Li(Assembler::t0, 0x0101'0101'0101'0101ULL);
-    as_.StD(Assembler::t0, Assembler::s8, VOffset(rd));
-    as_.StD(Assembler::t0, Assembler::s8, VOffset(rd) + 8);
+    as_.Li(Assembler::t0, 1);
+    as_.Vreplgr2vrB(Assembler::vr0, Assembler::t0);
+    StoreV(rd, Assembler::vr0);
     return true;
   }
 

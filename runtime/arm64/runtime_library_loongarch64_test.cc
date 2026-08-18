@@ -1657,6 +1657,59 @@ TEST(LoongArch64RuntimeLibraryTest, LiteCachesReadOnlyVectorSources) {
   }
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteFabs4SUsesSourceCache) {
+  constexpr std::array<uint32_t, 5> kGuestCode = {
+      0x4ea0'f822,  // fabs v2.4s, v1.4s
+      0x4ea0'f823,  // fabs v3.4s, v1.4s
+      0x4ea0'f824,  // fabs v4.4s, v1.4s
+      0x4ea0'f825,  // fabs v5.4s, v1.4s
+      0x4ea0'f826,  // fabs v6.4s, v1.4s
+  };
+  InitHostEntries();
+  GuestAddr start_pc = ToGuestAddr(kGuestCode.data());
+
+  LiteTranslateParams params;
+  params.end_pc = start_pc + sizeof(kGuestCode);
+  params.allow_dispatch = false;
+  params.enable_reg_mapping = false;
+  MachineCode uncached_code;
+  auto [uncached_success, uncached_stop_pc] =
+      TryLiteTranslateRegion(start_pc, &uncached_code, params);
+  ASSERT_TRUE(uncached_success);
+  ASSERT_EQ(uncached_stop_pc, params.end_pc);
+
+  params.enable_reg_mapping = true;
+  MachineCode cached_code;
+  auto [cached_success, cached_stop_pc] = TryLiteTranslateRegion(start_pc, &cached_code, params);
+  ASSERT_TRUE(cached_success);
+  ASSERT_EQ(cached_stop_pc, params.end_pc);
+
+  auto count_vector_loads = [](const MachineCode& code) {
+    size_t count = 0;
+    for (size_t offset = 0; offset < code.install_size(); offset += sizeof(uint32_t)) {
+      uint32_t insn = *code.AddrAs<const uint32_t>(offset);
+      if ((insn & 0xffc0'0000u) == 0x2c00'0000u) {
+        ++count;
+      }
+    }
+    return count;
+  };
+  EXPECT_EQ(count_vector_loads(uncached_code), 5u);
+  EXPECT_EQ(count_vector_loads(cached_code), 1u);
+
+  ThreadState state{};
+  state.cpu.v[1] = MakeUint32x4(0x8000'0000, 0xffc1'2345, 0xff80'0000, 0xc049'0fdb);
+  const __uint128_t expected =
+      MakeUint32x4(0x0000'0000, 0x7fc1'2345, 0x7f80'0000, 0x4049'0fdb);
+  ScopedExecRegion exec(&cached_code);
+  SetInsnAddr(state.cpu, start_pc);
+  SetResidence(state, kOutsideGeneratedCode);
+  berberis_RunGeneratedCode(&state, AsHostCode(exec.GetHostCodeAddr()));
+  for (uint32_t reg = 2; reg <= 6; ++reg) {
+    EXPECT_EQ(state.cpu.v[reg], expected) << reg;
+  }
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteVectorCacheObservesLd1rWrites) {
   // LD1R writes v1 before the repeated FMUL sources read it.  Structure-load
   // destinations must therefore be excluded from the region's vector cache.
