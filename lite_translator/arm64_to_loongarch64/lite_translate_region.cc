@@ -3110,64 +3110,23 @@ class LiteTranslator {
     const uint32_t rm = (insn >> 16) & 31;
     const uint32_t rn = (insn >> 5) & 31;
     const uint32_t rd = insn & 31;
-    const Register outputs[4] = {Assembler::t0, Assembler::t1, Assembler::t2, Assembler::t3};
-    uint32_t source_regs[4];
-    uint32_t source_lanes[4];
-
+    LoadV(rn, Assembler::vr1);
+    LoadV(rm, Assembler::vr2);
+    // LSX binary lane-selection instructions place Vk lanes before Vj lanes,
+    // so pass (Vm, Vn) to preserve ARM's Vn-then-Vm result ordering.
     if (operation == 0) {  // UZP1: n[0], n[2], m[0], m[2]
-      source_regs[0] = rn;
-      source_lanes[0] = 0;
-      source_regs[1] = rn;
-      source_lanes[1] = 2;
-      source_regs[2] = rm;
-      source_lanes[2] = 0;
-      source_regs[3] = rm;
-      source_lanes[3] = 2;
+      as_.VpickevW(Assembler::vr0, Assembler::vr2, Assembler::vr1);
     } else if (operation == 1) {  // ZIP2: n[2], m[2], n[3], m[3]
-      source_regs[0] = rn;
-      source_lanes[0] = 2;
-      source_regs[1] = rm;
-      source_lanes[1] = 2;
-      source_regs[2] = rn;
-      source_lanes[2] = 3;
-      source_regs[3] = rm;
-      source_lanes[3] = 3;
+      as_.VilvhW(Assembler::vr0, Assembler::vr2, Assembler::vr1);
     } else if (operation == 2) {  // TRN1: n[0], m[0], n[2], m[2]
-      source_regs[0] = rn;
-      source_lanes[0] = 0;
-      source_regs[1] = rm;
-      source_lanes[1] = 0;
-      source_regs[2] = rn;
-      source_lanes[2] = 2;
-      source_regs[3] = rm;
-      source_lanes[3] = 2;
+      as_.VpickevW(Assembler::vr0, Assembler::vr2, Assembler::vr1);
+      as_.Vshuf4iW(Assembler::vr0, Assembler::vr0, 0xd8);
     } else if (operation == 3) {  // UZP2: n[1], n[3], m[1], m[3]
-      source_regs[0] = rn;
-      source_lanes[0] = 1;
-      source_regs[1] = rn;
-      source_lanes[1] = 3;
-      source_regs[2] = rm;
-      source_lanes[2] = 1;
-      source_regs[3] = rm;
-      source_lanes[3] = 3;
+      as_.VpickodW(Assembler::vr0, Assembler::vr2, Assembler::vr1);
     } else {  // ZIP1: n[0], m[0], n[1], m[1]
-      source_regs[0] = rn;
-      source_lanes[0] = 0;
-      source_regs[1] = rm;
-      source_lanes[1] = 0;
-      source_regs[2] = rn;
-      source_lanes[2] = 1;
-      source_regs[3] = rm;
-      source_lanes[3] = 1;
+      as_.VilvlW(Assembler::vr0, Assembler::vr2, Assembler::vr1);
     }
-    for (size_t lane = 0; lane < 4; ++lane) {
-      as_.LdWU(outputs[lane],
-               Assembler::s8,
-               VOffset(source_regs[lane]) + static_cast<int32_t>(source_lanes[lane] * 4));
-    }
-    for (size_t lane = 0; lane < 4; ++lane) {
-      as_.StW(outputs[lane], Assembler::s8, VOffset(rd) + static_cast<int32_t>(lane * 4));
-    }
+    StoreV(rd, Assembler::vr0);
     return true;
   }
 

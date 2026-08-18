@@ -1710,6 +1710,60 @@ TEST(LoongArch64RuntimeLibraryTest, LiteFabs4SUsesSourceCache) {
   }
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LitePermute4SUsesSourceCache) {
+  constexpr std::array<uint32_t, 5> kGuestCode = {
+      0x4e81'3802,  // zip1 v2.4s, v0.4s, v1.4s
+      0x4e81'3803,  // zip1 v3.4s, v0.4s, v1.4s
+      0x4e81'3804,  // zip1 v4.4s, v0.4s, v1.4s
+      0x4e81'3805,  // zip1 v5.4s, v0.4s, v1.4s
+      0x4e81'3806,  // zip1 v6.4s, v0.4s, v1.4s
+  };
+  InitHostEntries();
+  GuestAddr start_pc = ToGuestAddr(kGuestCode.data());
+
+  LiteTranslateParams params;
+  params.end_pc = start_pc + sizeof(kGuestCode);
+  params.allow_dispatch = false;
+  params.enable_reg_mapping = false;
+  MachineCode uncached_code;
+  auto [uncached_success, uncached_stop_pc] =
+      TryLiteTranslateRegion(start_pc, &uncached_code, params);
+  ASSERT_TRUE(uncached_success);
+  ASSERT_EQ(uncached_stop_pc, params.end_pc);
+
+  params.enable_reg_mapping = true;
+  MachineCode cached_code;
+  auto [cached_success, cached_stop_pc] = TryLiteTranslateRegion(start_pc, &cached_code, params);
+  ASSERT_TRUE(cached_success);
+  ASSERT_EQ(cached_stop_pc, params.end_pc);
+
+  auto count_vector_loads = [](const MachineCode& code) {
+    size_t count = 0;
+    for (size_t offset = 0; offset < code.install_size(); offset += sizeof(uint32_t)) {
+      uint32_t insn = *code.AddrAs<const uint32_t>(offset);
+      if ((insn & 0xffc0'0000u) == 0x2c00'0000u) {
+        ++count;
+      }
+    }
+    return count;
+  };
+  EXPECT_EQ(count_vector_loads(uncached_code), 10u);
+  EXPECT_EQ(count_vector_loads(cached_code), 2u);
+
+  ThreadState state{};
+  state.cpu.v[0] = MakeUint32x4(0x0000'0000, 0x1111'1111, 0x2222'2222, 0x3333'3333);
+  state.cpu.v[1] = MakeUint32x4(0xaaaa'aaaa, 0xbbbb'bbbb, 0xcccc'cccc, 0xdddd'dddd);
+  const __uint128_t expected =
+      MakeUint32x4(0x0000'0000, 0xaaaa'aaaa, 0x1111'1111, 0xbbbb'bbbb);
+  ScopedExecRegion exec(&cached_code);
+  SetInsnAddr(state.cpu, start_pc);
+  SetResidence(state, kOutsideGeneratedCode);
+  berberis_RunGeneratedCode(&state, AsHostCode(exec.GetHostCodeAddr()));
+  for (uint32_t reg = 2; reg <= 6; ++reg) {
+    EXPECT_EQ(state.cpu.v[reg], expected) << reg;
+  }
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteVectorCacheObservesLd1rWrites) {
   // LD1R writes v1 before the repeated FMUL sources read it.  Structure-load
   // destinations must therefore be excluded from the region's vector cache.

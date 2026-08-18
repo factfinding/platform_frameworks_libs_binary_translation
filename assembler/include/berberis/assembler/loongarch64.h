@@ -387,6 +387,18 @@ class Assembler : public AssemblerBase {
   void VpickevD(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
     Emit32(0x711f'8000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
   }
+  void VpickevW(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
+    Emit32(0x711f'0000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
+  }
+  void VpickodW(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
+    Emit32(0x7121'0000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
+  }
+  void VilvlW(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
+    Emit32(0x711b'0000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
+  }
+  void VilvhW(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
+    Emit32(0x711d'0000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
+  }
   void Vreplgr2vrW(SimdRegister vd, Register rj) {
     Emit32(0x729f'0800 | EncodeRj(rj) | EncodeVd(vd));
   }

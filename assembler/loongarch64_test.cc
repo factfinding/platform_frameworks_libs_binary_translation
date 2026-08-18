@@ -327,6 +327,10 @@ TEST(LoongArch64AssemblerTest, EncodesLsxFloatingPointInstructions) {
   assembler.VsllwilWH(Assembler::vr2, Assembler::vr3, 15);
   assembler.VssrarniHW(Assembler::vr0, Assembler::vr1, 12);
   assembler.VpickevD(Assembler::vr3, Assembler::vr4, Assembler::vr5);
+  assembler.VilvlW(Assembler::vr0, Assembler::vr1, Assembler::vr2);
+  assembler.VilvhW(Assembler::vr3, Assembler::vr4, Assembler::vr5);
+  assembler.VpickevW(Assembler::vr6, Assembler::vr7, Assembler::vr8);
+  assembler.VpickodW(Assembler::vr0, Assembler::vr1, Assembler::vr2);
   assembler.Vreplgr2vrW(Assembler::vr1, Assembler::t0);
   assembler.Vreplgr2vrB(Assembler::vr1, Assembler::t0);
   assembler.Vreplgr2vrD(Assembler::vr2, Assembler::t1);
@@ -334,7 +338,7 @@ TEST(LoongArch64AssemblerTest, EncodesLsxFloatingPointInstructions) {
   assembler.VreplveiW(Assembler::vr4, Assembler::vr5, 3);
 
   // Generated independently with LLVM's LoongArch assembler and -mlsx.
-  constexpr std::array<uint32_t, 42> kExpected = {
+  constexpr std::array<uint32_t, 46> kExpected = {
       0x2c00'03e0, 0x2c40'43e1, 0x7138'9062, 0x7139'1062, 0x7130'9062, 0x7131'1062,
       0x7132'9062, 0x7133'1062, 0x713a'9062, 0x713b'1062, 0x729e'0462, 0x0104'9062,
       0x0105'1062,
@@ -342,8 +346,9 @@ TEST(LoongArch64AssemblerTest, EncodesLsxFloatingPointInstructions) {
       0x011a'8420, 0x0114'b40c, 0x0114'a5a1, 0x0c14'0820, 0x0c12'1060, 0x0c11'18a0,
       0x0114'dc0c, 0x0914'1cc5, 0x7127'1cc5, 0x700b'0820, 0x700d'1483, 0x7085'0820,
       0x70a9'1483, 0x70ab'20e6,
-      0x728e'a020, 0x7308'7c62, 0x7368'b020, 0x711f'9483, 0x729f'0981, 0x729f'0181,
-      0x729f'0da2, 0x72f7'e062, 0x72f7'eca4};
+      0x728e'a020, 0x7308'7c62, 0x7368'b020, 0x711f'9483, 0x711b'0820, 0x711d'1483,
+      0x711f'20e6, 0x7121'0820, 0x729f'0981, 0x729f'0181, 0x729f'0da2, 0x72f7'e062,
+      0x72f7'eca4};
   ASSERT_EQ(code.install_size(), sizeof(kExpected));
   for (size_t i = 0; i < kExpected.size(); ++i) {
     EXPECT_EQ(*code.AddrAs<const uint32_t>(i * sizeof(uint32_t)), kExpected[i]) << i;
