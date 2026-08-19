@@ -26,6 +26,35 @@
 namespace berberis::loongarch64 {
 namespace {
 
+TEST(LoongArch64AssemblerTest, EncodesLiteSimdFallbackInstructions) {
+  MachineCode code;
+  Assembler assembler(&code);
+  assembler.VsleBu(Assembler::vr0, Assembler::vr2, Assembler::vr1);
+  assembler.Movgr2frD(Assembler::vr0, Assembler::a0);
+  assembler.FfintSW(Assembler::vr0, Assembler::vr1);
+  assembler.FfintSL(Assembler::vr0, Assembler::vr1);
+  assembler.FfintDW(Assembler::vr0, Assembler::vr1);
+  assembler.FfintDL(Assembler::vr0, Assembler::vr1);
+  assembler.VsllwilWuHu(Assembler::vr0, Assembler::vr1, 0);
+  assembler.VsllwilWuHu(Assembler::vr2, Assembler::vr3, 15);
+
+  // Generated independently with LLVM 21's LoongArch assembler and LSX.
+  constexpr std::array<uint32_t, 8> kExpected = {
+      0x7004'0440,
+      0x0114'a880,
+      0x011d'1020,
+      0x011d'1820,
+      0x011d'2020,
+      0x011d'2820,
+      0x730c'4020,
+      0x730c'7c62,
+  };
+  ASSERT_EQ(code.install_size(), sizeof(kExpected));
+  for (size_t i = 0; i < kExpected.size(); ++i) {
+    EXPECT_EQ(*code.AddrAs<const uint32_t>(i * sizeof(uint32_t)), kExpected[i]) << i;
+  }
+}
+
 TEST(LoongArch64AssemblerTest, EncodesBootstrapInstructions) {
   MachineCode code;
   Assembler assembler(&code);

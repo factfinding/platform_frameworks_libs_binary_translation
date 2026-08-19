@@ -106,6 +106,30 @@ CachedVRegisterMap SelectCachedVRegisters(GuestAddr start_pc, GuestAddr end_pc) 
       continue;
     }
 
+    // Scalar FMUL by element splits Vm across bit 20 and bits 19:16.  Decode
+    // that source explicitly rather than treating the lane bits as a vector
+    // register number.
+    if ((insn & 0xffc0'f400u) == 0x5f80'9000u) {
+      mark_written(insn);
+      mark_read(insn >> 5);
+      mark_read((((insn >> 20) & 1) << 4) | ((insn >> 16) & 15));
+      continue;
+    }
+
+    // Unary narrowing/widening and scalar vector conversion have only Vn as
+    // a vector source.  The general-register SCVTF forms have none.
+    if ((insn & 0xffff'fc00u) == 0x5e21'd800u ||
+        ((insn & 0xff80'fc00u) == 0x2f00'a400u && (((insn >> 19) & 0xeu) == 0x2u)) ||
+        (insn & 0xffff'fc00u) == 0x0e61'2800u) {
+      mark_written(insn);
+      mark_read(insn >> 5);
+      continue;
+    }
+    if ((insn & 0x7fbf'fc00u) == 0x1e22'0000u) {
+      mark_written(insn);
+      continue;
+    }
+
     // SIMD and scalar floating-point data-processing instructions use Rd in
     // bits 4:0.  Count the possible source fields conservatively; false
     // positives only waste a cache slot, while every possible destination is
@@ -501,6 +525,14 @@ class LiteTranslator {
     if ((insn & 0xbf80'fc00u) == 0x0f00'a400u && (((insn >> 19) & 0xeu) == 0x2u)) {
       return TranslateSshll4S(insn);
     }
+    // USHLL Vd.4S, Vn.4H, #shift.  The unsigned LSX widening shift has the
+    // same low-half source selection and zero-extension semantics.
+    if ((insn & 0xff80'fc00u) == 0x2f00'a400u && (((insn >> 19) & 0xeu) == 0x2u)) {
+      return TranslateUshll4S(insn);
+    }
+    if ((insn & 0xffff'fc00u) == 0x0e61'2800u) {
+      return TranslateXtn4H(insn);
+    }
     // SQRSHRN/SQRSHRN2 Vd.4H/8H, Vn.4S, #shift.  LSX performs the same
     // rounding signed-saturating narrow; the Q form additionally preserves
     // Vd's low 64 bits and inserts the narrowed lanes into the high half.
@@ -618,8 +650,17 @@ class LiteTranslator {
     if ((insn & 0xffe0'fc00u) == 0x6e20'8c00u) {
       return TranslateCmeq16B(insn);
     }
+    if ((insn & 0xffe0'fc00u) == 0x6e20'3c00u) {
+      return TranslateCmhs16B(insn);
+    }
     if ((insn & 0xffff'fc00u) == 0x4e21'd800u) {
       return TranslateScvtf4S(insn);
+    }
+    if ((insn & 0xffff'fc00u) == 0x5e21'd800u) {
+      return TranslateScvtfScalarVector(insn);
+    }
+    if ((insn & 0x7fbf'fc00u) == 0x1e22'0000u) {
+      return TranslateScvtfScalarGeneral(insn);
     }
     if ((insn & 0xbf20'fc00u) == 0x2e20'dc00u) {
       return TranslateVectorFpBinary(insn, 0);  // FMUL
@@ -635,6 +676,9 @@ class LiteTranslator {
     }
     if ((insn & 0xffc0'f400u) == 0x4f80'9000u) {
       return TranslateFmul4SByElement(insn);
+    }
+    if ((insn & 0xffc0'f400u) == 0x5f80'9000u) {
+      return TranslateFmulSByElement(insn);
     }
     if ((insn & 0xffff'fc00u) == 0x1e20'4000u) {
       return TranslateFmovS(insn);
@@ -3207,12 +3251,69 @@ class LiteTranslator {
     return true;
   }
 
+  bool TranslateCmhs16B(uint32_t insn) {
+    const uint32_t rm = (insn >> 16) & 31;
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    LoadV(rn, Assembler::vr1);
+    LoadV(rm, Assembler::vr2);
+    // ARM Vn >= Vm is the unsigned comparison Vm <= Vn.
+    as_.VsleBu(Assembler::vr0, Assembler::vr2, Assembler::vr1);
+    StoreV(rd, Assembler::vr0);
+    return true;
+  }
+
   bool TranslateScvtf4S(uint32_t insn) {
     const uint32_t rn = (insn >> 5) & 31;
     const uint32_t rd = insn & 31;
     LoadV(rn, Assembler::vr1);
     as_.VffintSW(Assembler::vr0, Assembler::vr1);
     StoreV(rd, Assembler::vr0);
+    return true;
+  }
+
+  bool TranslateScvtfScalarVector(uint32_t insn) {
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    as_.LdWU(Assembler::t0, Assembler::s8, VOffset(rn));
+    as_.Movgr2frW(Assembler::vr0, Assembler::t0);
+    as_.FfintSW(Assembler::vr0, Assembler::vr0);
+    as_.Vst(Assembler::vr0, Assembler::s8, VOffset(rd));
+    as_.StW(Assembler::zero, Assembler::s8, VOffset(rd) + 4);
+    as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
+    return true;
+  }
+
+  bool TranslateScvtfScalarGeneral(uint32_t insn) {
+    const bool source_64 = (insn & (1u << 31)) != 0;
+    const bool destination_double = (insn & (1u << 22)) != 0;
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    LoadXOrZero(rn, Assembler::t0);
+    if (source_64) {
+      as_.Movgr2frD(Assembler::vr0, Assembler::t0);
+      if (destination_double) {
+        as_.FfintDL(Assembler::vr0, Assembler::vr0);
+      } else {
+        as_.FfintSL(Assembler::vr0, Assembler::vr0);
+      }
+    } else {
+      SignExtend32(Assembler::t0);
+      as_.Movgr2frW(Assembler::vr0, Assembler::t0);
+      if (destination_double) {
+        as_.FfintDW(Assembler::vr0, Assembler::vr0);
+      } else {
+        as_.FfintSW(Assembler::vr0, Assembler::vr0);
+      }
+    }
+    if (destination_double) {
+      as_.Vst(Assembler::vr0, Assembler::s8, VOffset(rd));
+      as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
+    } else {
+      as_.Vst(Assembler::vr0, Assembler::s8, VOffset(rd));
+      as_.StW(Assembler::zero, Assembler::s8, VOffset(rd) + 4);
+      as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
+    }
     return true;
   }
 
@@ -3229,6 +3330,31 @@ class LiteTranslator {
     }
     as_.VsllwilWH(Assembler::vr0, Assembler::vr1, shift);
     StoreV(rd, Assembler::vr0);
+    return true;
+  }
+
+  bool TranslateUshll4S(uint32_t insn) {
+    const uint32_t immh_immb = (insn >> 16) & 0x7f;
+    const uint32_t shift = immh_immb - 16;
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    LoadV(rn, Assembler::vr1);
+    as_.VsllwilWuHu(Assembler::vr0, Assembler::vr1, shift);
+    StoreV(rd, Assembler::vr0);
+    return true;
+  }
+
+  bool TranslateXtn4H(uint32_t insn) {
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    // XTN packs the low halfword of each source word into the low 64 bits.
+    // Scalar state accesses are compact enough here and avoid a more costly
+    // LSX cross-lane permutation sequence.
+    for (int32_t lane = 0; lane < 4; ++lane) {
+      as_.LdHU(Assembler::t0, Assembler::s8, VOffset(rn) + lane * 4);
+      as_.StH(Assembler::t0, Assembler::s8, VOffset(rd) + lane * 2);
+    }
+    as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
     return true;
   }
 
@@ -3689,6 +3815,21 @@ class LiteTranslator {
     as_.VreplveiW(Assembler::vr2, Assembler::vr2, index);
     as_.VfmulS(Assembler::vr0, Assembler::vr1, Assembler::vr2);
     StoreV(rd, Assembler::vr0);
+    return true;
+  }
+
+  bool TranslateFmulSByElement(uint32_t insn) {
+    const uint32_t rm = (((insn >> 20) & 1) << 4) | ((insn >> 16) & 15);
+    const uint32_t index = (((insn >> 11) & 1) << 1) | ((insn >> 21) & 1);
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    LoadV(rn, Assembler::vr1);
+    LoadV(rm, Assembler::vr2);
+    as_.VreplveiW(Assembler::vr2, Assembler::vr2, index);
+    as_.FmulS(Assembler::vr0, Assembler::vr1, Assembler::vr2);
+    as_.Vst(Assembler::vr0, Assembler::s8, VOffset(rd));
+    as_.StW(Assembler::zero, Assembler::s8, VOffset(rd) + 4);
+    as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
     return true;
   }
 

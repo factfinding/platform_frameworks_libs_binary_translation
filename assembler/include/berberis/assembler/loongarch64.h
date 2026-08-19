@@ -279,6 +279,9 @@ class Assembler : public AssemblerBase {
   void VffintSW(SimdRegister vd, SimdRegister vj) {
     Emit32(0x729e'0000 | EncodeVj(vj) | EncodeVd(vd));
   }
+  void VsleBu(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
+    Emit32(0x7004'0000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
+  }
   void VfcmpCeqS(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
     Emit32(0x0c52'0000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
   }
@@ -339,6 +342,21 @@ class Assembler : public AssemblerBase {
   void Movgr2frW(SimdRegister fd, Register rj) {
     Emit32(0x0114'a400 | EncodeRj(rj) | EncodeVd(fd));
   }
+  void Movgr2frD(SimdRegister fd, Register rj) {
+    Emit32(0x0114'a800 | EncodeRj(rj) | EncodeVd(fd));
+  }
+  void FfintSW(SimdRegister fd, SimdRegister fj) {
+    Emit32(0x011d'1000 | EncodeVj(fj) | EncodeVd(fd));
+  }
+  void FfintSL(SimdRegister fd, SimdRegister fj) {
+    Emit32(0x011d'1800 | EncodeVj(fj) | EncodeVd(fd));
+  }
+  void FfintDW(SimdRegister fd, SimdRegister fj) {
+    Emit32(0x011d'2000 | EncodeVj(fj) | EncodeVd(fd));
+  }
+  void FfintDL(SimdRegister fd, SimdRegister fj) {
+    Emit32(0x011d'2800 | EncodeVj(fj) | EncodeVd(fd));
+  }
   void FcmpCunS(SimdRegister fj, SimdRegister fk) {
     Emit32(0x0c14'0000 | EncodeVk(fk) | EncodeVj(fj));
   }
@@ -393,6 +411,10 @@ class Assembler : public AssemblerBase {
   void VsllwilWH(SimdRegister vd, SimdRegister vj, uint32_t shift) {
     CHECK_LT(shift, 16u);
     Emit32(0x7308'4000 | (shift << 10) | EncodeVj(vj) | EncodeVd(vd));
+  }
+  void VsllwilWuHu(SimdRegister vd, SimdRegister vj, uint32_t shift) {
+    CHECK_LT(shift, 16u);
+    Emit32(0x730c'4000 | (shift << 10) | EncodeVj(vj) | EncodeVd(vd));
   }
   void VssrarniHW(SimdRegister vd, SimdRegister vj, uint32_t shift) {
     CHECK_LT(shift, 32u);
