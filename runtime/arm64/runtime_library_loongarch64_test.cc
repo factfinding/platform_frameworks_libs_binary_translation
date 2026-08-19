@@ -2392,11 +2392,17 @@ TEST(LoongArch64RuntimeLibraryTest, LiteLdSt1Multiple4SMatchesInterpreter) {
   }
 }
 
-TEST(LoongArch64RuntimeLibraryTest, LiteLdSt1Multiple4SHasRecoveryPoints) {
-  constexpr std::array<uint32_t, 3> kGuestCode = {
+TEST(LoongArch64RuntimeLibraryTest, LiteStructMemoryHasRecoveryPoints) {
+  constexpr std::array<uint32_t, 9> kGuestCode = {
       0x4c40'2820,  // ld1 {v0.4s-v3.4s},[x1]
       0x4c9f'2820,  // st1 {v0.4s-v3.4s},[x1],#64
       0x4c40'0820,  // ld4 {v0.4s-v3.4s},[x1]
+      0x4d40'cd07,  // ld1r {v7.2d},[x8]
+      0x4ddf'c862,  // ld1r {v2.4s},[x3],#4
+      0x0d40'8420,  // ld1 {v0.d}[0],[x1]
+      0x4ddf'8528,  // ld1 {v8.d}[1],[x9],#8
+      0x0d00'84a4,  // st1 {v4.d}[0],[x5]
+      0x4d91'860f,  // st1 {v15.d}[1],[x16],x17
   };
   for (uint32_t insn : kGuestCode) {
     const std::array<uint32_t, 1> one_insn = {insn};
@@ -2409,7 +2415,13 @@ TEST(LoongArch64RuntimeLibraryTest, LiteLdSt1Multiple4SHasRecoveryPoints) {
     ASSERT_TRUE(success);
     EXPECT_EQ(stop_pc, params.end_pc);
     ScopedExecRegion exec(&code);
-    EXPECT_EQ(exec.recovery_map().size(), insn == 0x4c40'0820 ? 4u : 8u);
+    size_t expected_recovery_points = 1;
+    if (insn == 0x4c40'2820 || insn == 0x4c9f'2820) {
+      expected_recovery_points = 8;
+    } else if (insn == 0x4c40'0820) {
+      expected_recovery_points = 4;
+    }
+    EXPECT_EQ(exec.recovery_map().size(), expected_recovery_points);
   }
 }
 
@@ -3002,35 +3014,45 @@ TEST(LoongArch64RuntimeLibraryTest, LiteUcvtf4SMatchesInterpreter) {
   }
 }
 
-TEST(LoongArch64RuntimeLibraryTest, UnityInsGeneralToLiteVectorHandoffMatchesInterpreter) {
+TEST(LoongArch64RuntimeLibraryTest, LiteInsSFromGeneralMatchesInterpreter) {
+  constexpr std::array<uint32_t, 5> kGuestCode = {
+      0x4e04'1c20,  // mov v0.s[0],w1
+      0x4e0c'1c62,  // mov v2.s[1],w3
+      0x4e14'1ca4,  // mov v4.s[2],w5
+      0x4e1c'1ce6,  // mov v6.s[3],w7
+      0x4e1c'1fe8,  // mov v8.s[3],wzr
+  };
+  for (uint32_t insn : kGuestCode) {
+    const std::array<uint32_t, 1> one_insn = {insn};
+    ThreadState interpreted{};
+    ThreadState translated{};
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    interpreted.cpu.x[rn] = 0xfeed'face'1234'5678;
+    interpreted.cpu.v[rd] = MakeUint128(0x0123'4567'89ab'cdef, 0xfedc'ba98'7654'3210);
+    translated.cpu = interpreted.cpu;
+    SetInsnAddr(interpreted.cpu, ToGuestAddr(one_insn.data()));
+    InterpretInsn(&interpreted);
+    TranslateAndRun(one_insn, &translated);
+    SCOPED_TRACE(testing::Message() << "insn=" << std::hex << insn);
+    EXPECT_EQ(translated.cpu.v[rd], interpreted.cpu.v[rd]);
+  }
+}
+
+TEST(LoongArch64RuntimeLibraryTest, UnityInsGeneralSequenceMatchesInterpreter) {
   // Real libunity sequence observed immediately after LD1R during the original
-  // rendering-corruption diagnosis.
-  // INS (general) is intentionally interpreter-only; verify that handing its
-  // partially constructed vector to the Lite AND/UCVTF/FMUL chain preserves
-  // all lanes exactly.
-  constexpr std::array<uint32_t, 4> kInterpretedPrefix = {
+  // rendering-corruption diagnosis.  The whole sequence, including its
+  // partial general-register-to-vector lane writes, must now stay in Lite JIT.
+  constexpr std::array<uint32_t, 9> kFullSequence = {
       0x4e04'0ff2,  // dup v18.4s,wzr
       0x4e04'1ef2,  // mov v18.s[0],w23
       0x4e0c'1f12,  // mov v18.s[1],w24
       0x4e14'1ed2,  // mov v18.s[2],w22
-  };
-  constexpr std::array<uint32_t, 5> kLiteSuffix = {
       0x4e31'1e51,  // and v17.16b,v18.16b,v17.16b
       0x0b15'06b5,  // add w21,w21,w21,lsl #1
       0x6e21'da31,  // ucvtf v17.4s,v17.4s
       0x2a1f'03f3,  // mov w19,wzr
       0x6e31'de10,  // fmul v16.4s,v16.4s,v17.4s
-  };
-  constexpr std::array<uint32_t, 9> kFullSequence = {
-      kInterpretedPrefix[0],
-      kInterpretedPrefix[1],
-      kInterpretedPrefix[2],
-      kInterpretedPrefix[3],
-      kLiteSuffix[0],
-      kLiteSuffix[1],
-      kLiteSuffix[2],
-      kLiteSuffix[3],
-      kLiteSuffix[4],
   };
 
   auto initialize = [](ThreadState* state) {
@@ -3051,27 +3073,46 @@ TEST(LoongArch64RuntimeLibraryTest, UnityInsGeneralToLiteVectorHandoffMatchesInt
     InterpretInsn(&interpreted);
   }
 
-  ThreadState mixed{};
-  initialize(&mixed);
-  SetInsnAddr(mixed.cpu, ToGuestAddr(kInterpretedPrefix.data()));
-  for (size_t i = 0; i < kInterpretedPrefix.size(); ++i) {
-    InterpretInsn(&mixed);
+  ThreadState translated{};
+  initialize(&translated);
+  {
+    GuestAddr start_pc = ToGuestAddr(kFullSequence.data());
+    MachineCode code;
+    LiteTranslateParams params;
+    params.end_pc = start_pc + sizeof(kFullSequence);
+    params.allow_dispatch = false;
+    auto [success, stop_pc] = TryLiteTranslateRegion(start_pc, &code, params);
+    ASSERT_TRUE(success);
+    ASSERT_EQ(stop_pc, params.end_pc);
   }
-  TranslateAndRun(kLiteSuffix, &mixed);
+  TranslateAndRun(kFullSequence, &translated);
 
-  EXPECT_EQ(mixed.cpu.x[19], interpreted.cpu.x[19]);
-  EXPECT_EQ(mixed.cpu.x[21], interpreted.cpu.x[21]);
-  EXPECT_EQ(mixed.cpu.v[16], interpreted.cpu.v[16]);
-  EXPECT_EQ(mixed.cpu.v[17], interpreted.cpu.v[17]);
-  EXPECT_EQ(mixed.cpu.v[18], interpreted.cpu.v[18]);
+  EXPECT_EQ(translated.cpu.x[19], interpreted.cpu.x[19]);
+  EXPECT_EQ(translated.cpu.x[21], interpreted.cpu.x[21]);
+  EXPECT_EQ(translated.cpu.v[16], interpreted.cpu.v[16]);
+  EXPECT_EQ(translated.cpu.v[17], interpreted.cpu.v[17]);
+  EXPECT_EQ(translated.cpu.v[18], interpreted.cpu.v[18]);
 }
 
 TEST(LoongArch64RuntimeLibraryTest, LiteHotStructMemoryMatchesInterpreter) {
-  constexpr std::array<uint32_t, 15> kGuestCode = {
+  constexpr std::array<uint32_t, 28> kGuestCode = {
       0x4c9f'a820,  // st1 {v0.4s,v1.4s},[x1],#32
       0x0ddf'8464,  // ld1 {v4.d}[0],[x3],#8
       0x4ddf'8464,  // ld1 {v4.d}[1],[x3],#8
       0x4d40'c930,  // ld1r {v16.4s},[x9]
+      0x4d40'cd07,  // ld1r {v7.2d},[x8]
+      0x4ddf'cd49,  // ld1r {v9.2d},[x10],#8
+      0x4dcd'cd8b,  // ld1r {v11.2d},[x12],x13
+      0x4ddf'c862,  // ld1r {v2.4s},[x3],#4
+      0x4dc6'c8a4,  // ld1r {v4.4s},[x5],x6
+      0x0d40'8420,  // ld1 {v0.d}[0],[x1]
+      0x4d40'8462,  // ld1 {v2.d}[1],[x3]
+      0x0d00'84a4,  // st1 {v4.d}[0],[x5]
+      0x4d00'84e6,  // st1 {v6.d}[1],[x7]
+      0x4ddf'8528,  // ld1 {v8.d}[1],[x9],#8
+      0x4dcc'856a,  // ld1 {v10.d}[1],[x11],x12
+      0x0d9f'85cd,  // st1 {v13.d}[0],[x14],#8
+      0x4d91'860f,  // st1 {v15.d}[1],[x16],x17
       0x4d00'8121,  // st1 {v1.s}[2],[x9]
       0x0d00'8101,  // st1 {v1.s}[0],[x8]
       0x0d00'9101,  // st1 {v1.s}[1],[x8]

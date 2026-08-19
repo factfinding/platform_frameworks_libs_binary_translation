@@ -99,6 +99,13 @@ CachedVRegisterMap SelectCachedVRegisters(GuestAddr start_pc, GuestAddr end_pc) 
       continue;
     }
 
+    // INS Vd.S[index], Wn uses the general register field in bits 9:5.  It is
+    // a partial vector write, but has no vector source to count for caching.
+    if ((insn & 0xffe0'fc00u) == 0x4e00'1c00u && (((insn >> 16) & 7) == 4)) {
+      mark_written(insn);
+      continue;
+    }
+
     // SIMD and scalar floating-point data-processing instructions use Rd in
     // bits 4:0.  Count the possible source fields conservatively; false
     // positives only waste a cache slot, while every possible destination is
@@ -383,17 +390,25 @@ class LiteTranslator {
       }
       return TranslateLdSt1Multiple4S(insn, pc);
     }
-    if ((insn & 0xbfff'fc00u) == 0x0ddf'8400u) {
+    // LD1/ST1 of one 64-bit lane, with optional immediate/register
+    // post-index writeback.  Q selects the destination/source lane.
+    if ((insn & 0xbfff'fc00u) == 0x0d40'8400u ||
+        (insn & 0xbfff'fc00u) == 0x0d00'8400u ||
+        (insn & 0xbfe0'fc00u) == 0x0dc0'8400u ||
+        (insn & 0xbfe0'fc00u) == 0x0d80'8400u) {
       if (!enable_guest_memory_) {
         return false;
       }
-      return TranslateLd1D1PostIndex(insn, pc);
+      return TranslateLdSt1D(insn, pc);
     }
-    if ((insn & 0xffff'fc00u) == 0x4d40'c800u) {
+    // LD1R of one 32- or 64-bit element, with optional immediate/register
+    // post-index writeback.
+    if ((insn & 0xffff'f800u) == 0x4d40'c800u ||
+        (insn & 0xffe0'f800u) == 0x4dc0'c800u) {
       if (!enable_guest_memory_) {
         return false;
       }
-      return TranslateLd1r4S(insn, pc);
+      return TranslateLd1r(insn, pc);
     }
     // LD1/ST1 of one 32-bit lane without writeback.  Q and S encode the lane.
     if ((insn & 0xbfff'ec00u) == 0x0d40'8000u ||
@@ -405,6 +420,10 @@ class LiteTranslator {
     }
     if ((insn & 0xffe0'8400u) == 0x6e00'0400u) {
       return TranslateInsElement(insn);
+    }
+    // INS Vd.S[index], Wn (MOV alias).
+    if ((insn & 0xffe0'fc00u) == 0x4e00'1c00u && (((insn >> 16) & 7) == 4)) {
+      return TranslateInsSFromGeneral(insn);
     }
     if ((insn & 0xffe0'fc00u) == 0x4e00'0400u) {
       return TranslateDupElement4S(insn);
@@ -2692,42 +2711,80 @@ class LiteTranslator {
     return true;
   }
 
-  bool TranslateLd1D1PostIndex(uint32_t insn, GuestAddr pc) {
+  bool TranslateLdSt1D(uint32_t insn, GuestAddr pc) {
+    const bool load = (insn & (1u << 22)) != 0;
+    const bool post_index = (insn & (1u << 23)) != 0;
     const uint32_t rn = (insn >> 5) & 31;
     const uint32_t rt = insn & 31;
+    const uint32_t rm = (insn >> 16) & 31;
+    const int32_t lane_offset = ((insn >> 30) & 1) * 8;
     LoadXOrSp(rn, Assembler::t0);
     ApplyTbi(Assembler::t0);
     Assembler::Label* recovery = as_.MakeLabel();
     Assembler::Label* done = as_.MakeLabel();
-    as_.SetRecoveryPoint(recovery);
-    as_.LdD(Assembler::t1, Assembler::t0, 0);
-    const int32_t lane_offset = ((insn >> 30) & 1) * 8;
-    as_.StD(Assembler::t1, Assembler::s8, VOffset(rt) + lane_offset);
+    if (load) {
+      // Preserve the destination until the potentially faulting load has
+      // completed so interpreter recovery can restart the instruction.
+      as_.SetRecoveryPoint(recovery);
+      as_.LdD(Assembler::t1, Assembler::t0, 0);
+      as_.StD(Assembler::t1, Assembler::s8, VOffset(rt) + lane_offset);
+    } else {
+      as_.LdD(Assembler::t1, Assembler::s8, VOffset(rt) + lane_offset);
+      as_.SetRecoveryPoint(recovery);
+      as_.StD(Assembler::t1, Assembler::t0, 0);
+    }
     as_.B(*done);
     as_.Bind(recovery);
     ExitGeneratedCode(pc);
     as_.Bind(done);
-    LoadXOrSp(rn, Assembler::t0);
-    as_.AddiD(Assembler::t0, Assembler::t0, 8);
-    StoreXOrSp(rn, Assembler::t0);
+    if (post_index) {
+      // Reload the untagged architectural value rather than writing the TBI
+      // memory address back to the guest register.
+      LoadXOrSp(rn, Assembler::t0);
+      if (rm == 31) {
+        as_.AddiD(Assembler::t0, Assembler::t0, 8);
+      } else {
+        LoadXOrZero(rm, Assembler::t1);
+        as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
+      }
+      StoreXOrSp(rn, Assembler::t0);
+    }
     return true;
   }
 
-  bool TranslateLd1r4S(uint32_t insn, GuestAddr pc) {
+  bool TranslateLd1r(uint32_t insn, GuestAddr pc) {
+    const bool element_64 = (insn & (1u << 10)) != 0;
+    const bool post_index = (insn & (1u << 23)) != 0;
     const uint32_t rn = (insn >> 5) & 31;
     const uint32_t rt = insn & 31;
+    const uint32_t rm = (insn >> 16) & 31;
     LoadXOrSp(rn, Assembler::t0);
     ApplyTbi(Assembler::t0);
     Assembler::Label* recovery = as_.MakeLabel();
     Assembler::Label* done = as_.MakeLabel();
     as_.SetRecoveryPoint(recovery);
-    as_.LdWU(Assembler::t1, Assembler::t0, 0);
-    as_.Vreplgr2vrW(Assembler::vr0, Assembler::t1);
+    if (element_64) {
+      as_.LdD(Assembler::t1, Assembler::t0, 0);
+      as_.Vreplgr2vrD(Assembler::vr0, Assembler::t1);
+    } else {
+      as_.LdWU(Assembler::t1, Assembler::t0, 0);
+      as_.Vreplgr2vrW(Assembler::vr0, Assembler::t1);
+    }
     StoreV(rt, Assembler::vr0);
     as_.B(*done);
     as_.Bind(recovery);
     ExitGeneratedCode(pc);
     as_.Bind(done);
+    if (post_index) {
+      LoadXOrSp(rn, Assembler::t0);
+      if (rm == 31) {
+        as_.AddiD(Assembler::t0, Assembler::t0, element_64 ? 8 : 4);
+      } else {
+        LoadXOrZero(rm, Assembler::t1);
+        as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
+      }
+      StoreXOrSp(rn, Assembler::t0);
+    }
     return true;
   }
 
@@ -2767,6 +2824,15 @@ class LiteTranslator {
     as_.Vst(Assembler::vr0, Assembler::s8, VOffset(rd));
     as_.StW(Assembler::zero, Assembler::s8, VOffset(rd) + 4);
     as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
+    return true;
+  }
+
+  bool TranslateInsSFromGeneral(uint32_t insn) {
+    const uint32_t lane = ((insn >> 16) & 31) >> 3;
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    LoadXOrZero(rn, Assembler::t0);
+    as_.StW(Assembler::t0, Assembler::s8, VOffset(rd) + lane * 4);
     return true;
   }
 
