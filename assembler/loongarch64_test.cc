@@ -38,9 +38,15 @@ TEST(LoongArch64AssemblerTest, EncodesLiteSimdFallbackInstructions) {
   assembler.FfintDL(Assembler::vr0, Assembler::vr1);
   assembler.VsllwilWuHu(Assembler::vr0, Assembler::vr1, 0);
   assembler.VsllwilWuHu(Assembler::vr2, Assembler::vr3, 15);
+  assembler.FmaxS(Assembler::vr0, Assembler::vr1, Assembler::vr2);
+  assembler.FmaxD(Assembler::vr3, Assembler::vr4, Assembler::vr5);
+  assembler.FminS(Assembler::vr6, Assembler::vr7, Assembler::vr8);
+  assembler.FminD(Assembler::vr9, Assembler::vr10, Assembler::vr11);
+  assembler.VmaxW(Assembler::vr0, Assembler::vr1, Assembler::vr2);
+  assembler.VminW(Assembler::vr3, Assembler::vr4, Assembler::vr5);
 
   // Generated independently with LLVM 21's LoongArch assembler and LSX.
-  constexpr std::array<uint32_t, 9> kExpected = {
+  constexpr std::array<uint32_t, 15> kExpected = {
       0x7004'0440,
       0x7007'0440,
       0x0114'a880,
@@ -50,6 +56,12 @@ TEST(LoongArch64AssemblerTest, EncodesLiteSimdFallbackInstructions) {
       0x011d'2820,
       0x730c'4020,
       0x730c'7c62,
+      0x0108'8820,
+      0x0109'1483,
+      0x010a'a0e6,
+      0x010b'2d49,
+      0x7071'0820,
+      0x7073'1483,
   };
   ASSERT_EQ(code.install_size(), sizeof(kExpected));
   for (size_t i = 0; i < kExpected.size(); ++i) {

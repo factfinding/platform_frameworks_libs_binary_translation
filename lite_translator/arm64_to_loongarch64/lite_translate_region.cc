@@ -109,16 +109,24 @@ CachedVRegisterMap SelectCachedVRegisters(GuestAddr start_pc, GuestAddr end_pc) 
     // Scalar FMUL by element splits Vm across bit 20 and bits 19:16.  Decode
     // that source explicitly rather than treating the lane bits as a vector
     // register number.
-    if ((insn & 0xffc0'f400u) == 0x5f80'9000u) {
+    if ((insn & 0xffc0'f400u) == 0x5f80'9000u ||
+        (insn & 0xbfc0'f400u) == 0x0f80'9000u) {
       mark_written(insn);
       mark_read(insn >> 5);
       mark_read((((insn >> 20) & 1) << 4) | ((insn >> 16) & 15));
       continue;
     }
 
+    if ((insn & 0xbfe0'fc00u) == 0x0e00'0400u) {
+      mark_written(insn);
+      mark_read(insn >> 5);
+      continue;
+    }
+
     // Unary narrowing/widening and scalar vector conversion have only Vn as
     // a vector source.  The general-register SCVTF forms have none.
     if ((insn & 0xffff'fc00u) == 0x5e21'd800u ||
+        (insn & 0xbfff'fc00u) == 0x0e21'd800u ||
         ((insn & 0xff80'fc00u) == 0x2f00'a400u && (((insn >> 19) & 0xeu) == 0x2u)) ||
         (insn & 0xffff'fc00u) == 0x0e61'2800u) {
       mark_written(insn);
@@ -131,6 +139,24 @@ CachedVRegisterMap SelectCachedVRegisters(GuestAddr start_pc, GuestAddr end_pc) 
     }
     if ((insn & 0x7fbf'fc00u) == 0x1e23'0000u) {
       mark_written(insn);
+      continue;
+    }
+    // DUP from a general register and modified-immediate constants have no
+    // vector source.  UMOV is the opposite: it reads a vector but writes a
+    // general register.  Handle them before the conservative SIMD rule.
+    if ((insn & 0xbfff'fc00u) == 0x0e04'0c00u ||
+        (insn & 0xffff'ffe0u) == 0x4f04'8400u ||
+        (insn & 0xffff'ffe0u) == 0x4f04'6400u ||
+        (insn & 0xffff'ffe0u) == 0x4f05'67e0u ||
+        (insn & 0xffff'ffe0u) == 0x4f03'f600u ||
+        (insn & 0xffff'ffe0u) == 0x4f06'f600u ||
+        (insn & 0xffff'ffe0u) == 0x4f07'f600u ||
+        (insn & 0xffff'ffe0u) == 0x0f07'f600u) {
+      mark_written(insn);
+      continue;
+    }
+    if ((insn & 0xffe0'fc00u) == 0x0e00'3c00u && (((insn >> 16) & 3) == 2)) {
+      mark_read(insn >> 5);
       continue;
     }
     if ((insn & 0xffff'fc00u) == 0x1e21'4000u ||
@@ -462,8 +488,8 @@ class LiteTranslator {
     if ((insn & 0xffe0'fc00u) == 0x4e00'1c00u && (((insn >> 16) & 7) == 4)) {
       return TranslateInsSFromGeneral(insn);
     }
-    if ((insn & 0xffe0'fc00u) == 0x4e00'0400u) {
-      return TranslateDupElement4S(insn);
+    if ((insn & 0xbfe0'fc00u) == 0x0e00'0400u) {
+      return TranslateDupElement2S4S(insn);
     }
     // Scalar MOV Sd, Vn.S[index] is the scalar DUP (element) encoding.
     if ((insn & 0xffe0'fc00u) == 0x5e00'0400u && (((insn >> 16) & 7) == 4)) {
@@ -474,6 +500,12 @@ class LiteTranslator {
     // narrow until the other lane widths have independent validation.
     if ((insn & 0xffff'fc00u) == 0x4e01'0c00u) {
       return TranslateDup16B(insn);
+    }
+    if ((insn & 0xbfff'fc00u) == 0x0e04'0c00u) {
+      return TranslateDup2S4S(insn);
+    }
+    if ((insn & 0xffe0'fc00u) == 0x0e00'3c00u && (((insn >> 16) & 3) == 2)) {
+      return TranslateUmovH(insn);
     }
     if ((insn & 0xffff'fc00u) == 0x4e04'0400u) {
       return TranslateDup4SFromElement(insn);
@@ -585,6 +617,9 @@ class LiteTranslator {
     if ((insn & 0xffe0'fc00u) == 0x4e80'3800u) {
       return TranslatePermute4S(insn, 4);  // ZIP1
     }
+    if ((insn & 0xffe0'fc00u) == 0x0e80'3800u) {
+      return TranslateZip1_2S(insn);
+    }
     if ((insn & 0xffe0'fc00u) == 0x4ec0'7800u) {
       return TranslateZip2D(insn);
     }
@@ -611,6 +646,33 @@ class LiteTranslator {
     if ((insn & 0xffff'ffe0u) == 0x0f00'0420u) {
       return TranslateMoviConstant(insn, 0x0000'0001'0000'0001ULL, 0);
     }
+    if ((insn & 0xffff'ffe0u) == 0x4f04'8400u) {
+      return TranslateMoviConstant(insn, 0x0080'0080'0080'0080ULL,
+                                   0x0080'0080'0080'0080ULL);
+    }
+    if ((insn & 0xffff'ffe0u) == 0x4f04'6400u) {
+      return TranslateMoviConstant(insn, 0x8000'0000'8000'0000ULL,
+                                   0x8000'0000'8000'0000ULL);
+    }
+    if ((insn & 0xffff'ffe0u) == 0x4f05'67e0u) {
+      return TranslateMoviConstant(insn, 0xbf00'0000'bf00'0000ULL,
+                                   0xbf00'0000'bf00'0000ULL);
+    }
+    if ((insn & 0xffff'ffe0u) == 0x4f03'f600u) {
+      return TranslateMoviConstant(insn, 0x3f80'0000'3f80'0000ULL,
+                                   0x3f80'0000'3f80'0000ULL);
+    }
+    if ((insn & 0xffff'ffe0u) == 0x4f06'f600u) {
+      return TranslateMoviConstant(insn, 0xbe80'0000'be80'0000ULL,
+                                   0xbe80'0000'be80'0000ULL);
+    }
+    if ((insn & 0xffff'ffe0u) == 0x4f07'f600u) {
+      return TranslateMoviConstant(insn, 0xbf80'0000'bf80'0000ULL,
+                                   0xbf80'0000'bf80'0000ULL);
+    }
+    if ((insn & 0xffff'ffe0u) == 0x0f07'f600u) {
+      return TranslateMoviConstant(insn, 0xbf80'0000'bf80'0000ULL, 0);
+    }
     // Bit 23 distinguishes FMLA (0) from FMLS (1).
     if ((insn & 0xffa0'fc00u) == 0x4e20'cc00u || (insn & 0xffa0'fc00u) == 0x4ea0'cc00u) {
       return TranslateFmlaFmls4S(insn);
@@ -618,7 +680,7 @@ class LiteTranslator {
     // Scalar FP arithmetic is pervasive in Unity startup code.  Use scalar
     // LA64 operations so inactive SIMD lanes cannot raise spurious FP flags.
     if ((insn & 0xff20'0c00u) == 0x1e20'0800u) {
-      return TranslateScalarFpBinary(insn);
+      return TranslateScalarFpBinary(insn, pc);
     }
     if ((insn & 0xff20'8000u) == 0x1f00'0000u) {
       return TranslateScalarFmadd(insn);
@@ -672,8 +734,12 @@ class LiteTranslator {
     if ((insn & 0xffe0'fc00u) == 0x4ea0'3400u) {
       return TranslateCmgt4S(insn);
     }
-    if ((insn & 0xffff'fc00u) == 0x4e21'd800u) {
-      return TranslateScvtf4S(insn);
+    if ((insn & 0xffe0'fc00u) == 0x0ea0'a400u ||
+        (insn & 0xffe0'fc00u) == 0x0ea0'ac00u) {
+      return TranslateSignedMinMaxPair2S(insn);
+    }
+    if ((insn & 0xbfff'fc00u) == 0x0e21'd800u) {
+      return TranslateScvtf2S4S(insn);
     }
     if ((insn & 0xffff'fc00u) == 0x5e21'd800u) {
       return TranslateScvtfScalarVector(insn);
@@ -696,8 +762,8 @@ class LiteTranslator {
     if ((insn & 0xffc0'f400u) == 0x4f80'1000u) {
       return TranslateFmla4SByElement(insn);
     }
-    if ((insn & 0xffc0'f400u) == 0x4f80'9000u) {
-      return TranslateFmul4SByElement(insn);
+    if ((insn & 0xbfc0'f400u) == 0x0f80'9000u) {
+      return TranslateFmul2S4SByElement(insn);
     }
     if ((insn & 0xffc0'f400u) == 0x5f80'9000u) {
       return TranslateFmulSByElement(insn);
@@ -2962,7 +3028,7 @@ class LiteTranslator {
     return true;
   }
 
-  bool TranslateDupElement4S(uint32_t insn) {
+  bool TranslateDupElement2S4S(uint32_t insn) {
     const uint32_t imm5 = (insn >> 16) & 31;
     if ((imm5 & 7) != 4) {
       return false;
@@ -2973,6 +3039,32 @@ class LiteTranslator {
     LoadV(rn, Assembler::vr1);
     as_.VreplveiW(Assembler::vr0, Assembler::vr1, index);
     StoreV(rd, Assembler::vr0);
+    if ((insn & (1u << 30)) == 0) {
+      as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
+    }
+    return true;
+  }
+
+  bool TranslateDup2S4S(uint32_t insn) {
+    const bool is_128_bit = (insn & (1u << 30)) != 0;
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    LoadXOrZero(rn, Assembler::t0);
+    as_.Vreplgr2vrW(Assembler::vr0, Assembler::t0);
+    StoreV(rd, Assembler::vr0);
+    if (!is_128_bit) {
+      as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
+    }
+    return true;
+  }
+
+  bool TranslateUmovH(uint32_t insn) {
+    const uint32_t imm5 = (insn >> 16) & 31;
+    const uint32_t lane = imm5 >> 2;
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    as_.LdHU(Assembler::t0, Assembler::s8, VOffset(rn) + lane * 2);
+    StoreXOrDiscard(rd, Assembler::t0);
     return true;
   }
 
@@ -3303,12 +3395,35 @@ class LiteTranslator {
     return true;
   }
 
-  bool TranslateScvtf4S(uint32_t insn) {
+  bool TranslateScvtf2S4S(uint32_t insn) {
+    const bool is_128_bit = (insn & (1u << 30)) != 0;
     const uint32_t rn = (insn >> 5) & 31;
     const uint32_t rd = insn & 31;
     LoadV(rn, Assembler::vr1);
     as_.VffintSW(Assembler::vr0, Assembler::vr1);
     StoreV(rd, Assembler::vr0);
+    if (!is_128_bit) {
+      as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
+    }
+    return true;
+  }
+
+  bool TranslateSignedMinMaxPair2S(uint32_t insn) {
+    const bool is_min = (insn & (1u << 11)) != 0;
+    const uint32_t rm = (insn >> 16) & 31;
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    LoadV(rn, Assembler::vr1);
+    LoadV(rm, Assembler::vr2);
+    as_.Vshuf4iW(Assembler::vr3, Assembler::vr1, 0xb1);
+    is_min ? as_.VminW(Assembler::vr1, Assembler::vr1, Assembler::vr3)
+           : as_.VmaxW(Assembler::vr1, Assembler::vr1, Assembler::vr3);
+    as_.Vshuf4iW(Assembler::vr3, Assembler::vr2, 0xb1);
+    is_min ? as_.VminW(Assembler::vr2, Assembler::vr2, Assembler::vr3)
+           : as_.VmaxW(Assembler::vr2, Assembler::vr2, Assembler::vr3);
+    as_.VilvlW(Assembler::vr0, Assembler::vr2, Assembler::vr1);
+    StoreV(rd, Assembler::vr0);
+    as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
     return true;
   }
 
@@ -3588,6 +3703,18 @@ class LiteTranslator {
     return true;
   }
 
+  bool TranslateZip1_2S(uint32_t insn) {
+    const uint32_t rm = (insn >> 16) & 31;
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    LoadV(rn, Assembler::vr1);
+    LoadV(rm, Assembler::vr2);
+    as_.VilvlW(Assembler::vr0, Assembler::vr2, Assembler::vr1);
+    StoreV(rd, Assembler::vr0);
+    as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
+    return true;
+  }
+
   bool TranslateZip2D(uint32_t insn) {
     const uint32_t rm = (insn >> 16) & 31;
     const uint32_t rn = (insn >> 5) & 31;
@@ -3649,19 +3776,99 @@ class LiteTranslator {
     return true;
   }
 
-  bool TranslateScalarFpBinary(uint32_t insn) {
+  bool TranslateScalarFpBinary(uint32_t insn, GuestAddr pc) {
     uint32_t ftype = (insn >> 22) & 3;
     uint32_t operation = (insn >> 12) & 15;
     uint32_t rm = (insn >> 16) & 31;
     uint32_t rn = (insn >> 5) & 31;
     uint32_t rd = insn & 31;
-    if (ftype > 1 || operation > 3) {
+    if (ftype > 1 || operation > 7) {
       return false;
+    }
+
+    const bool is_double = ftype == 1;
+    if (operation >= 4) {
+      const bool is_min = (operation & 1) != 0;
+      const bool is_number = (operation & 2) != 0;
+      Assembler::Label* lhs_nan = as_.MakeLabel();
+      Assembler::Label* rhs_nan = as_.MakeLabel();
+      Assembler::Label* fallback = as_.MakeLabel();
+      Assembler::Label* calculate = as_.MakeLabel();
+      Assembler::Label* store_bits = as_.MakeLabel();
+      Assembler::Label* done = as_.MakeLabel();
+
+      if (is_double) {
+        as_.LdD(Assembler::t0, Assembler::s8, VOffset(rn));
+        as_.LdD(Assembler::t1, Assembler::s8, VOffset(rm));
+        as_.Li(Assembler::t4, 0x7fff'ffff'ffff'ffffULL);
+        as_.And(Assembler::t2, Assembler::t0, Assembler::t4);
+        as_.Li(Assembler::t3, 0x7ff0'0000'0000'0000ULL);
+      } else {
+        as_.LdWU(Assembler::t0, Assembler::s8, VOffset(rn));
+        as_.LdWU(Assembler::t1, Assembler::s8, VOffset(rm));
+        as_.Li(Assembler::t4, 0x7fff'ffffu);
+        as_.And(Assembler::t2, Assembler::t0, Assembler::t4);
+        as_.Li(Assembler::t3, 0x7f80'0000u);
+      }
+      as_.Bltu(Assembler::t3, Assembler::t2, *lhs_nan);
+      as_.And(Assembler::t2, Assembler::t1, Assembler::t4);
+      as_.Bltu(Assembler::t3, Assembler::t2, *rhs_nan);
+      as_.B(*calculate);
+
+      as_.Bind(lhs_nan);
+      if (is_number) {
+        // FMAXNM/FMINNM return the numeric operand when exactly one input is
+        // a NaN.  If both are NaNs, let the interpreter apply FPCR payload
+        // and default-NaN rules.
+        as_.And(Assembler::t2, Assembler::t1, Assembler::t4);
+        as_.Bltu(Assembler::t3, Assembler::t2, *fallback);
+        as_.Move(Assembler::t2, Assembler::t1);
+        as_.B(*store_bits);
+      } else {
+        as_.B(*fallback);
+      }
+
+      as_.Bind(rhs_nan);
+      if (is_number) {
+        as_.Move(Assembler::t2, Assembler::t0);
+        as_.B(*store_bits);
+      } else {
+        as_.B(*fallback);
+      }
+
+      as_.Bind(fallback);
+      ExitGeneratedCode(pc);
+
+      as_.Bind(calculate);
+      LoadV(rn, Assembler::vr1);
+      LoadV(rm, Assembler::vr2);
+      if (is_double) {
+        is_min ? as_.FminD(Assembler::vr0, Assembler::vr1, Assembler::vr2)
+               : as_.FmaxD(Assembler::vr0, Assembler::vr1, Assembler::vr2);
+      } else {
+        is_min ? as_.FminS(Assembler::vr0, Assembler::vr1, Assembler::vr2)
+               : as_.FmaxS(Assembler::vr0, Assembler::vr1, Assembler::vr2);
+      }
+      as_.Vst(Assembler::vr0, Assembler::s8, VOffset(rd));
+      as_.B(*done);
+
+      as_.Bind(store_bits);
+      if (is_double) {
+        as_.StD(Assembler::t2, Assembler::s8, VOffset(rd));
+      } else {
+        as_.StW(Assembler::t2, Assembler::s8, VOffset(rd));
+        as_.StW(Assembler::zero, Assembler::s8, VOffset(rd) + 4);
+      }
+      as_.Bind(done);
+      if (!is_double) {
+        as_.StW(Assembler::zero, Assembler::s8, VOffset(rd) + 4);
+      }
+      as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
+      return true;
     }
 
     LoadV(rn, Assembler::vr1);
     LoadV(rm, Assembler::vr2);
-    bool is_double = ftype == 1;
     switch (operation) {
       case 0:
         is_double ? as_.FmulD(Assembler::vr0, Assembler::vr1, Assembler::vr2)
@@ -3951,7 +4158,8 @@ class LiteTranslator {
     return true;
   }
 
-  bool TranslateFmul4SByElement(uint32_t insn) {
+  bool TranslateFmul2S4SByElement(uint32_t insn) {
+    const bool is_128_bit = (insn & (1u << 30)) != 0;
     uint32_t rm = (((insn >> 20) & 1) << 4) | ((insn >> 16) & 15);
     uint32_t index = (((insn >> 11) & 1) << 1) | ((insn >> 21) & 1);
     uint32_t rn = (insn >> 5) & 31;
@@ -3961,6 +4169,9 @@ class LiteTranslator {
     as_.VreplveiW(Assembler::vr2, Assembler::vr2, index);
     as_.VfmulS(Assembler::vr0, Assembler::vr1, Assembler::vr2);
     StoreV(rd, Assembler::vr0);
+    if (!is_128_bit) {
+      as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
+    }
     return true;
   }
 
