@@ -279,6 +279,71 @@ TEST(LoongArch64RuntimeLibraryTest, LiteConditionalFallthroughExtendsRegion) {
   EXPECT_EQ(GetInsnAddr(state.cpu), params.end_pc);
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteConditionalBranchesShareColdExitStub) {
+  // Both branches in kShared target the end of the region.  kDistinct changes
+  // only the second target, requiring a second out-of-line dispatch stub.
+  constexpr std::array<uint32_t, 3> kShared = {
+      0xb400'0060,  // cbz x0,+12
+      0xb400'0041,  // cbz x1,+8
+      0xd503'201f,
+  };
+  constexpr std::array<uint32_t, 3> kDistinct = {
+      0xb400'0060,  // cbz x0,+12
+      0xb400'0061,  // cbz x1,+12
+      0xd503'201f,
+  };
+  auto translate = [](const auto& guest_code, MachineCode* machine_code) {
+    GuestAddr start_pc = ToGuestAddr(guest_code.data());
+    LiteTranslateParams params;
+    params.end_pc = start_pc + sizeof(guest_code);
+    params.allow_dispatch = true;
+    auto [success, stop_pc] = TryLiteTranslateRegion(start_pc, machine_code, params);
+    EXPECT_TRUE(success);
+    EXPECT_EQ(stop_pc, params.end_pc);
+  };
+
+  MachineCode shared_code;
+  MachineCode distinct_code;
+  translate(kShared, &shared_code);
+  translate(kDistinct, &distinct_code);
+  EXPECT_LT(shared_code.install_size(), distinct_code.install_size());
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteRegisterCacheIgnoresCodeAfterTerminalBranch) {
+  constexpr std::array<uint32_t, 16> kGuestCode = {
+      0x8b01'0020,  // add x0,x1,x1
+      0x1400'0001,  // b +4 (terminates the linear region)
+      0x8b02'0042, 0x8b02'0042,
+      0x8b03'0063, 0x8b03'0063,
+      0x8b04'0084, 0x8b04'0084,
+      0x8b05'00a5, 0x8b05'00a5,
+      0x8b06'00c6, 0x8b06'00c6,
+      0x8b07'00e7, 0x8b07'00e7,
+      0x8b08'0108, 0x8b08'0108,
+  };
+  GuestAddr start_pc = ToGuestAddr(kGuestCode.data());
+  LiteTranslateParams short_params;
+  short_params.end_pc = start_pc + 2 * sizeof(uint32_t);
+  short_params.allow_dispatch = false;
+  MachineCode short_code;
+  auto [short_success, short_stop_pc] =
+      TryLiteTranslateRegion(start_pc, &short_code, short_params);
+  ASSERT_TRUE(short_success);
+  ASSERT_EQ(short_stop_pc, short_params.end_pc);
+
+  LiteTranslateParams long_params = short_params;
+  long_params.end_pc = start_pc + sizeof(kGuestCode);
+  MachineCode long_code;
+  auto [long_success, long_stop_pc] = TryLiteTranslateRegion(start_pc, &long_code, long_params);
+  ASSERT_TRUE(long_success);
+  ASSERT_EQ(long_stop_pc, short_params.end_pc);
+  ASSERT_EQ(long_code.install_size(), short_code.install_size());
+  for (size_t offset = 0; offset < short_code.install_size(); offset += sizeof(uint32_t)) {
+    EXPECT_EQ(*long_code.AddrAs<const uint32_t>(offset),
+              *short_code.AddrAs<const uint32_t>(offset));
+  }
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesTestAndBranch) {
   // tbz x0, #5, +8
   constexpr std::array<uint32_t, 3> kTbzCode = {0x3628'0040, 0xd503'201f, 0xd503'201f};

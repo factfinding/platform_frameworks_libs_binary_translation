@@ -20,6 +20,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <tuple>
+#include <vector>
 
 #include "berberis/assembler/loongarch64.h"
 #include "berberis/base/checks.h"
@@ -37,6 +38,22 @@ using Register = loongarch64::Register;
 using SimdRegister = loongarch64::SimdRegister;
 using CachedXRegisterMap = std::array<int8_t, 32>;
 using CachedVRegisterMap = std::array<int8_t, 32>;
+
+GuestAddr FindLinearRegionEnd(GuestAddr start_pc, GuestAddr end_pc) {
+  for (GuestAddr pc = start_pc; pc < end_pc; pc += sizeof(uint32_t)) {
+    uint32_t insn = *ToHostAddr<const uint32_t>(pc);
+    // An unconditional immediate or register branch terminates the linear
+    // region.  Do not let unreachable instructions after it influence the
+    // source-only register cache selection.
+    if ((insn & 0x7c00'0000u) == 0x1400'0000u ||
+        (insn & 0xffff'fc1fu) == 0xd61f'0000u ||
+        (insn & 0xffff'fc1fu) == 0xd63f'0000u ||
+        (insn & 0xffff'fc1fu) == 0xd65f'0000u) {
+      return pc + sizeof(uint32_t);
+    }
+  }
+  return end_pc;
+}
 
 constexpr int32_t kSpOffset = offsetof(ThreadState, cpu) + offsetof(CPUState, sp);
 constexpr int32_t kFlagsOffset = offsetof(ThreadState, cpu) + offsetof(CPUState, flags);
@@ -956,11 +973,36 @@ class LiteTranslator {
     ExitGeneratedCode();
   }
 
-  void Finalize() { as_.Finalize(); }
+  void Finalize() {
+    // Keep taken conditional edges out of the sequentially executed body.
+    // Besides improving I-cache density, one shared stub is enough when
+    // several branches in a region target the same guest address.
+    for (const PendingStaticExit& exit : pending_static_exits_) {
+      as_.Bind(exit.label);
+      Exit(exit.target);
+    }
+    as_.Finalize();
+  }
   bool region_end_reached() const { return region_end_reached_; }
 
  private:
   enum class AtomicMemoryOp { kCas, kSwp, kLdadd };
+
+  struct PendingStaticExit {
+    GuestAddr target;
+    Assembler::Label* label;
+  };
+
+  Assembler::Label* GetStaticExitLabel(GuestAddr target) {
+    for (const PendingStaticExit& exit : pending_static_exits_) {
+      if (exit.target == target) {
+        return exit.label;
+      }
+    }
+    Assembler::Label* label = as_.MakeLabel();
+    pending_static_exits_.push_back({target, label});
+    return label;
+  }
 
   static constexpr int32_t XOffset(uint32_t reg) {
     return offsetof(ThreadState, cpu) + offsetof(CPUState, x) + reg * sizeof(uint64_t);
@@ -4403,14 +4445,12 @@ class LiteTranslator {
     if (!is_64_bit) {
       ZeroExtend32(Assembler::t1);
     }
-    Assembler::Label* fallthrough = as_.MakeLabel();
+    Assembler::Label* taken = GetStaticExitLabel(pc + displacement);
     if (nonzero) {
-      as_.Beqz(Assembler::t1, *fallthrough);
+      as_.Bnez(Assembler::t1, *taken);
     } else {
-      as_.Bnez(Assembler::t1, *fallthrough);
+      as_.Beqz(Assembler::t1, *taken);
     }
-    Exit(pc + displacement);
-    as_.Bind(fallthrough);
   }
 
   void TranslateTestAndBranch(uint32_t insn, GuestAddr pc) {
@@ -4425,24 +4465,19 @@ class LiteTranslator {
     // would incorrectly include every bit above the requested position.
     as_.AddiD(Assembler::t0, Assembler::zero, 1);
     as_.And(Assembler::t1, Assembler::t1, Assembler::t0);
-    Assembler::Label* fallthrough = as_.MakeLabel();
+    Assembler::Label* taken = GetStaticExitLabel(pc + displacement);
     if (nonzero) {
-      as_.Beqz(Assembler::t1, *fallthrough);
+      as_.Bnez(Assembler::t1, *taken);
     } else {
-      as_.Bnez(Assembler::t1, *fallthrough);
+      as_.Beqz(Assembler::t1, *taken);
     }
-    Exit(pc + displacement);
-    as_.Bind(fallthrough);
   }
 
   void TranslateConditionalBranch(uint32_t insn, GuestAddr pc) {
     int64_t displacement = SignExtend((insn >> 5) & 0x7ffff, 19) * 4;
     EmitCondition(insn & 0xf);
 
-    Assembler::Label* fallthrough = as_.MakeLabel();
-    as_.Beqz(Assembler::t2, *fallthrough);
-    Exit(pc + displacement);
-    as_.Bind(fallthrough);
+    as_.Bnez(Assembler::t2, *GetStaticExitLabel(pc + displacement));
   }
 
   void EmitCondition(uint32_t condition) {
@@ -4590,6 +4625,7 @@ class LiteTranslator {
   bool allow_dispatch_;
   CachedXRegisterMap cached_x_registers_;
   CachedVRegisterMap cached_v_registers_;
+  std::vector<PendingStaticExit> pending_static_exits_;
   bool region_end_reached_ = false;
 };
 
@@ -4611,8 +4647,9 @@ std::tuple<bool, GuestAddr> TryLiteTranslateRegion(GuestAddr start_pc,
   CachedVRegisterMap cached_v_registers{};
   cached_v_registers.fill(-1);
   if (params.enable_reg_mapping) {
-    cached_x_registers = SelectCachedXRegisters(start_pc, params.end_pc);
-    cached_v_registers = SelectCachedVRegisters(start_pc, params.end_pc);
+    GuestAddr linear_end_pc = FindLinearRegionEnd(start_pc, params.end_pc);
+    cached_x_registers = SelectCachedXRegisters(start_pc, linear_end_pc);
+    cached_v_registers = SelectCachedVRegisters(start_pc, linear_end_pc);
   }
   LiteTranslator translator(machine_code,
                             cached_x_registers,
