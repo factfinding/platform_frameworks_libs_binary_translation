@@ -282,6 +282,9 @@ class Assembler : public AssemblerBase {
   void VsleBu(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
     Emit32(0x7004'0000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
   }
+  void VsltW(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
+    Emit32(0x7007'0000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
+  }
   void VfcmpCeqS(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
     Emit32(0x0c52'0000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
   }

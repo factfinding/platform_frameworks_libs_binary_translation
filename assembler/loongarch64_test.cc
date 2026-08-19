@@ -30,6 +30,7 @@ TEST(LoongArch64AssemblerTest, EncodesLiteSimdFallbackInstructions) {
   MachineCode code;
   Assembler assembler(&code);
   assembler.VsleBu(Assembler::vr0, Assembler::vr2, Assembler::vr1);
+  assembler.VsltW(Assembler::vr0, Assembler::vr2, Assembler::vr1);
   assembler.Movgr2frD(Assembler::vr0, Assembler::a0);
   assembler.FfintSW(Assembler::vr0, Assembler::vr1);
   assembler.FfintSL(Assembler::vr0, Assembler::vr1);
@@ -39,8 +40,9 @@ TEST(LoongArch64AssemblerTest, EncodesLiteSimdFallbackInstructions) {
   assembler.VsllwilWuHu(Assembler::vr2, Assembler::vr3, 15);
 
   // Generated independently with LLVM 21's LoongArch assembler and LSX.
-  constexpr std::array<uint32_t, 8> kExpected = {
+  constexpr std::array<uint32_t, 9> kExpected = {
       0x7004'0440,
+      0x7007'0440,
       0x0114'a880,
       0x011d'1020,
       0x011d'1820,

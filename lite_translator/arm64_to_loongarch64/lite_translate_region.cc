@@ -129,6 +129,19 @@ CachedVRegisterMap SelectCachedVRegisters(GuestAddr start_pc, GuestAddr end_pc) 
       mark_written(insn);
       continue;
     }
+    if ((insn & 0x7fbf'fc00u) == 0x1e23'0000u) {
+      mark_written(insn);
+      continue;
+    }
+    if ((insn & 0xffff'fc00u) == 0x1e21'4000u ||
+        (insn & 0xffff'fc00u) == 0x1e61'4000u ||
+        (insn & 0xffff'fc00u) == 0x1e20'c000u ||
+        (insn & 0xffff'fc00u) == 0x1e60'c000u ||
+        (insn & 0xffff'fc00u) == 0x2e30'3800u) {
+      mark_written(insn);
+      mark_read(insn >> 5);
+      continue;
+    }
 
     // SIMD and scalar floating-point data-processing instructions use Rd in
     // bits 4:0.  Count the possible source fields conservatively; false
@@ -542,8 +555,11 @@ class LiteTranslator {
     if ((insn & 0xffff'fc00u) == 0x4ea0'f800u) {
       return TranslateFabs4S(insn);
     }
-    if ((insn & 0xffff'fc00u) == 0x6ea0'f800u) {
-      return TranslateFneg4S(insn);
+    if ((insn & 0xbfff'fc00u) == 0x2ea0'f800u) {
+      return TranslateFneg2S4S(insn);
+    }
+    if ((insn & 0xffff'fc00u) == 0x2e30'3800u) {
+      return TranslateUaddlv8B(insn);
     }
     if ((insn & 0xbfff'fc00u) == 0x0e20'5800u) {
       return TranslateCnt8B16B(insn);
@@ -653,6 +669,9 @@ class LiteTranslator {
     if ((insn & 0xffe0'fc00u) == 0x6e20'3c00u) {
       return TranslateCmhs16B(insn);
     }
+    if ((insn & 0xffe0'fc00u) == 0x4ea0'3400u) {
+      return TranslateCmgt4S(insn);
+    }
     if ((insn & 0xffff'fc00u) == 0x4e21'd800u) {
       return TranslateScvtf4S(insn);
     }
@@ -661,6 +680,9 @@ class LiteTranslator {
     }
     if ((insn & 0x7fbf'fc00u) == 0x1e22'0000u) {
       return TranslateScvtfScalarGeneral(insn);
+    }
+    if ((insn & 0x7fbf'fc00u) == 0x1e23'0000u) {
+      return TranslateUcvtfScalarGeneral(insn);
     }
     if ((insn & 0xbf20'fc00u) == 0x2e20'dc00u) {
       return TranslateVectorFpBinary(insn, 0);  // FMUL
@@ -679,6 +701,12 @@ class LiteTranslator {
     }
     if ((insn & 0xffc0'f400u) == 0x5f80'9000u) {
       return TranslateFmulSByElement(insn);
+    }
+    if ((insn & 0xffff'fc00u) == 0x1e21'4000u ||
+        (insn & 0xffff'fc00u) == 0x1e61'4000u ||
+        (insn & 0xffff'fc00u) == 0x1e20'c000u ||
+        (insn & 0xffff'fc00u) == 0x1e60'c000u) {
+      return TranslateScalarFabsFneg(insn);
     }
     if ((insn & 0xffff'fc00u) == 0x1e20'4000u) {
       return TranslateFmovS(insn);
@@ -3263,6 +3291,18 @@ class LiteTranslator {
     return true;
   }
 
+  bool TranslateCmgt4S(uint32_t insn) {
+    const uint32_t rm = (insn >> 16) & 31;
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    LoadV(rn, Assembler::vr1);
+    LoadV(rm, Assembler::vr2);
+    // ARM Vn > Vm is the signed comparison Vm < Vn.
+    as_.VsltW(Assembler::vr0, Assembler::vr2, Assembler::vr1);
+    StoreV(rd, Assembler::vr0);
+    return true;
+  }
+
   bool TranslateScvtf4S(uint32_t insn) {
     const uint32_t rn = (insn >> 5) & 31;
     const uint32_t rd = insn & 31;
@@ -3311,6 +3351,63 @@ class LiteTranslator {
       as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
     } else {
       as_.Vst(Assembler::vr0, Assembler::s8, VOffset(rd));
+      as_.StW(Assembler::zero, Assembler::s8, VOffset(rd) + 4);
+      as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
+    }
+    return true;
+  }
+
+  bool TranslateUcvtfScalarGeneral(uint32_t insn) {
+    const bool source_64 = (insn & (1u << 31)) != 0;
+    const bool destination_double = (insn & (1u << 22)) != 0;
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    Assembler::Label* convert = as_.MakeLabel();
+    Assembler::Label* done = as_.MakeLabel();
+
+    LoadXOrZero(rn, Assembler::t0);
+    if (!source_64) {
+      // A zero-extended uint32_t always fits in a signed 64-bit input.
+      ZeroExtend32(Assembler::t0);
+      as_.Movgr2frD(Assembler::vr0, Assembler::t0);
+      destination_double ? as_.FfintDL(Assembler::vr0, Assembler::vr0)
+                         : as_.FfintSL(Assembler::vr0, Assembler::vr0);
+    } else {
+      as_.SrliD(Assembler::t1, Assembler::t0, 63);
+      as_.Beqz(Assembler::t1, *convert);
+      // For values with bit 63 set, convert ceil(x / 2) as a positive signed
+      // integer and multiply by two.  At this magnitude the discarded odd
+      // bit is below both the binary32 and binary64 precision, so this has the
+      // same correctly rounded result as a direct uint64 conversion.
+      as_.Li(Assembler::t1, 1);
+      as_.And(Assembler::t1, Assembler::t0, Assembler::t1);
+      as_.SrliD(Assembler::t0, Assembler::t0, 1);
+      as_.Or(Assembler::t0, Assembler::t0, Assembler::t1);
+      as_.Movgr2frD(Assembler::vr0, Assembler::t0);
+      if (destination_double) {
+        as_.FfintDL(Assembler::vr0, Assembler::vr0);
+        as_.Li(Assembler::t1, 0x4000'0000'0000'0000ULL);  // 2.0
+        as_.Movgr2frD(Assembler::vr1, Assembler::t1);
+        as_.FmulD(Assembler::vr0, Assembler::vr0, Assembler::vr1);
+      } else {
+        as_.FfintSL(Assembler::vr0, Assembler::vr0);
+        as_.Li(Assembler::t1, 0x4000'0000u);  // 2.0f
+        as_.Movgr2frW(Assembler::vr1, Assembler::t1);
+        as_.FmulS(Assembler::vr0, Assembler::vr0, Assembler::vr1);
+      }
+      as_.B(*done);
+
+      as_.Bind(convert);
+      as_.Movgr2frD(Assembler::vr0, Assembler::t0);
+      destination_double ? as_.FfintDL(Assembler::vr0, Assembler::vr0)
+                         : as_.FfintSL(Assembler::vr0, Assembler::vr0);
+      as_.Bind(done);
+    }
+
+    as_.Vst(Assembler::vr0, Assembler::s8, VOffset(rd));
+    if (destination_double) {
+      as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
+    } else {
       as_.StW(Assembler::zero, Assembler::s8, VOffset(rd) + 4);
       as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
     }
@@ -3387,7 +3484,8 @@ class LiteTranslator {
     return true;
   }
 
-  bool TranslateFneg4S(uint32_t insn) {
+  bool TranslateFneg2S4S(uint32_t insn) {
+    const bool is_128_bit = (insn & (1u << 30)) != 0;
     const uint32_t rn = (insn >> 5) & 31;
     const uint32_t rd = insn & 31;
     LoadV(rn, Assembler::vr1);
@@ -3397,6 +3495,54 @@ class LiteTranslator {
     as_.Vreplgr2vrW(Assembler::vr2, Assembler::t0);
     as_.VxorV(Assembler::vr0, Assembler::vr1, Assembler::vr2);
     StoreV(rd, Assembler::vr0);
+    if (!is_128_bit) {
+      as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
+    }
+    return true;
+  }
+
+  bool TranslateUaddlv8B(uint32_t insn) {
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    as_.Move(Assembler::t0, Assembler::zero);
+    for (int32_t lane = 0; lane < 8; ++lane) {
+      as_.LdBU(Assembler::t1, Assembler::s8, VOffset(rn) + lane);
+      as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
+    }
+    as_.StH(Assembler::t0, Assembler::s8, VOffset(rd));
+    as_.StH(Assembler::zero, Assembler::s8, VOffset(rd) + 2);
+    as_.StW(Assembler::zero, Assembler::s8, VOffset(rd) + 4);
+    as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
+    return true;
+  }
+
+  bool TranslateScalarFabsFneg(uint32_t insn) {
+    const bool is_double = (insn & (1u << 22)) != 0;
+    const bool negate = (insn & (1u << 16)) != 0;
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    if (is_double) {
+      as_.LdD(Assembler::t0, Assembler::s8, VOffset(rn));
+      as_.Li(Assembler::t1,
+             negate ? 0x8000'0000'0000'0000ULL : 0x7fff'ffff'ffff'ffffULL);
+      if (negate) {
+        as_.Xor(Assembler::t0, Assembler::t0, Assembler::t1);
+      } else {
+        as_.And(Assembler::t0, Assembler::t0, Assembler::t1);
+      }
+      as_.StD(Assembler::t0, Assembler::s8, VOffset(rd));
+    } else {
+      as_.LdWU(Assembler::t0, Assembler::s8, VOffset(rn));
+      as_.Li(Assembler::t1, negate ? 0x8000'0000u : 0x7fff'ffffu);
+      if (negate) {
+        as_.Xor(Assembler::t0, Assembler::t0, Assembler::t1);
+      } else {
+        as_.And(Assembler::t0, Assembler::t0, Assembler::t1);
+      }
+      as_.StW(Assembler::t0, Assembler::s8, VOffset(rd));
+      as_.StW(Assembler::zero, Assembler::s8, VOffset(rd) + 4);
+    }
+    as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
     return true;
   }
 

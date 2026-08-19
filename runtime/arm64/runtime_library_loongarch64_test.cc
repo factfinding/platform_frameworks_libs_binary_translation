@@ -3621,12 +3621,13 @@ TEST(LoongArch64RuntimeLibraryTest, LiteFaddp2SUsesSourceCache) {
 }
 
 TEST(LoongArch64RuntimeLibraryTest, LiteHotVectorComparisonsMatchInterpreter) {
-  constexpr std::array<uint32_t, 5> kGuestCode = {
+  constexpr std::array<uint32_t, 6> kGuestCode = {
       0x4ea0'd800,  // fcmeq v0.4s,v0.4s,#0
       0x6e21'e400,  // fcmge v0.4s,v0.4s,v1.4s
       0x6ea7'e462,  // fcmgt v2.4s,v3.4s,v7.4s
       0x6e27'8e07,  // cmeq v7.16b,v16.16b,v7.16b (destination aliases second source)
       0x6e21'3ca3,  // cmhs v3.16b,v5.16b,v1.16b
+      0x4ea0'3442,  // cmgt v2.4s,v2.4s,v0.4s
   };
   for (uint32_t insn : kGuestCode) {
     const std::array<uint32_t, 1> one_insn = {insn};
@@ -3649,10 +3650,11 @@ TEST(LoongArch64RuntimeLibraryTest, LiteHotVectorComparisonsMatchInterpreter) {
   }
 }
 
-TEST(LoongArch64RuntimeLibraryTest, LiteFneg4SAndBsl16BMatchInterpreter) {
-  constexpr std::array<uint32_t, 5> kGuestCode = {
+TEST(LoongArch64RuntimeLibraryTest, LiteFneg2S4SAndBsl16BMatchInterpreter) {
+  constexpr std::array<uint32_t, 6> kGuestCode = {
       0x6ea0'f820,  // fneg v0.4s,v1.4s
       0x6ea0'f821,  // fneg v1.4s,v1.4s (destination aliases source)
+      0x2ea0'f820,  // fneg v0.2s,v1.2s
       0x6e63'1c22,  // bsl v2.16b,v1.16b,v3.16b
       0x6e62'1c22,  // bsl v2.16b,v1.16b,v2.16b (destination aliases second source)
       0x6e61'1c21,  // bsl v1.16b,v1.16b,v1.16b (all registers alias)
@@ -3729,6 +3731,84 @@ TEST(LoongArch64RuntimeLibraryTest, LiteScalarScvtfMatchesInterpreter) {
     InterpretInsn(&interpreted);
     TranslateAndRun(one_insn, &translated);
     SCOPED_TRACE(testing::Message() << "insn=" << std::hex << one_insn[0]);
+    EXPECT_EQ(translated.cpu.v[rd], interpreted.cpu.v[rd]);
+  }
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteScalarUcvtfMatchesInterpreter) {
+  constexpr std::array<uint32_t, 4> kGuestCode = {
+      0x1e23'0020,  // ucvtf s0,w1
+      0x9e23'0062,  // ucvtf s2,x3
+      0x1e63'00a4,  // ucvtf d4,w5
+      0x9e63'00e6,  // ucvtf d6,x7
+  };
+  constexpr std::array<uint64_t, 4> kInputs = {
+      UINT32_MAX,
+      UINT64_MAX,
+      UINT32_MAX,
+      0x8000'0000'0000'0001ULL,
+  };
+  for (size_t i = 0; i < kGuestCode.size(); ++i) {
+    const std::array<uint32_t, 1> one_insn = {kGuestCode[i]};
+    ThreadState interpreted{};
+    ThreadState translated{};
+    const uint32_t rn = (one_insn[0] >> 5) & 31;
+    const uint32_t rd = one_insn[0] & 31;
+    interpreted.cpu.x[rn] = kInputs[i];
+    interpreted.cpu.v[rd] = MakeUint128(UINT64_MAX, UINT64_MAX);
+    translated.cpu = interpreted.cpu;
+    SetInsnAddr(interpreted.cpu, ToGuestAddr(one_insn.data()));
+    InterpretInsn(&interpreted);
+    TranslateAndRun(one_insn, &translated);
+    SCOPED_TRACE(testing::Message() << "insn=" << std::hex << one_insn[0]);
+    EXPECT_EQ(translated.cpu.v[rd], interpreted.cpu.v[rd]);
+  }
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteScalarFabsFnegMatchesInterpreter) {
+  constexpr std::array<uint32_t, 4> kGuestCode = {
+      0x1e21'4020,  // fneg s0,s1
+      0x1e61'4062,  // fneg d2,d3
+      0x1e20'c0a4,  // fabs s4,s5
+      0x1e60'c0e6,  // fabs d6,d7
+  };
+  for (uint32_t insn : kGuestCode) {
+    const std::array<uint32_t, 1> one_insn = {insn};
+    ThreadState interpreted{};
+    ThreadState translated{};
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    interpreted.cpu.v[rn] = MakeUint128(0xffc1'2345'8000'0000ULL, 0x0123'4567'89ab'cdefULL);
+    interpreted.cpu.v[rd] = MakeUint128(UINT64_MAX, UINT64_MAX);
+    translated.cpu = interpreted.cpu;
+    SetInsnAddr(interpreted.cpu, ToGuestAddr(one_insn.data()));
+    InterpretInsn(&interpreted);
+    TranslateAndRun(one_insn, &translated);
+    SCOPED_TRACE(testing::Message() << "insn=" << std::hex << insn);
+    EXPECT_EQ(translated.cpu.v[rd], interpreted.cpu.v[rd]);
+  }
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteUaddlv8BMatchesInterpreter) {
+  constexpr std::array<uint32_t, 2> kGuestCode = {
+      0x2e30'3820,  // uaddlv h0,v1.8b
+      0x2e30'3842,  // uaddlv h2,v2.8b (destination aliases source)
+  };
+  for (uint32_t insn : kGuestCode) {
+    const std::array<uint32_t, 1> one_insn = {insn};
+    ThreadState interpreted{};
+    ThreadState translated{};
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    interpreted.cpu.v[rn] = MakeUint128(0xff80'4020'1008'0402ULL, UINT64_MAX);
+    if (rd != rn) {
+      interpreted.cpu.v[rd] = MakeUint128(UINT64_MAX, UINT64_MAX);
+    }
+    translated.cpu = interpreted.cpu;
+    SetInsnAddr(interpreted.cpu, ToGuestAddr(one_insn.data()));
+    InterpretInsn(&interpreted);
+    TranslateAndRun(one_insn, &translated);
+    SCOPED_TRACE(testing::Message() << "insn=" << std::hex << insn);
     EXPECT_EQ(translated.cpu.v[rd], interpreted.cpu.v[rd]);
   }
 }
