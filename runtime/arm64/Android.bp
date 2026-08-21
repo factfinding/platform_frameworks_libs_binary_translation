@@ -135,3 +135,51 @@ cc_test {
     shared_libs: ["liblog"],
     test_suites: ["device-tests"],
 }
+
+cc_binary {
+    name: "berberis_runtime_arm64_loongarch64_microbench",
+    defaults: ["berberis_arm64_defaults"],
+    // LoongArch runtime entry stubs branch to absolute assembly symbols.
+    // ThinLTO currently rewrites those references into invalid B26 relocations.
+    lto: {
+        never: true,
+    },
+    enabled: false,
+    arch: {
+        loongarch64: {
+            enabled: true,
+        },
+    },
+    srcs: ["loongarch64_microbench.cc"],
+    header_libs: [
+        "berberis_test_utils_headers",
+        "libberberis_assembler_headers",
+        "libberberis_code_gen_lib_headers",
+        "libberberis_guest_abi_arm64_headers",
+        "libberberis_guest_state_arm64_headers",
+        "libberberis_lite_translator_headers",
+        "libberberis_runtime_primitives_headers",
+    ],
+    static_libs: [
+        "libbase",
+        "libberberis_assembler",
+        "libberberis_base",
+        "libberberis_code_gen_lib_arm64",
+        "libberberis_elf_backed_exec_region",
+        "libberberis_guest_abi_arm64",
+        "libberberis_guest_os_primitives_arm64",
+        "libberberis_guest_state_arm64",
+        "libberberis_instrument",
+        "libberberis_interpreter_arm64",
+        "libberberis_intrinsics",
+        "libberberis_intrinsics_arm64",
+        "libberberis_kernel_api_arm64",
+        "libberberis_lite_translator_arm64_to_loongarch64",
+        "libberberis_runtime_arm64",
+        "libberberis_runtime_primitives",
+        "libberberis_runtime_primitives_arm64",
+        "libberberis_tinyloader",
+        "libffi",
+    ],
+    shared_libs: ["liblog"],
+}
