@@ -242,6 +242,52 @@ TEST(LoongArch64RuntimeLibraryTest, LiteWriteThroughRegisterMappingPreservesInte
   EXPECT_EQ(state.cpu.x[2], 12u);
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteRegisterCacheExcludesDestinationOnlyRegisters) {
+  // add x0, x1, x2 repeated.  Only x1 and x2 are read; treating the Rd field
+  // as a use would cache x0 and add one needless move after every write.
+  constexpr std::array<uint32_t, 8> kGuestCode = {
+      0x8b02'0020,
+      0x8b02'0020,
+      0x8b02'0020,
+      0x8b02'0020,
+      0x8b02'0020,
+      0x8b02'0020,
+      0x8b02'0020,
+      0x8b02'0020,
+  };
+  InitHostEntries();
+  GuestAddr start_pc = ToGuestAddr(kGuestCode.data());
+
+  LiteTranslateParams params;
+  params.end_pc = start_pc + sizeof(kGuestCode);
+  params.allow_dispatch = false;
+  params.enable_reg_mapping = false;
+  MachineCode uncached_code;
+  auto [uncached_success, uncached_stop_pc] =
+      TryLiteTranslateRegion(start_pc, &uncached_code, params);
+  ASSERT_TRUE(uncached_success);
+  ASSERT_EQ(uncached_stop_pc, params.end_pc);
+
+  params.enable_reg_mapping = true;
+  MachineCode cached_code;
+  auto [cached_success, cached_stop_pc] = TryLiteTranslateRegion(start_pc, &cached_code, params);
+  ASSERT_TRUE(cached_success);
+  ASSERT_EQ(cached_stop_pc, params.end_pc);
+
+  // Cached source loads are replaced one-for-one by moves.  Only the two
+  // source-cache prologue loads may increase code size.
+  EXPECT_EQ(cached_code.install_size(), uncached_code.install_size() + 2 * sizeof(uint32_t));
+
+  ThreadState state{};
+  state.cpu.x[1] = 17;
+  state.cpu.x[2] = 25;
+  ScopedExecRegion exec(&cached_code);
+  SetInsnAddr(state.cpu, start_pc);
+  SetResidence(state, kOutsideGeneratedCode);
+  berberis_RunGeneratedCode(&state, AsHostCode(exec.GetHostCodeAddr()));
+  EXPECT_EQ(state.cpu.x[0], 42u);
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesCompareAndBranch) {
   // cbz x0, +8.  Taken dispatches to the target while the fallthrough remains
   // in the current region and executes both following instructions.
@@ -313,21 +359,27 @@ TEST(LoongArch64RuntimeLibraryTest, LiteRegisterCacheIgnoresCodeAfterTerminalBra
   constexpr std::array<uint32_t, 16> kGuestCode = {
       0x8b01'0020,  // add x0,x1,x1
       0x1400'0001,  // b +4 (terminates the linear region)
-      0x8b02'0042, 0x8b02'0042,
-      0x8b03'0063, 0x8b03'0063,
-      0x8b04'0084, 0x8b04'0084,
-      0x8b05'00a5, 0x8b05'00a5,
-      0x8b06'00c6, 0x8b06'00c6,
-      0x8b07'00e7, 0x8b07'00e7,
-      0x8b08'0108, 0x8b08'0108,
+      0x8b02'0042,
+      0x8b02'0042,
+      0x8b03'0063,
+      0x8b03'0063,
+      0x8b04'0084,
+      0x8b04'0084,
+      0x8b05'00a5,
+      0x8b05'00a5,
+      0x8b06'00c6,
+      0x8b06'00c6,
+      0x8b07'00e7,
+      0x8b07'00e7,
+      0x8b08'0108,
+      0x8b08'0108,
   };
   GuestAddr start_pc = ToGuestAddr(kGuestCode.data());
   LiteTranslateParams short_params;
   short_params.end_pc = start_pc + 2 * sizeof(uint32_t);
   short_params.allow_dispatch = false;
   MachineCode short_code;
-  auto [short_success, short_stop_pc] =
-      TryLiteTranslateRegion(start_pc, &short_code, short_params);
+  auto [short_success, short_stop_pc] = TryLiteTranslateRegion(start_pc, &short_code, short_params);
   ASSERT_TRUE(short_success);
   ASSERT_EQ(short_stop_pc, short_params.end_pc);
 
@@ -1764,8 +1816,7 @@ TEST(LoongArch64RuntimeLibraryTest, LiteFabs4SUsesSourceCache) {
 
   ThreadState state{};
   state.cpu.v[1] = MakeUint32x4(0x8000'0000, 0xffc1'2345, 0xff80'0000, 0xc049'0fdb);
-  const __uint128_t expected =
-      MakeUint32x4(0x0000'0000, 0x7fc1'2345, 0x7f80'0000, 0x4049'0fdb);
+  const __uint128_t expected = MakeUint32x4(0x0000'0000, 0x7fc1'2345, 0x7f80'0000, 0x4049'0fdb);
   ScopedExecRegion exec(&cached_code);
   SetInsnAddr(state.cpu, start_pc);
   SetResidence(state, kOutsideGeneratedCode);
@@ -1818,8 +1869,7 @@ TEST(LoongArch64RuntimeLibraryTest, LitePermute4SUsesSourceCache) {
   ThreadState state{};
   state.cpu.v[0] = MakeUint32x4(0x0000'0000, 0x1111'1111, 0x2222'2222, 0x3333'3333);
   state.cpu.v[1] = MakeUint32x4(0xaaaa'aaaa, 0xbbbb'bbbb, 0xcccc'cccc, 0xdddd'dddd);
-  const __uint128_t expected =
-      MakeUint32x4(0x0000'0000, 0xaaaa'aaaa, 0x1111'1111, 0xbbbb'bbbb);
+  const __uint128_t expected = MakeUint32x4(0x0000'0000, 0xaaaa'aaaa, 0x1111'1111, 0xbbbb'bbbb);
   ScopedExecRegion exec(&cached_code);
   SetInsnAddr(state.cpu, start_pc);
   SetResidence(state, kOutsideGeneratedCode);
@@ -1847,8 +1897,7 @@ TEST(LoongArch64RuntimeLibraryTest, LiteVectorCacheObservesLd1rWrites) {
 
   TranslateAndRun(kGuestCode, &state);
 
-  const __uint128_t expected =
-      MakeUint32x4(0x4000'0000, 0x4080'0000, 0x40c0'0000, 0x4100'0000);
+  const __uint128_t expected = MakeUint32x4(0x4000'0000, 0x4080'0000, 0x40c0'0000, 0x4100'0000);
   for (uint32_t reg = 2; reg <= 5; ++reg) {
     EXPECT_EQ(state.cpu.v[reg], expected) << reg;
   }
@@ -1948,8 +1997,7 @@ TEST(LoongArch64RuntimeLibraryTest, LiteExtUsesSourceCache) {
   ThreadState state{};
   state.cpu.v[0] = MakeUint128(0x0706'0504'0302'0100, 0x0f0e'0d0c'0b0a'0908);
   state.cpu.v[1] = MakeUint128(0x1716'1514'1312'1110, 0x1f1e'1d1c'1b1a'1918);
-  const __uint128_t expected =
-      MakeUint128(0x0e0d'0c0b'0a09'0807, 0x1615'1413'1211'100f);
+  const __uint128_t expected = MakeUint128(0x0e0d'0c0b'0a09'0807, 0x1615'1413'1211'100f);
   ScopedExecRegion exec(&cached_code);
   SetInsnAddr(state.cpu, start_pc);
   SetResidence(state, kOutsideGeneratedCode);
@@ -3193,15 +3241,14 @@ TEST(LoongArch64RuntimeLibraryTest, LiteHotStructMemoryMatchesInterpreter) {
 
   for (size_t i = 0; i < kGuestCode.size(); ++i) {
     const std::array<uint32_t, 1> one_insn = {kGuestCode[i]};
-    alignas(16) std::array<uint64_t, 8> interpreted_memory = {
-        0x0123'4567'89ab'cdef,
-        0x1122'3344'5566'7788,
-        0x99aa'bbcc'ddee'ff00,
-        0xfedc'ba98'7654'3210,
-        0x0f1e'2d3c'4b5a'6978,
-        0x8877'6655'4433'2211,
-        0x1357'9bdf'2468'ace0,
-        0xdead'beef'cafe'babe};
+    alignas(16) std::array<uint64_t, 8> interpreted_memory = {0x0123'4567'89ab'cdef,
+                                                              0x1122'3344'5566'7788,
+                                                              0x99aa'bbcc'ddee'ff00,
+                                                              0xfedc'ba98'7654'3210,
+                                                              0x0f1e'2d3c'4b5a'6978,
+                                                              0x8877'6655'4433'2211,
+                                                              0x1357'9bdf'2468'ace0,
+                                                              0xdead'beef'cafe'babe};
     alignas(16) std::array<uint64_t, 8> translated_memory = interpreted_memory;
     ThreadState interpreted{};
     ThreadState translated{};
@@ -3593,8 +3640,8 @@ TEST(LoongArch64RuntimeLibraryTest, LiteMovSFromElementMatchesInterpreter) {
     ThreadState interpreted{};
     ThreadState translated{};
     for (uint32_t reg = 0; reg < 8; ++reg) {
-      interpreted.cpu.v[reg] = MakeUint32x4(
-          0x0102'0304 + reg, 0x1122'3344 + reg, 0x5566'7788 + reg, 0x99aa'bbcc + reg);
+      interpreted.cpu.v[reg] =
+          MakeUint32x4(0x0102'0304 + reg, 0x1122'3344 + reg, 0x5566'7788 + reg, 0x99aa'bbcc + reg);
       translated.cpu.v[reg] = interpreted.cpu.v[reg];
     }
     SetInsnAddr(interpreted.cpu, ToGuestAddr(one_insn.data()));
@@ -3882,11 +3929,11 @@ TEST(LoongArch64RuntimeLibraryTest, LiteScalarMinMaxMatchesInterpreter) {
         lhs = lhs == 0x4040'0000u   ? 0x4008'0000'0000'0000ULL
               : lhs == 0xc080'0000u ? 0xc010'0000'0000'0000ULL
               : lhs == 0x8000'0000u ? 0x8000'0000'0000'0000ULL
-                                     : 0;
+                                    : 0;
         rhs = rhs == 0x4040'0000u   ? 0x4008'0000'0000'0000ULL
               : rhs == 0xc080'0000u ? 0xc010'0000'0000'0000ULL
               : rhs == 0x8000'0000u ? 0x8000'0000'0000'0000ULL
-                                     : 0;
+                                    : 0;
       }
       const std::array<uint32_t, 1> one_insn = {insn};
       ThreadState interpreted{};
@@ -3898,8 +3945,8 @@ TEST(LoongArch64RuntimeLibraryTest, LiteScalarMinMaxMatchesInterpreter) {
       SetInsnAddr(interpreted.cpu, ToGuestAddr(one_insn.data()));
       InterpretInsn(&interpreted);
       TranslateAndRun(one_insn, &translated);
-      SCOPED_TRACE(testing::Message() << "insn=" << std::hex << insn << " lhs=" << lhs
-                                      << " rhs=" << rhs);
+      SCOPED_TRACE(testing::Message()
+                   << "insn=" << std::hex << insn << " lhs=" << lhs << " rhs=" << rhs);
       EXPECT_EQ(translated.cpu.v[rd], interpreted.cpu.v[rd]);
     }
   }
@@ -3969,8 +4016,8 @@ TEST(LoongArch64RuntimeLibraryTest, LiteHot2SLaneOperationsMatchInterpreter) {
     ThreadState translated{};
     for (uint32_t reg = 0; reg < 32; ++reg) {
       interpreted.cpu.x[reg] = 0x8000'0000u + reg * 0x0102'0304u;
-      interpreted.cpu.v[reg] = MakeUint32x4(
-          0x3f00'0000u + reg, 0xc000'0000u + reg, 0x7000'0000u + reg, reg);
+      interpreted.cpu.v[reg] =
+          MakeUint32x4(0x3f00'0000u + reg, 0xc000'0000u + reg, 0x7000'0000u + reg, reg);
     }
     translated.cpu = interpreted.cpu;
     SetInsnAddr(interpreted.cpu, ToGuestAddr(one_insn.data()));
@@ -4046,11 +4093,10 @@ TEST(LoongArch64RuntimeLibraryTest, LiteScalarFmulByElementMatchesInterpreter) {
     ThreadState interpreted{};
     ThreadState translated{};
     for (uint32_t reg = 0; reg < 32; ++reg) {
-      interpreted.cpu.v[reg] =
-          MakeUint32x4(0x3f00'0000 + reg * 0x0001'0000,
-                       0xbf80'0000 - reg * 0x0001'0000,
-                       0x4000'0000 + reg * 0x0000'8000,
-                       0x8000'0000);
+      interpreted.cpu.v[reg] = MakeUint32x4(0x3f00'0000 + reg * 0x0001'0000,
+                                            0xbf80'0000 - reg * 0x0001'0000,
+                                            0x4000'0000 + reg * 0x0000'8000,
+                                            0x8000'0000);
     }
     translated.cpu = interpreted.cpu;
     SetInsnAddr(interpreted.cpu, ToGuestAddr(one_insn.data()));

@@ -16,6 +16,7 @@
 
 #include "berberis/lite_translator/lite_translate_region.h"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -39,21 +40,10 @@ using SimdRegister = loongarch64::SimdRegister;
 using CachedXRegisterMap = std::array<int8_t, 32>;
 using CachedVRegisterMap = std::array<int8_t, 32>;
 
-GuestAddr FindLinearRegionEnd(GuestAddr start_pc, GuestAddr end_pc) {
-  for (GuestAddr pc = start_pc; pc < end_pc; pc += sizeof(uint32_t)) {
-    uint32_t insn = *ToHostAddr<const uint32_t>(pc);
-    // An unconditional immediate or register branch terminates the linear
-    // region.  Do not let unreachable instructions after it influence the
-    // source-only register cache selection.
-    if ((insn & 0x7c00'0000u) == 0x1400'0000u ||
-        (insn & 0xffff'fc1fu) == 0xd61f'0000u ||
-        (insn & 0xffff'fc1fu) == 0xd63f'0000u ||
-        (insn & 0xffff'fc1fu) == 0xd65f'0000u) {
-      return pc + sizeof(uint32_t);
-    }
-  }
-  return end_pc;
-}
+struct XRegisterUsage {
+  std::array<uint16_t, 31> reads{};
+  std::array<uint16_t, 31> writes{};
+};
 
 constexpr int32_t kSpOffset = offsetof(ThreadState, cpu) + offsetof(CPUState, sp);
 constexpr int32_t kFlagsOffset = offsetof(ThreadState, cpu) + offsetof(CPUState, flags);
@@ -69,31 +59,28 @@ constexpr int64_t SignExtend(uint64_t value, uint32_t width) {
   return static_cast<int64_t>((value & mask) ^ sign) - static_cast<int64_t>(sign);
 }
 
-CachedXRegisterMap SelectCachedXRegisters(GuestAddr start_pc, GuestAddr end_pc) {
-  std::array<uint16_t, 31> uses{};
-  for (GuestAddr pc = start_pc; pc < end_pc; pc += sizeof(uint32_t)) {
-    uint32_t insn = *ToHostAddr<const uint32_t>(pc);
-    for (uint32_t reg : {insn & 31, (insn >> 5) & 31, (insn >> 10) & 31, (insn >> 16) & 31}) {
-      if (reg != 31) {
-        ++uses[reg];
-      }
-    }
-  }
-
+CachedXRegisterMap SelectCachedXRegisters(const XRegisterUsage& usage) {
   CachedXRegisterMap result{};
   result.fill(-1);
+  std::array<bool, 31> selected{};
   for (int8_t slot = 0; slot < 7; ++slot) {
     uint32_t best_reg = 31;
-    for (uint32_t reg = 0; reg < uses.size(); ++reg) {
-      if (uses[reg] >= 2 && (best_reg == 31 || uses[reg] > uses[best_reg])) {
+    uint32_t best_score = 0;
+    for (uint32_t reg = 0; reg < usage.reads.size(); ++reg) {
+      // A cached read replaces a ThreadState load.  A cached write remains
+      // write-through and may need an additional register move, so use writes
+      // only as a tie-break penalty and never cache destination-only values.
+      uint32_t score = 2 * usage.reads[reg] - std::min(usage.reads[reg], usage.writes[reg]);
+      if (!selected[reg] && usage.reads[reg] >= 2 && score > best_score) {
         best_reg = reg;
+        best_score = score;
       }
     }
     if (best_reg == 31) {
       break;
     }
     result[best_reg] = slot;
-    uses[best_reg] = 0;
+    selected[best_reg] = true;
   }
   return result;
 }
@@ -126,8 +113,7 @@ CachedVRegisterMap SelectCachedVRegisters(GuestAddr start_pc, GuestAddr end_pc) 
     // Scalar FMUL by element splits Vm across bit 20 and bits 19:16.  Decode
     // that source explicitly rather than treating the lane bits as a vector
     // register number.
-    if ((insn & 0xffc0'f400u) == 0x5f80'9000u ||
-        (insn & 0xbfc0'f400u) == 0x0f80'9000u) {
+    if ((insn & 0xffc0'f400u) == 0x5f80'9000u || (insn & 0xbfc0'f400u) == 0x0f80'9000u) {
       mark_written(insn);
       mark_read(insn >> 5);
       mark_read((((insn >> 20) & 1) << 4) | ((insn >> 16) & 15));
@@ -142,8 +128,7 @@ CachedVRegisterMap SelectCachedVRegisters(GuestAddr start_pc, GuestAddr end_pc) 
 
     // Unary narrowing/widening and scalar vector conversion have only Vn as
     // a vector source.  The general-register SCVTF forms have none.
-    if ((insn & 0xffff'fc00u) == 0x5e21'd800u ||
-        (insn & 0xbfff'fc00u) == 0x0e21'd800u ||
+    if ((insn & 0xffff'fc00u) == 0x5e21'd800u || (insn & 0xbfff'fc00u) == 0x0e21'd800u ||
         ((insn & 0xff80'fc00u) == 0x2f00'a400u && (((insn >> 19) & 0xeu) == 0x2u)) ||
         (insn & 0xffff'fc00u) == 0x0e61'2800u) {
       mark_written(insn);
@@ -161,14 +146,10 @@ CachedVRegisterMap SelectCachedVRegisters(GuestAddr start_pc, GuestAddr end_pc) 
     // DUP from a general register and modified-immediate constants have no
     // vector source.  UMOV is the opposite: it reads a vector but writes a
     // general register.  Handle them before the conservative SIMD rule.
-    if ((insn & 0xbfff'fc00u) == 0x0e04'0c00u ||
-        (insn & 0xffff'ffe0u) == 0x4f04'8400u ||
-        (insn & 0xffff'ffe0u) == 0x4f04'6400u ||
-        (insn & 0xffff'ffe0u) == 0x4f05'67e0u ||
-        (insn & 0xffff'ffe0u) == 0x4f03'f600u ||
-        (insn & 0xffff'ffe0u) == 0x4f06'f600u ||
-        (insn & 0xffff'ffe0u) == 0x4f07'f600u ||
-        (insn & 0xffff'ffe0u) == 0x0f07'f600u) {
+    if ((insn & 0xbfff'fc00u) == 0x0e04'0c00u || (insn & 0xffff'ffe0u) == 0x4f04'8400u ||
+        (insn & 0xffff'ffe0u) == 0x4f04'6400u || (insn & 0xffff'ffe0u) == 0x4f05'67e0u ||
+        (insn & 0xffff'ffe0u) == 0x4f03'f600u || (insn & 0xffff'ffe0u) == 0x4f06'f600u ||
+        (insn & 0xffff'ffe0u) == 0x4f07'f600u || (insn & 0xffff'ffe0u) == 0x0f07'f600u) {
       mark_written(insn);
       continue;
     }
@@ -176,10 +157,8 @@ CachedVRegisterMap SelectCachedVRegisters(GuestAddr start_pc, GuestAddr end_pc) 
       mark_read(insn >> 5);
       continue;
     }
-    if ((insn & 0xffff'fc00u) == 0x1e21'4000u ||
-        (insn & 0xffff'fc00u) == 0x1e61'4000u ||
-        (insn & 0xffff'fc00u) == 0x1e20'c000u ||
-        (insn & 0xffff'fc00u) == 0x1e60'c000u ||
+    if ((insn & 0xffff'fc00u) == 0x1e21'4000u || (insn & 0xffff'fc00u) == 0x1e61'4000u ||
+        (insn & 0xffff'fc00u) == 0x1e20'c000u || (insn & 0xffff'fc00u) == 0x1e60'c000u ||
         (insn & 0xffff'fc00u) == 0x2e30'3800u) {
       mark_written(insn);
       mark_read(insn >> 5);
@@ -307,12 +286,14 @@ class LiteTranslator {
                           CachedXRegisterMap cached_x_registers,
                           CachedVRegisterMap cached_v_registers,
                           bool enable_guest_memory,
-                          bool allow_dispatch)
+                          bool allow_dispatch,
+                          XRegisterUsage* x_register_usage = nullptr)
       : as_(machine_code),
         enable_guest_memory_(enable_guest_memory),
         allow_dispatch_(allow_dispatch),
         cached_x_registers_(cached_x_registers),
-        cached_v_registers_(cached_v_registers) {
+        cached_v_registers_(cached_v_registers),
+        x_register_usage_(x_register_usage) {
     for (uint32_t guest_reg = 0; guest_reg < cached_x_registers_.size(); ++guest_reg) {
       int slot = cached_x_registers_[guest_reg];
       if (slot >= 0) {
@@ -453,8 +434,7 @@ class LiteTranslator {
     }
     // LD4 of four complete 4S vectors.  Handle this before the broader LD1
     // class below, whose decoder rejects interleaved structure opcodes.
-    if ((insn & 0xffff'fc00u) == 0x4c40'0800u ||
-        (insn & 0xffe0'fc00u) == 0x4cc0'0800u) {
+    if ((insn & 0xffff'fc00u) == 0x4c40'0800u || (insn & 0xffe0'fc00u) == 0x4cc0'0800u) {
       if (!enable_guest_memory_) {
         return false;
       }
@@ -472,10 +452,8 @@ class LiteTranslator {
     }
     // LD1/ST1 of one 64-bit lane, with optional immediate/register
     // post-index writeback.  Q selects the destination/source lane.
-    if ((insn & 0xbfff'fc00u) == 0x0d40'8400u ||
-        (insn & 0xbfff'fc00u) == 0x0d00'8400u ||
-        (insn & 0xbfe0'fc00u) == 0x0dc0'8400u ||
-        (insn & 0xbfe0'fc00u) == 0x0d80'8400u) {
+    if ((insn & 0xbfff'fc00u) == 0x0d40'8400u || (insn & 0xbfff'fc00u) == 0x0d00'8400u ||
+        (insn & 0xbfe0'fc00u) == 0x0dc0'8400u || (insn & 0xbfe0'fc00u) == 0x0d80'8400u) {
       if (!enable_guest_memory_) {
         return false;
       }
@@ -483,16 +461,14 @@ class LiteTranslator {
     }
     // LD1R of one 32- or 64-bit element, with optional immediate/register
     // post-index writeback.
-    if ((insn & 0xffff'f800u) == 0x4d40'c800u ||
-        (insn & 0xffe0'f800u) == 0x4dc0'c800u) {
+    if ((insn & 0xffff'f800u) == 0x4d40'c800u || (insn & 0xffe0'f800u) == 0x4dc0'c800u) {
       if (!enable_guest_memory_) {
         return false;
       }
       return TranslateLd1r(insn, pc);
     }
     // LD1/ST1 of one 32-bit lane without writeback.  Q and S encode the lane.
-    if ((insn & 0xbfff'ec00u) == 0x0d40'8000u ||
-        (insn & 0xbfff'ec00u) == 0x0d00'8000u) {
+    if ((insn & 0xbfff'ec00u) == 0x0d40'8000u || (insn & 0xbfff'ec00u) == 0x0d00'8000u) {
       if (!enable_guest_memory_) {
         return false;
       }
@@ -664,28 +640,22 @@ class LiteTranslator {
       return TranslateMoviConstant(insn, 0x0000'0001'0000'0001ULL, 0);
     }
     if ((insn & 0xffff'ffe0u) == 0x4f04'8400u) {
-      return TranslateMoviConstant(insn, 0x0080'0080'0080'0080ULL,
-                                   0x0080'0080'0080'0080ULL);
+      return TranslateMoviConstant(insn, 0x0080'0080'0080'0080ULL, 0x0080'0080'0080'0080ULL);
     }
     if ((insn & 0xffff'ffe0u) == 0x4f04'6400u) {
-      return TranslateMoviConstant(insn, 0x8000'0000'8000'0000ULL,
-                                   0x8000'0000'8000'0000ULL);
+      return TranslateMoviConstant(insn, 0x8000'0000'8000'0000ULL, 0x8000'0000'8000'0000ULL);
     }
     if ((insn & 0xffff'ffe0u) == 0x4f05'67e0u) {
-      return TranslateMoviConstant(insn, 0xbf00'0000'bf00'0000ULL,
-                                   0xbf00'0000'bf00'0000ULL);
+      return TranslateMoviConstant(insn, 0xbf00'0000'bf00'0000ULL, 0xbf00'0000'bf00'0000ULL);
     }
     if ((insn & 0xffff'ffe0u) == 0x4f03'f600u) {
-      return TranslateMoviConstant(insn, 0x3f80'0000'3f80'0000ULL,
-                                   0x3f80'0000'3f80'0000ULL);
+      return TranslateMoviConstant(insn, 0x3f80'0000'3f80'0000ULL, 0x3f80'0000'3f80'0000ULL);
     }
     if ((insn & 0xffff'ffe0u) == 0x4f06'f600u) {
-      return TranslateMoviConstant(insn, 0xbe80'0000'be80'0000ULL,
-                                   0xbe80'0000'be80'0000ULL);
+      return TranslateMoviConstant(insn, 0xbe80'0000'be80'0000ULL, 0xbe80'0000'be80'0000ULL);
     }
     if ((insn & 0xffff'ffe0u) == 0x4f07'f600u) {
-      return TranslateMoviConstant(insn, 0xbf80'0000'bf80'0000ULL,
-                                   0xbf80'0000'bf80'0000ULL);
+      return TranslateMoviConstant(insn, 0xbf80'0000'bf80'0000ULL, 0xbf80'0000'bf80'0000ULL);
     }
     if ((insn & 0xffff'ffe0u) == 0x0f07'f600u) {
       return TranslateMoviConstant(insn, 0xbf80'0000'bf80'0000ULL, 0);
@@ -751,8 +721,7 @@ class LiteTranslator {
     if ((insn & 0xffe0'fc00u) == 0x4ea0'3400u) {
       return TranslateCmgt4S(insn);
     }
-    if ((insn & 0xffe0'fc00u) == 0x0ea0'a400u ||
-        (insn & 0xffe0'fc00u) == 0x0ea0'ac00u) {
+    if ((insn & 0xffe0'fc00u) == 0x0ea0'a400u || (insn & 0xffe0'fc00u) == 0x0ea0'ac00u) {
       return TranslateSignedMinMaxPair2S(insn);
     }
     if ((insn & 0xbfff'fc00u) == 0x0e21'd800u) {
@@ -785,10 +754,8 @@ class LiteTranslator {
     if ((insn & 0xffc0'f400u) == 0x5f80'9000u) {
       return TranslateFmulSByElement(insn);
     }
-    if ((insn & 0xffff'fc00u) == 0x1e21'4000u ||
-        (insn & 0xffff'fc00u) == 0x1e61'4000u ||
-        (insn & 0xffff'fc00u) == 0x1e20'c000u ||
-        (insn & 0xffff'fc00u) == 0x1e60'c000u) {
+    if ((insn & 0xffff'fc00u) == 0x1e21'4000u || (insn & 0xffff'fc00u) == 0x1e61'4000u ||
+        (insn & 0xffff'fc00u) == 0x1e20'c000u || (insn & 0xffff'fc00u) == 0x1e60'c000u) {
       return TranslateScalarFabsFneg(insn);
     }
     if ((insn & 0xffff'fc00u) == 0x1e20'4000u) {
@@ -1056,6 +1023,9 @@ class LiteTranslator {
     if (reg == 31) {
       as_.Move(dst, Assembler::zero);
     } else {
+      if (x_register_usage_ != nullptr) {
+        ++x_register_usage_->reads[reg];
+      }
       int slot = FindCachedXRegister(reg);
       if (slot < 0) {
         as_.LdD(dst, Assembler::s8, XOffset(reg));
@@ -1067,6 +1037,9 @@ class LiteTranslator {
 
   void StoreXOrDiscard(uint32_t reg, Register src) {
     if (reg != 31) {
+      if (x_register_usage_ != nullptr) {
+        ++x_register_usage_->writes[reg];
+      }
       // Keep ThreadState authoritative at every instruction boundary.  Signal
       // delivery and memory-fault recovery may leave generated code without
       // passing through a normal region exit.
@@ -1079,6 +1052,9 @@ class LiteTranslator {
   }
 
   void LoadXOrSp(uint32_t reg, Register dst) {
+    if (reg != 31 && x_register_usage_ != nullptr) {
+      ++x_register_usage_->reads[reg];
+    }
     int slot = reg == 31 ? -1 : FindCachedXRegister(reg);
     if (slot < 0) {
       as_.LdD(dst, Assembler::s8, reg == 31 ? kSpOffset : XOffset(reg));
@@ -1091,6 +1067,9 @@ class LiteTranslator {
     if (reg == 31) {
       as_.StD(src, Assembler::s8, kSpOffset);
       return;
+    }
+    if (x_register_usage_ != nullptr) {
+      ++x_register_usage_->writes[reg];
     }
     as_.StD(src, Assembler::s8, XOffset(reg));
     int slot = FindCachedXRegister(reg);
@@ -3680,8 +3659,7 @@ class LiteTranslator {
     const uint32_t rd = insn & 31;
     if (is_double) {
       as_.LdD(Assembler::t0, Assembler::s8, VOffset(rn));
-      as_.Li(Assembler::t1,
-             negate ? 0x8000'0000'0000'0000ULL : 0x7fff'ffff'ffff'ffffULL);
+      as_.Li(Assembler::t1, negate ? 0x8000'0000'0000'0000ULL : 0x7fff'ffff'ffff'ffffULL);
       if (negate) {
         as_.Xor(Assembler::t0, Assembler::t0, Assembler::t1);
       } else {
@@ -4625,6 +4603,7 @@ class LiteTranslator {
   bool allow_dispatch_;
   CachedXRegisterMap cached_x_registers_;
   CachedVRegisterMap cached_v_registers_;
+  XRegisterUsage* x_register_usage_;
   std::vector<PendingStaticExit> pending_static_exits_;
   bool region_end_reached_ = false;
 };
@@ -4647,9 +4626,31 @@ std::tuple<bool, GuestAddr> TryLiteTranslateRegion(GuestAddr start_pc,
   CachedVRegisterMap cached_v_registers{};
   cached_v_registers.fill(-1);
   if (params.enable_reg_mapping) {
-    GuestAddr linear_end_pc = FindLinearRegionEnd(start_pc, params.end_pc);
-    cached_x_registers = SelectCachedXRegisters(start_pc, linear_end_pc);
-    cached_v_registers = SelectCachedVRegisters(start_pc, linear_end_pc);
+    // Reuse the real decoder to obtain exact GPR reads and writes.  This avoids
+    // mistaking immediate/opcode fields for registers and automatically keeps
+    // the analysis in sync as new instruction lowerings are added.
+    MachineCode analysis_code;
+    XRegisterUsage usage;
+    CachedXRegisterMap no_cached_x_registers{};
+    no_cached_x_registers.fill(-1);
+    CachedVRegisterMap no_cached_v_registers{};
+    no_cached_v_registers.fill(-1);
+    LiteTranslator analyzer(&analysis_code,
+                            no_cached_x_registers,
+                            no_cached_v_registers,
+                            params.enable_guest_memory,
+                            params.allow_dispatch,
+                            &usage);
+    GuestAddr analysis_pc = start_pc;
+    while (analysis_pc < params.end_pc && !analyzer.region_end_reached()) {
+      uint32_t insn = *ToHostAddr<const uint32_t>(analysis_pc);
+      if (!analyzer.Translate(insn, analysis_pc)) {
+        return {false, analysis_pc};
+      }
+      analysis_pc += sizeof(insn);
+    }
+    cached_x_registers = SelectCachedXRegisters(usage);
+    cached_v_registers = SelectCachedVRegisters(start_pc, analysis_pc);
   }
   LiteTranslator translator(machine_code,
                             cached_x_registers,
