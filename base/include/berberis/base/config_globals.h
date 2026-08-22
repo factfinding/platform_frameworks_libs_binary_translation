@@ -45,6 +45,8 @@ const char* GetTracingConfig();
 
 const char* GetTranslationModeConfig();
 
+const char* GetJitThresholdConfig();
+
 const char* GetProfilingConfig();
 
 uintptr_t GetEntryPointOverride();

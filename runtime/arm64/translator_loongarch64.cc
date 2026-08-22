@@ -18,6 +18,8 @@
 
 #include <array>
 #include <atomic>
+#include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <tuple>
 
@@ -46,8 +48,17 @@ enum class TranslationMode {
 // for arbitrary APK startup code.  Set berberis.mode to
 // lite-translate-or-interpret to exercise translated regions.
 TranslationMode g_translation_mode = TranslationMode::kInterpretOnly;
+// Loading a large game touches hundreds of thousands of one-shot basic blocks.
+// Translating every first encounter both grows the code cache and makes the
+// application thread pay for register-usage analysis that it may never reuse.
+// Interpret cold entries in bounded batches and only compile recurring entry
+// points.  A value of four means translation starts on the fifth dispatch.
+constexpr uint32_t kDefaultJitThreshold = 4;
+constexpr uint32_t kMaxJitThreshold = 64;
+uint32_t g_jit_threshold = kDefaultJitThreshold;
 std::atomic<uint64_t> g_jit_successes;
 std::atomic<uint64_t> g_jit_fallbacks;
+std::atomic<uint64_t> g_jit_cold_interpretations;
 std::atomic<uint64_t> g_jit_guest_insns;
 std::atomic<uint64_t> g_jit_host_bytes;
 constexpr size_t kJitRegionBucketCount = 7;
@@ -178,6 +189,22 @@ void UpdateTranslationMode() {
   LOG_ALWAYS_FATAL("Unsupported LoongArch64 translation mode '%s'", mode);
 }
 
+void UpdateJitThreshold() {
+  const char* value = GetJitThresholdConfig();
+  if (!value || *value == '\0') {
+    return;
+  }
+  errno = 0;
+  char* end = nullptr;
+  unsigned long threshold = std::strtoul(value, &end, 10);
+  if (errno != 0 || end == value || *end != '\0' || threshold > kMaxJitThreshold) {
+    LOG_ALWAYS_FATAL("Invalid LoongArch64 JIT threshold '%s' (expected 0..%u)",
+                     value,
+                     kMaxJitThreshold);
+  }
+  g_jit_threshold = static_cast<uint32_t>(threshold);
+}
+
 size_t GetExecutableRegionSize(GuestAddr pc) {
   auto [is_executable, size] =
       GuestMapShadow::GetInstance()->GetExecutableRegionSize(pc, config::kGuestPageSize);
@@ -217,18 +244,24 @@ std::tuple<bool, HostCodePiece, size_t> TryLiteTranslateAndInstallRegion(GuestAd
   return {piece.code != kNullHostCodeAddr, piece, size};
 }
 
-void TranslateRegion(GuestAddr pc) {
+bool TranslateRegion(GuestAddr pc) {
   TranslationCache* cache = TranslationCache::GetInstance();
-  GuestCodeEntry* entry = cache->AddAndLockForTranslation(pc, 0);
+  uint32_t threshold = g_translation_mode == TranslationMode::kLiteTranslateOrInterpret
+                           ? g_jit_threshold
+                           : 0;
+  GuestCodeEntry* entry = cache->AddAndLockForTranslation(pc, threshold);
   if (!entry) {
-    return;
+    // AddAndLockForTranslation leaves the entry at NotTranslated only when its
+    // cold counter has not reached the requested threshold.  A translating or
+    // already-installed entry is handled by the normal outer dispatch loop.
+    return cache->GetHostCodePtr(pc)->load() == kEntryNotTranslated;
   }
 
   auto [is_executable, insn_size] = IsPcExecutable(pc, GuestMapShadow::GetInstance());
   if (!is_executable) {
     cache->SetTranslatedAndUnlock(
         pc, entry, insn_size, GuestCodeEntry::Kind::kSpecialHandler, {kEntryNoExec, 0});
-    return;
+    return false;
   }
 
   if (g_translation_mode == TranslationMode::kLiteTranslateOrInterpret) {
@@ -244,7 +277,7 @@ void TranslateRegion(GuestAddr pc) {
                         static_cast<unsigned long>(size / 4));
       }
       cache->SetTranslatedAndUnlock(pc, entry, size, GuestCodeEntry::Kind::kLiteTranslated, piece);
-      return;
+      return false;
     }
   }
   if (g_translation_mode == TranslationMode::kLiteTranslateOrInterpret) {
@@ -264,6 +297,7 @@ void TranslateRegion(GuestAddr pc) {
   }
   cache->SetTranslatedAndUnlock(
       pc, entry, insn_size, GuestCodeEntry::Kind::kInterpreted, {kEntryInterpret, 0});
+  return false;
 }
 
 }  // namespace
@@ -271,11 +305,25 @@ void TranslateRegion(GuestAddr pc) {
 void InitTranslatorArch() {
   ClaimHostFaultSignals();
   UpdateTranslationMode();
+  UpdateJitThreshold();
+  TRACE_AND_ALOGD("berberis-la64: JIT cold threshold=%u", g_jit_threshold);
 }
+
+extern "C" __attribute__((used, __visibility__("hidden"))) void berberis_HandleInterpret(
+    ThreadState* state);
 
 extern "C" __attribute__((used, __visibility__("hidden"))) void berberis_HandleNotTranslated(
     ThreadState* state) {
-  TranslateRegion(state->cpu.insn_addr);
+  if (TranslateRegion(state->cpu.insn_addr)) {
+    uint64_t cold = g_jit_cold_interpretations.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (cold <= 20 || (cold & (cold - 1)) == 0) {
+      TRACE_AND_ALOGD("berberis-la64: cold-interpret #%lu pc=0x%lx threshold=%u",
+                      static_cast<unsigned long>(cold),
+                      static_cast<unsigned long>(state->cpu.insn_addr),
+                      g_jit_threshold);
+    }
+    berberis_HandleInterpret(state);
+  }
 }
 
 extern "C" __attribute__((used, __visibility__("hidden"))) void berberis_HandleInterpret(

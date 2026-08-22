@@ -222,6 +222,11 @@ const char* GetTranslationModeConfig() {
   return var.get();
 }
 
+const char* GetJitThresholdConfig() {
+  static ConfigStr var("BERBERIS_JIT_THRESHOLD", "berberis.jit-threshold");
+  return var.get();
+}
+
 const char* GetProfilingConfig() {
   static ConfigStr var("BERBERIS_PROFILING", "berberis.profiling");
   return var.get();
