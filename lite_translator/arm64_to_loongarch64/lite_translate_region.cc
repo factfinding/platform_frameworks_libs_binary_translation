@@ -940,6 +940,20 @@ class LiteTranslator {
     ExitGeneratedCode();
   }
 
+  void EmitSelfProfiling(const LiteTranslateParams& params) {
+    CHECK(params.counter_location);
+    *params.counter_location = 0;
+    profile_threshold_callback_ = params.counter_threshold_callback;
+    profile_hot_exit_ = as_.MakeLabel();
+
+    as_.Li(Assembler::t0, reinterpret_cast<uint64_t>(params.counter_location));
+    as_.LdWU(Assembler::t1, Assembler::t0, 0);
+    as_.AddiD(Assembler::t1, Assembler::t1, 1);
+    as_.StW(Assembler::t1, Assembler::t0, 0);
+    as_.Li(Assembler::t2, params.counter_threshold);
+    as_.Bltu(Assembler::t2, Assembler::t1, *profile_hot_exit_);
+  }
+
   void Finalize() {
     // Keep taken conditional edges out of the sequentially executed body.
     // Besides improving I-cache density, one shared stub is enough when
@@ -947,6 +961,11 @@ class LiteTranslator {
     for (const PendingStaticExit& exit : pending_static_exits_) {
       as_.Bind(exit.label);
       Exit(exit.target);
+    }
+    if (profile_hot_exit_) {
+      as_.Bind(profile_hot_exit_);
+      as_.Li(Assembler::t0, reinterpret_cast<uint64_t>(profile_threshold_callback_));
+      as_.Jirl(Assembler::zero, Assembler::t0, 0);
     }
     as_.Finalize();
   }
@@ -4605,6 +4624,8 @@ class LiteTranslator {
   CachedVRegisterMap cached_v_registers_;
   XRegisterUsage* x_register_usage_;
   std::vector<PendingStaticExit> pending_static_exits_;
+  Assembler::Label* profile_hot_exit_ = nullptr;
+  HostCode profile_threshold_callback_ = nullptr;
   bool region_end_reached_ = false;
 };
 
@@ -4614,13 +4635,6 @@ std::tuple<bool, GuestAddr> TryLiteTranslateRegion(GuestAddr start_pc,
                                                    MachineCode* machine_code,
                                                    LiteTranslateParams params) {
   CHECK_LT(start_pc, params.end_pc);
-  // The bootstrap backend deliberately returns to the dispatcher at region
-  // boundaries.  Direct chaining and self-profiling are added once the base
-  // instruction set has device differential coverage.
-  if (params.enable_self_profiling) {
-    return {false, start_pc};
-  }
-
   CachedXRegisterMap cached_x_registers{};
   cached_x_registers.fill(-1);
   CachedVRegisterMap cached_v_registers{};
@@ -4657,6 +4671,9 @@ std::tuple<bool, GuestAddr> TryLiteTranslateRegion(GuestAddr start_pc,
                             cached_v_registers,
                             params.enable_guest_memory,
                             params.allow_dispatch);
+  if (params.enable_self_profiling) {
+    translator.EmitSelfProfiling(params);
+  }
   GuestAddr pc = start_pc;
   while (pc < params.end_pc && !translator.region_end_reached()) {
     uint32_t insn = *ToHostAddr<const uint32_t>(pc);

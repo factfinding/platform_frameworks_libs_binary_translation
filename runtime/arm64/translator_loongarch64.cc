@@ -57,6 +57,7 @@ constexpr uint32_t kDefaultJitThreshold = 4;
 constexpr uint32_t kMaxJitThreshold = 64;
 uint32_t g_jit_threshold = kDefaultJitThreshold;
 std::atomic<uint64_t> g_jit_successes;
+std::atomic<uint64_t> g_jit_gear_ups;
 std::atomic<uint64_t> g_jit_fallbacks;
 std::atomic<uint64_t> g_jit_cold_interpretations;
 std::atomic<uint64_t> g_jit_guest_insns;
@@ -212,8 +213,8 @@ size_t GetExecutableRegionSize(GuestAddr pc) {
   return size;
 }
 
-std::tuple<bool, HostCodePiece, size_t> TryLiteTranslateAndInstallRegion(GuestAddr pc) {
-  LiteTranslateParams params;
+std::tuple<bool, HostCodePiece, size_t> TryLiteTranslateAndInstallRegion(
+    GuestAddr pc, LiteTranslateParams params = {}) {
   constexpr size_t kMaxGuestInstructionsPerRegion = 64;
   size_t executable_size = GetExecutableRegionSize(pc);
   size_t max_size = kMaxGuestInstructionsPerRegion * sizeof(uint32_t);
@@ -244,17 +245,17 @@ std::tuple<bool, HostCodePiece, size_t> TryLiteTranslateAndInstallRegion(GuestAd
   return {piece.code != kNullHostCodeAddr, piece, size};
 }
 
-bool TranslateRegion(GuestAddr pc) {
+bool TranslateRegion(GuestAddr pc, bool gear_up = false) {
   TranslationCache* cache = TranslationCache::GetInstance();
-  uint32_t threshold = g_translation_mode == TranslationMode::kLiteTranslateOrInterpret
-                           ? g_jit_threshold
-                           : 0;
-  GuestCodeEntry* entry = cache->AddAndLockForTranslation(pc, threshold);
+  uint32_t threshold =
+      g_translation_mode == TranslationMode::kLiteTranslateOrInterpret ? g_jit_threshold : 0;
+  GuestCodeEntry* entry = gear_up ? cache->LockForGearUpTranslation(pc)
+                                  : cache->AddAndLockForTranslation(pc, threshold);
   if (!entry) {
     // AddAndLockForTranslation leaves the entry at NotTranslated only when its
     // cold counter has not reached the requested threshold.  A translating or
     // already-installed entry is handled by the normal outer dispatch loop.
-    return cache->GetHostCodePtr(pc)->load() == kEntryNotTranslated;
+    return !gear_up && cache->GetHostCodePtr(pc)->load() == kEntryNotTranslated;
   }
 
   auto [is_executable, insn_size] = IsPcExecutable(pc, GuestMapShadow::GetInstance());
@@ -265,16 +266,38 @@ bool TranslateRegion(GuestAddr pc) {
   }
 
   if (g_translation_mode == TranslationMode::kLiteTranslateOrInterpret) {
-    auto [success, piece, size] = TryLiteTranslateAndInstallRegion(pc);
+    LiteTranslateParams params;
+    params.enable_reg_mapping = gear_up;
+    params.enable_self_profiling = !gear_up;
+    params.counter_location = !gear_up ? &entry->invocation_counter : nullptr;
+    auto [success, piece, size] = TryLiteTranslateAndInstallRegion(pc, params);
+    if (!success && gear_up) {
+      // The optimized pass uses the same decoder and instruction lowerings as
+      // first gear.  Still keep a single-pass fallback so allocation pressure
+      // can never turn a working hot region into interpreted code.
+      params.enable_reg_mapping = false;
+      auto fallback = TryLiteTranslateAndInstallRegion(pc, params);
+      std::tie(success, piece, size) = fallback;
+    }
     if (success) {
       g_consecutive_jit_fallbacks = 0;
       g_next_interpreter_batch_size = 0;
-      uint64_t jit_successes = RecordJitRegion(size, piece.size);
-      if (jit_successes <= 20 || jit_successes % 1000 == 0) {
-        TRACE_AND_ALOGD("berberis-la64: JIT #%lu pc=0x%lx insns=%lu",
-                        static_cast<unsigned long>(jit_successes),
-                        static_cast<unsigned long>(pc),
-                        static_cast<unsigned long>(size / 4));
+      if (gear_up) {
+        uint64_t gear_ups = g_jit_gear_ups.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (gear_ups <= 20 || gear_ups % 1000 == 0) {
+          TRACE_AND_ALOGD("berberis-la64: gear-up #%lu pc=0x%lx insns=%lu",
+                          static_cast<unsigned long>(gear_ups),
+                          static_cast<unsigned long>(pc),
+                          static_cast<unsigned long>(size / 4));
+        }
+      } else {
+        uint64_t jit_successes = RecordJitRegion(size, piece.size);
+        if (jit_successes <= 20 || jit_successes % 1000 == 0) {
+          TRACE_AND_ALOGD("berberis-la64: JIT #%lu pc=0x%lx insns=%lu",
+                          static_cast<unsigned long>(jit_successes),
+                          static_cast<unsigned long>(pc),
+                          static_cast<unsigned long>(size / 4));
+        }
       }
       cache->SetTranslatedAndUnlock(pc, entry, size, GuestCodeEntry::Kind::kLiteTranslated, piece);
       return false;
@@ -357,8 +380,8 @@ extern "C" __attribute__((used, __visibility__("hidden"))) const void* berberis_
 }
 
 extern "C" __attribute__((used, __visibility__("hidden"))) void
-berberis_HandleLiteCounterThresholdReached(ThreadState*) {
-  LOG_ALWAYS_FATAL("LoongArch64 bootstrap JIT does not use tiering");
+berberis_HandleLiteCounterThresholdReached(ThreadState* state) {
+  TranslateRegion(state->cpu.insn_addr, true);
 }
 
 }  // namespace berberis
