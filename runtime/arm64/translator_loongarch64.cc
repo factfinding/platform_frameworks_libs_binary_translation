@@ -55,8 +55,11 @@ TranslationMode g_translation_mode = TranslationMode::kInterpretOnly;
 // points.  A value of four means translation starts on the fifth dispatch.
 constexpr uint32_t kDefaultJitThreshold = 4;
 constexpr uint32_t kMaxJitThreshold = 64;
+constexpr uint32_t kDefaultMaxRegionInsns = 64;
+constexpr uint32_t kMaxRegionInsns = 256;
 uint32_t g_jit_threshold = kDefaultJitThreshold;
 uint32_t g_gear_switch_threshold = config::kGearSwitchThreshold;
+uint32_t g_max_region_insns = kDefaultMaxRegionInsns;
 std::atomic<uint64_t> g_jit_successes;
 std::atomic<uint64_t> g_jit_gear_ups;
 std::atomic<uint64_t> g_jit_fallbacks;
@@ -226,6 +229,24 @@ void UpdateGearSwitchThreshold() {
   g_gear_switch_threshold = static_cast<uint32_t>(threshold);
 }
 
+void UpdateMaxRegionInsns() {
+  static ConfigStr config("BERBERIS_MAX_REGION_INSNS", "berberis.max_region_insns");
+  const char* value = config.get();
+  if (!value || *value == '\0') {
+    return;
+  }
+  errno = 0;
+  char* end = nullptr;
+  unsigned long insns = std::strtoul(value, &end, 10);
+  if (errno != 0 || end == value || *end != '\0' || insns == 0 ||
+      insns > kMaxRegionInsns) {
+    LOG_ALWAYS_FATAL("Invalid LoongArch64 max region instruction count '%s' (expected 1..%u)",
+                     value,
+                     kMaxRegionInsns);
+  }
+  g_max_region_insns = static_cast<uint32_t>(insns);
+}
+
 size_t GetExecutableRegionSize(GuestAddr pc) {
   auto [is_executable, size] =
       GuestMapShadow::GetInstance()->GetExecutableRegionSize(pc, config::kGuestPageSize);
@@ -235,12 +256,10 @@ size_t GetExecutableRegionSize(GuestAddr pc) {
 
 std::tuple<bool, HostCodePiece, size_t> TryLiteTranslateAndInstallRegion(
     GuestAddr pc, LiteTranslateParams params = {}) {
-  constexpr size_t kMaxGuestInstructionsPerRegion = 64;
   size_t executable_size = GetExecutableRegionSize(pc);
-  size_t max_size = kMaxGuestInstructionsPerRegion * sizeof(uint32_t);
+  size_t max_size = g_max_region_insns * sizeof(uint32_t);
   params.end_pc = pc + (executable_size < max_size ? executable_size : max_size);
   params.allow_dispatch = true;
-  params.enable_reg_mapping = true;
   params.enable_guest_memory = true;
 
   MachineCode machine_code;
@@ -351,9 +370,12 @@ void InitTranslatorArch() {
   UpdateTranslationMode();
   UpdateJitThreshold();
   UpdateGearSwitchThreshold();
-  TRACE_AND_ALOGD("berberis-la64: JIT cold threshold=%u gear-switch threshold=%u",
+  UpdateMaxRegionInsns();
+  TRACE_AND_ALOGD("berberis-la64: JIT cold threshold=%u gear-switch threshold=%u "
+                  "max-region-insns=%u",
                   g_jit_threshold,
-                  g_gear_switch_threshold);
+                  g_gear_switch_threshold,
+                  g_max_region_insns);
 }
 
 extern "C" __attribute__((used, __visibility__("hidden"))) void berberis_HandleInterpret(

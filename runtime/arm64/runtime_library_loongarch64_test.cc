@@ -329,6 +329,40 @@ TEST(LoongArch64RuntimeLibraryTest, LiteWriteThroughRegisterMappingPreservesInte
   EXPECT_EQ(state.cpu.x[2], 12u);
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteLongRegionsAmortizeEntryAndExitCode) {
+  std::array<uint32_t, 256> guest_code;
+  guest_code.fill(0x9100'0400);  // add x0, x0, #1
+  InitHostEntries();
+  GuestAddr start_pc = ToGuestAddr(guest_code.data());
+  constexpr std::array<size_t, 3> kRegionLengths = {64, 128, 256};
+  std::array<size_t, kRegionLengths.size()> host_sizes{};
+
+  for (size_t index = 0; index < kRegionLengths.size(); ++index) {
+    const size_t guest_insns = kRegionLengths[index];
+    MachineCode code;
+    LiteTranslateParams params;
+    params.end_pc = start_pc + guest_insns * sizeof(uint32_t);
+    params.allow_dispatch = false;
+    params.enable_reg_mapping = true;
+    auto [success, stop_pc] = TryLiteTranslateRegion(start_pc, &code, params);
+    ASSERT_TRUE(success);
+    ASSERT_EQ(stop_pc, params.end_pc);
+    host_sizes[index] = code.install_size();
+
+    ThreadState state{};
+    ScopedExecRegion exec(&code);
+    SetInsnAddr(state.cpu, start_pc);
+    SetResidence(state, kOutsideGeneratedCode);
+    berberis_RunGeneratedCode(&state, AsHostCode(exec.GetHostCodeAddr()));
+    EXPECT_EQ(state.cpu.x[0], guest_insns);
+    EXPECT_EQ(GetInsnAddr(state.cpu), params.end_pc);
+  }
+
+  // A longer region pays for one cache prologue and one dispatcher exit.
+  EXPECT_LT(host_sizes[1], 2 * host_sizes[0]);
+  EXPECT_LT(host_sizes[2], 2 * host_sizes[1]);
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteRegisterCacheExcludesDestinationOnlyRegisters) {
   // add x0, x1, x2 repeated.  Only x1 and x2 are read; treating the Rd field
   // as a use would cache x0 and add one needless move after every write.
