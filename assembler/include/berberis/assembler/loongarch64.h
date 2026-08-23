@@ -339,6 +339,12 @@ class Assembler : public AssemblerBase {
   void FmaddD(SimdRegister fd, SimdRegister fj, SimdRegister fk, SimdRegister fa) {
     Emit32(0x0820'0000 | EncodeVa(fa) | EncodeVk(fk) | EncodeVj(fj) | EncodeVd(fd));
   }
+  void FmsubS(SimdRegister fd, SimdRegister fj, SimdRegister fk, SimdRegister fa) {
+    Emit32(0x0850'0000 | EncodeVa(fa) | EncodeVk(fk) | EncodeVj(fj) | EncodeVd(fd));
+  }
+  void FmsubD(SimdRegister fd, SimdRegister fj, SimdRegister fk, SimdRegister fa) {
+    Emit32(0x0860'0000 | EncodeVa(fa) | EncodeVk(fk) | EncodeVj(fj) | EncodeVd(fd));
+  }
   void FcvtDS(SimdRegister fd, SimdRegister fj) {
     Emit32(0x0119'2400 | EncodeVj(fj) | EncodeVd(fd));
   }
@@ -432,6 +438,10 @@ class Assembler : public AssemblerBase {
   void VsllwilWH(SimdRegister vd, SimdRegister vj, uint32_t shift) {
     CHECK_LT(shift, 16u);
     Emit32(0x7308'4000 | (shift << 10) | EncodeVj(vj) | EncodeVd(vd));
+  }
+  void VsllwilHB(SimdRegister vd, SimdRegister vj, uint32_t shift) {
+    CHECK_LT(shift, 8u);
+    Emit32(0x7308'2000 | (shift << 10) | EncodeVj(vj) | EncodeVd(vd));
   }
   void VsllwilWuHu(SimdRegister vd, SimdRegister vj, uint32_t shift) {
     CHECK_LT(shift, 16u);

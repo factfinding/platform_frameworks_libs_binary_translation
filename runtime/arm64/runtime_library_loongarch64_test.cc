@@ -1733,6 +1733,20 @@ TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesSimd32LoadsAndStores) {
   EXPECT_EQ(memory[1], memory[2]);
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesSimd16UnsignedImmediateLoad) {
+  // ldr h1, [x12, #144] — exact opcode observed in the Unity loading profile.
+  constexpr std::array<uint32_t, 1> kGuestCode = {0x7d41'2181};
+  std::array<uint16_t, 80> memory{};
+  memory[72] = 0x8123;
+
+  ThreadState state{};
+  state.cpu.x[12] = ToGuestAddr(memory.data());
+  state.cpu.v[1] = MakeUint128(UINT64_MAX, UINT64_MAX);
+  TranslateAndRun(kGuestCode, &state);
+
+  EXPECT_EQ(state.cpu.v[1], static_cast<__uint128_t>(0x8123));
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteLsxVectorFloatMatchesInterpreter) {
   // fmla v0.4s, v1.4s, v2.4s
   // fmul v3.4s, v1.4s, v2.4s
@@ -2389,6 +2403,91 @@ TEST(LoongArch64RuntimeLibraryTest, LiteSshll4SMatchesInterpreter) {
       SCOPED_TRACE(testing::Message() << "insn=" << std::hex << insn);
       EXPECT_EQ(translated.cpu.v[0], interpreted.cpu.v[0]);
     }
+  }
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteHotFallbackSimdFormsMatchInterpreter) {
+  constexpr std::array<uint32_t, 8> kGuestCode = {
+      0x0f08'a420,  // sshll v0.8h, v1.8b, #0
+      0x0f0f'a420,  // sshll v0.8h, v1.8b, #7
+      0x4f08'a420,  // sshll2 v0.8h, v1.16b, #0
+      0x4f0f'a420,  // sshll2 v0.8h, v1.16b, #7
+      0x0e82'7820,  // zip2 v0.2s, v1.2s, v2.2s
+      0x0e84'7863,  // zip2 v3.2s, v3.2s, v4.2s (observed Unity opcode)
+      0x4e22'e420,  // fcmeq v0.4s, v1.4s, v2.4s
+      0x4ea1'd820,  // frecpe v0.4s, v1.4s
+  };
+  constexpr std::array<std::array<__uint128_t, 4>, 3> kInputs = {{
+      {MakeUint128(0x7f80'ff00'0180'fe02, 0x55aa'40c0'81ff'807e),
+       MakeUint32x4(0x3f80'0000, 0x8000'0000, 0x7f80'0000, 0x7fc0'1234),
+       MakeUint32x4(0x3f80'0000, 0x0000'0000, 0xff80'0000, 0x4000'0000),
+       MakeUint32x4(0x1111'1111, 0x2222'2222, 0x3333'3333, 0x4444'4444)},
+      {MakeUint128(0x0102'0304'8081'feff, 0x1020'3040'7f80'c0e0),
+       MakeUint32x4(0x4000'0000, 0x4080'0000, 0xbf00'0000, 0xc100'0000),
+       MakeUint32x4(0x4000'0000, 0x4040'0000, 0xbf00'0000, 0xc000'0000),
+       MakeUint32x4(0xaaaa'aaaa, 0xbbbb'bbbb, 0xcccc'cccc, 0xdddd'dddd)},
+      {MakeUint128(0xfffe'8180'7f02'0100, 0x8001'fe7f'40c0'55aa),
+       MakeUint32x4(0x3f00'0000, 0xc000'0000, 0x0080'0000, 0x7f7f'ffff),
+       MakeUint32x4(0xbf00'0000, 0xc000'0000, 0x0000'0000, 0x7f7f'ffff),
+       MakeUint32x4(0x0123'4567, 0x89ab'cdef, 0x1357'9bdf, 0x2468'ace0)},
+  }};
+
+  for (uint32_t insn : kGuestCode) {
+    for (const auto& input : kInputs) {
+      const std::array<uint32_t, 1> one_insn = {insn};
+      ThreadState interpreted{};
+      ThreadState translated{};
+      auto initialize = [&](ThreadState* state) {
+        state->cpu.v[0] = MakeUint128(UINT64_MAX, UINT64_MAX);
+        state->cpu.v[1] = input[0];
+        state->cpu.v[2] = input[2];
+        state->cpu.v[3] = input[3];
+        state->cpu.v[4] = input[1];
+      };
+      initialize(&interpreted);
+      initialize(&translated);
+      SetInsnAddr(interpreted.cpu, ToGuestAddr(one_insn.data()));
+
+      InterpretInsn(&interpreted);
+      TranslateAndRun(one_insn, &translated);
+
+      const uint32_t rd = insn & 31;
+      SCOPED_TRACE(testing::Message() << "insn=" << std::hex << insn);
+      EXPECT_EQ(translated.cpu.v[rd], interpreted.cpu.v[rd]);
+    }
+  }
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteHotFallbackScalarFpFormsMatchInterpreter) {
+  constexpr std::array<uint32_t, 3> kGuestCode = {
+      0x7ea9'd501,  // fabd s1, s8, s9
+      0x5e61'd800,  // scvtf d0, d0
+      0x1f64'8823,  // fnmsub d3, d1, d4, d2
+  };
+
+  for (uint32_t insn : kGuestCode) {
+    const std::array<uint32_t, 1> one_insn = {insn};
+    ThreadState interpreted{};
+    ThreadState translated{};
+    auto initialize = [](ThreadState* state) {
+      state->cpu.v[0] = MakeUint128(0xffff'ffff'ffff'fff9ULL, UINT64_MAX);  // int64_t -7
+      state->cpu.v[1] = MakeUint128(0x4008'0000'0000'0000ULL, UINT64_MAX);  // 3.0
+      state->cpu.v[2] = MakeUint128(0x4014'0000'0000'0000ULL, UINT64_MAX);  // 5.0
+      state->cpu.v[3] = MakeUint128(UINT64_MAX, UINT64_MAX);
+      state->cpu.v[4] = MakeUint128(0x4000'0000'0000'0000ULL, UINT64_MAX);  // 2.0
+      state->cpu.v[8] = MakeUint32x4(0xc060'0000, UINT32_MAX, UINT32_MAX, UINT32_MAX);  // -3.5f
+      state->cpu.v[9] = MakeUint32x4(0x3fa0'0000, UINT32_MAX, UINT32_MAX, UINT32_MAX);  // 1.25f
+    };
+    initialize(&interpreted);
+    initialize(&translated);
+    SetInsnAddr(interpreted.cpu, ToGuestAddr(one_insn.data()));
+
+    InterpretInsn(&interpreted);
+    TranslateAndRun(one_insn, &translated);
+
+    const uint32_t rd = insn & 31;
+    SCOPED_TRACE(testing::Message() << "insn=" << std::hex << insn);
+    EXPECT_EQ(translated.cpu.v[rd], interpreted.cpu.v[rd]);
   }
 }
 
