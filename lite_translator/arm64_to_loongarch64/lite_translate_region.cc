@@ -920,6 +920,12 @@ class LiteTranslator {
     return false;
   }
 
+  void BeginInstruction(GuestAddr pc) {
+    Assembler::Label* label = as_.MakeLabel();
+    local_code_labels_.push_back({pc, label});
+    as_.Bind(label);
+  }
+
   void Exit(GuestAddr pc) {
     SetGuestPc(pc);
     if (allow_dispatch_ && config::kLinkJumpsBetweenRegions) {
@@ -993,15 +999,21 @@ class LiteTranslator {
   void EmitSelfProfiling(const LiteTranslateParams& params) {
     CHECK(params.counter_location);
     *params.counter_location = 0;
+    profile_counter_location_ = params.counter_location;
+    profile_counter_threshold_ = params.counter_threshold;
     profile_threshold_callback_ = params.counter_threshold_callback;
     profile_hot_exit_ = as_.MakeLabel();
 
-    as_.Li(Assembler::t0, reinterpret_cast<uint64_t>(params.counter_location));
+    EmitSelfProfilingCounter(profile_hot_exit_);
+  }
+
+  void EmitSelfProfilingCounter(Assembler::Label* hot_exit) {
+    as_.Li(Assembler::t0, reinterpret_cast<uint64_t>(profile_counter_location_));
     as_.LdWU(Assembler::t1, Assembler::t0, 0);
     as_.AddiD(Assembler::t1, Assembler::t1, 1);
     as_.StW(Assembler::t1, Assembler::t0, 0);
-    as_.Li(Assembler::t2, params.counter_threshold);
-    as_.Bltu(Assembler::t2, Assembler::t1, *profile_hot_exit_);
+    as_.Li(Assembler::t2, profile_counter_threshold_);
+    as_.Bltu(Assembler::t2, Assembler::t1, *hot_exit);
   }
 
   void Finalize() {
@@ -1011,6 +1023,28 @@ class LiteTranslator {
     for (const PendingRecoveryExit& exit : pending_recovery_exits_) {
       as_.Bind(exit.label);
       ExitGeneratedCode(exit.guest_pc);
+    }
+    // A taken backward edge stays inside generated code.  Poll signals on
+    // every backedge, and count loop iterations in first-tier regions so a
+    // hot internal loop still triggers second-tier translation.
+    for (const PendingLocalBackedge& edge : pending_local_backedges_) {
+      as_.Bind(edge.stub_label);
+      Assembler::Label* backedge_hot_exit = nullptr;
+      if (profile_hot_exit_) {
+        backedge_hot_exit = as_.MakeLabel();
+        EmitSelfProfilingCounter(backedge_hot_exit);
+      }
+      as_.LdBU(Assembler::t0,
+               Assembler::s8,
+               static_cast<int32_t>(offsetof(ThreadState, pending_signals_status)));
+      as_.AddiD(Assembler::t1, Assembler::zero, kPendingSignalsPresent);
+      as_.Beq(Assembler::t0, Assembler::t1, *GetStaticExitLabel(edge.target_pc));
+      as_.B(*edge.target_label);
+      if (backedge_hot_exit) {
+        as_.Bind(backedge_hot_exit);
+        SetGuestPc(edge.target_pc);
+        as_.B(*profile_hot_exit_);
+      }
     }
     // Keep taken conditional edges out of the sequentially executed body.
     // Besides improving I-cache density, one shared stub is enough when
@@ -1041,6 +1075,17 @@ class LiteTranslator {
     Assembler::Label* label;
   };
 
+  struct LocalCodeLabel {
+    GuestAddr guest_pc;
+    Assembler::Label* label;
+  };
+
+  struct PendingLocalBackedge {
+    GuestAddr target_pc;
+    Assembler::Label* target_label;
+    Assembler::Label* stub_label;
+  };
+
   Assembler::Label* AddRecoveryExit(GuestAddr guest_pc) {
     Assembler::Label* label = as_.MakeLabel();
     pending_recovery_exits_.push_back({guest_pc, label});
@@ -1056,6 +1101,36 @@ class LiteTranslator {
     Assembler::Label* label = as_.MakeLabel();
     pending_static_exits_.push_back({target, label});
     return label;
+  }
+
+  Assembler::Label* GetLocalBackedgeLabel(GuestAddr target, GuestAddr current_pc) {
+    if (config::kLinkJumpsWithinRegion && target >= start_pc_ && target <= current_pc) {
+      Assembler::Label* target_label = nullptr;
+      for (const LocalCodeLabel& entry : local_code_labels_) {
+        if (entry.guest_pc == target) {
+          target_label = entry.label;
+          break;
+        }
+      }
+      if (target_label != nullptr) {
+        for (const PendingLocalBackedge& edge : pending_local_backedges_) {
+          if (edge.target_pc == target) {
+            return edge.stub_label;
+          }
+        }
+        Assembler::Label* stub_label = as_.MakeLabel();
+        pending_local_backedges_.push_back({target, target_label, stub_label});
+        return stub_label;
+      }
+    }
+    return nullptr;
+  }
+
+  Assembler::Label* GetBranchTargetLabel(GuestAddr target, GuestAddr current_pc) {
+    if (Assembler::Label* local = GetLocalBackedgeLabel(target, current_pc)) {
+      return local;
+    }
+    return GetStaticExitLabel(target);
   }
 
   static constexpr int32_t XOffset(uint32_t reg) {
@@ -4463,7 +4538,12 @@ class LiteTranslator {
       as_.Li(Assembler::t0, pc + 4);
       StoreXOrDiscard(30, Assembler::t0);
     }
-    Exit(pc + displacement);
+    GuestAddr target = pc + displacement;
+    if (Assembler::Label* local = GetLocalBackedgeLabel(target, pc)) {
+      as_.B(*local);
+    } else {
+      Exit(target);
+    }
   }
 
   void TranslateCompareAndBranch(uint32_t insn, GuestAddr pc) {
@@ -4476,7 +4556,7 @@ class LiteTranslator {
     if (!is_64_bit) {
       ZeroExtend32(Assembler::t1);
     }
-    Assembler::Label* taken = GetStaticExitLabel(pc + displacement);
+    Assembler::Label* taken = GetBranchTargetLabel(pc + displacement, pc);
     if (nonzero) {
       as_.Bnez(Assembler::t1, *taken);
     } else {
@@ -4496,7 +4576,7 @@ class LiteTranslator {
     // would incorrectly include every bit above the requested position.
     as_.AddiD(Assembler::t0, Assembler::zero, 1);
     as_.And(Assembler::t1, Assembler::t1, Assembler::t0);
-    Assembler::Label* taken = GetStaticExitLabel(pc + displacement);
+    Assembler::Label* taken = GetBranchTargetLabel(pc + displacement, pc);
     if (nonzero) {
       as_.Bnez(Assembler::t1, *taken);
     } else {
@@ -4508,7 +4588,7 @@ class LiteTranslator {
     int64_t displacement = SignExtend((insn >> 5) & 0x7ffff, 19) * 4;
     EmitCondition(insn & 0xf);
 
-    as_.Bnez(Assembler::t2, *GetStaticExitLabel(pc + displacement));
+    as_.Bnez(Assembler::t2, *GetBranchTargetLabel(pc + displacement, pc));
   }
 
   void EmitCondition(uint32_t condition) {
@@ -4663,8 +4743,12 @@ class LiteTranslator {
   CachedXRegisterMap cached_x_registers_;
   CachedVRegisterMap cached_v_registers_;
   XRegisterUsage* x_register_usage_;
+  std::vector<LocalCodeLabel> local_code_labels_;
   std::vector<PendingRecoveryExit> pending_recovery_exits_;
+  std::vector<PendingLocalBackedge> pending_local_backedges_;
   std::vector<PendingStaticExit> pending_static_exits_;
+  uint32_t* profile_counter_location_ = nullptr;
+  uint32_t profile_counter_threshold_ = 0;
   Assembler::Label* profile_hot_exit_ = nullptr;
   HostCode profile_threshold_callback_ = nullptr;
   bool region_end_reached_ = false;
@@ -4700,6 +4784,7 @@ std::tuple<bool, GuestAddr> TryLiteTranslateRegion(GuestAddr start_pc,
     GuestAddr analysis_pc = start_pc;
     while (analysis_pc < params.end_pc && !analyzer.region_end_reached()) {
       uint32_t insn = *ToHostAddr<const uint32_t>(analysis_pc);
+      analyzer.BeginInstruction(analysis_pc);
       if (!analyzer.Translate(insn, analysis_pc)) {
         return {false, analysis_pc};
       }
@@ -4720,6 +4805,7 @@ std::tuple<bool, GuestAddr> TryLiteTranslateRegion(GuestAddr start_pc,
   GuestAddr pc = start_pc;
   while (pc < params.end_pc && !translator.region_end_reached()) {
     uint32_t insn = *ToHostAddr<const uint32_t>(pc);
+    translator.BeginInstruction(pc);
     if (!translator.Translate(insn, pc)) {
       return {false, pc};
     }

@@ -238,6 +238,79 @@ TEST(LoongArch64RuntimeLibraryTest, LiteSelfProfilingExitsAtGearUpThreshold) {
   EXPECT_EQ(GetResidence(state), kOutsideGeneratedCode);
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteLocalBackedgeRunsLoopAndPollsSignals) {
+  constexpr std::array<uint32_t, 5> kGuestCode = {
+      0xd280'0080,  // mov x0,#4
+      0xd280'0001,  // mov x1,#0
+      0x9100'0421,  // add x1,x1,#1
+      0xf100'0400,  // subs x0,x0,#1
+      0x54ff'ffc1,  // b.ne add
+  };
+  InitHostEntries();
+  GuestAddr start_pc = ToGuestAddr(kGuestCode.data());
+  MachineCode code;
+  LiteTranslateParams params;
+  params.end_pc = start_pc + sizeof(kGuestCode);
+  params.allow_dispatch = false;
+  params.enable_reg_mapping = true;
+  auto [success, stop_pc] = TryLiteTranslateRegion(start_pc, &code, params);
+  ASSERT_TRUE(success);
+  ASSERT_EQ(stop_pc, params.end_pc);
+  ScopedExecRegion exec(&code);
+
+  ThreadState state{};
+  SetInsnAddr(state.cpu, start_pc);
+  SetResidence(state, kOutsideGeneratedCode);
+  berberis_RunGeneratedCode(&state, AsHostCode(exec.GetHostCodeAddr()));
+  EXPECT_EQ(state.cpu.x[0], 0u);
+  EXPECT_EQ(state.cpu.x[1], 4u);
+  EXPECT_EQ(GetInsnAddr(state.cpu), params.end_pc);
+
+  ThreadState pending_state{};
+  pending_state.pending_signals_status.store(kPendingSignalsPresent);
+  SetInsnAddr(pending_state.cpu, start_pc);
+  SetResidence(pending_state, kOutsideGeneratedCode);
+  berberis_RunGeneratedCode(&pending_state, AsHostCode(exec.GetHostCodeAddr()));
+  EXPECT_EQ(pending_state.cpu.x[0], 3u);
+  EXPECT_EQ(pending_state.cpu.x[1], 1u);
+  EXPECT_EQ(GetInsnAddr(pending_state.cpu), start_pc + 2 * sizeof(uint32_t));
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteLocalBackedgeContributesToGearUpCounter) {
+  constexpr std::array<uint32_t, 5> kGuestCode = {
+      0xd280'0080,  // mov x0,#4
+      0xd280'0001,  // mov x1,#0
+      0x9100'0421,  // add x1,x1,#1
+      0xf100'0400,  // subs x0,x0,#1
+      0x54ff'ffc1,  // b.ne add
+  };
+  InitHostEntries();
+  GuestAddr start_pc = ToGuestAddr(kGuestCode.data());
+  uint32_t counter = 0;
+  MachineCode code;
+  LiteTranslateParams params;
+  params.end_pc = start_pc + sizeof(kGuestCode);
+  params.allow_dispatch = false;
+  params.enable_reg_mapping = false;
+  params.enable_self_profiling = true;
+  params.counter_location = &counter;
+  params.counter_threshold = 2;
+  params.counter_threshold_callback = AsHostCode(kEntryExitGeneratedCode);
+  auto [success, stop_pc] = TryLiteTranslateRegion(start_pc, &code, params);
+  ASSERT_TRUE(success);
+  ASSERT_EQ(stop_pc, params.end_pc);
+  ScopedExecRegion exec(&code);
+
+  ThreadState state{};
+  SetInsnAddr(state.cpu, start_pc);
+  SetResidence(state, kOutsideGeneratedCode);
+  berberis_RunGeneratedCode(&state, AsHostCode(exec.GetHostCodeAddr()));
+  EXPECT_EQ(counter, 3u);
+  EXPECT_EQ(state.cpu.x[0], 2u);
+  EXPECT_EQ(state.cpu.x[1], 2u);
+  EXPECT_EQ(GetInsnAddr(state.cpu), start_pc + 2 * sizeof(uint32_t));
+}
+
 template <size_t kSize>
 void TranslateAndRun(const std::array<uint32_t, kSize>& guest_code, ThreadState* state) {
   InitHostEntries();
