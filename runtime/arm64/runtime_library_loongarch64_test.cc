@@ -38,6 +38,8 @@
 #include "berberis/runtime_primitives/translation_cache.h"
 #include "berberis/test_utils/scoped_exec_region.h"
 
+extern "C" void berberis_HandleNotTranslated(berberis::ThreadState* state);
+
 namespace berberis {
 namespace {
 
@@ -68,6 +70,51 @@ void RunStackClosure(GuestAddr pc, GuestArgumentBuffer* buffer) {
 
 void RunConcurrentClosure(GuestAddr pc, GuestArgumentBuffer* buffer) {
   buffer->argv[0] += pc;
+}
+
+int g_pretranslation_hook_calls;
+GuestAddr g_exact_host_target;
+
+bool HandleExactHostTargetBeforeTranslation(ThreadState* state) {
+  if (GetInsnAddr(state->cpu) != g_exact_host_target) {
+    return false;
+  }
+  ++g_pretranslation_hook_calls;
+  return true;
+}
+
+TEST(LoongArch64RuntimeLibraryTest, ExactHostTargetHookRunsBeforeTranslation) {
+  ThreadState state{};
+  SetInsnAddr(state.cpu, 0x1234'5000);
+  g_exact_host_target = GetInsnAddr(state.cpu);
+  g_pretranslation_hook_calls = 0;
+  SetHandleNoExecHook(HandleExactHostTargetBeforeTranslation);
+
+  berberis_HandleNotTranslated(&state);
+
+  SetHandleNoExecHook(nullptr);
+  EXPECT_EQ(g_pretranslation_hook_calls, 1);
+}
+
+TEST(LoongArch64RuntimeLibraryTest, ExactHostTargetHookRunsAfterInterpretedBranch) {
+  // BR X0.  The target models an executable host symbol reached while
+  // InterpretBatch is already decoding guest instructions.
+  alignas(4) constexpr std::array<uint32_t, 1> kCode = {0xd61f0000};
+  ThreadState state{};
+  g_exact_host_target = 0x1234'5000;
+  state.cpu.x[0] = g_exact_host_target;
+  SetInsnAddr(state.cpu, ToGuestAddr(kCode.data()));
+  g_pretranslation_hook_calls = 0;
+  SetHandleNoExecHook(HandleExactHostTargetBeforeTranslation);
+
+  InterpretBatch(&state,
+                 2,
+                 nullptr,
+                 InterpreterCacheLookupMode::kAll);
+
+  SetHandleNoExecHook(nullptr);
+  EXPECT_EQ(g_pretranslation_hook_calls, 1);
+  EXPECT_EQ(GetInsnAddr(state.cpu), g_exact_host_target);
 }
 
 TEST(LoongArch64RuntimeLibraryTest, StaticClosureTrampolinePreservesArguments) {

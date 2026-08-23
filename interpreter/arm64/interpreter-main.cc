@@ -76,6 +76,14 @@ void InterpretBatch(ThreadState* state,
     GuestAddr new_pc = state->cpu.insn_addr;
     if (new_pc == 0) break;
 
+    // An indirect branch may leave guest code and land on an exact host
+    // function while this batch is still running.  Such a target can already
+    // look executable in the coarse GuestMapShadow, so stop before decoding
+    // host instructions and let a registered hook install its wrapper.
+    if (new_pc != pc + insn_len && TryHandleNoExecHook(state)) {
+      break;
+    }
+
     // JIT-enabled runtimes must check every instruction so that execution can
     // enter a translation installed at the next sequential PC.  An
     // interpreter-only runtime has no such translations, but still must check

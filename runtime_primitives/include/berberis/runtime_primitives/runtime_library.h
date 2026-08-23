@@ -67,15 +67,16 @@ void RunGuestCall(GuestAddr pc, GuestArgumentBuffer* buf);
 void ExecuteGuestCall(ThreadState* state);
 
 // region digitalis
-// Optional hook invoked by berberis_HandleNoExec before it raises SIGSEGV. A
-// higher layer that can resolve guest symbols may register a handler which
-// services the fault — e.g. redirecting a guest call that landed in a host
-// system library (because a hardened library resolved a host symbol from
-// /proc/self/maps and called it directly, bypassing the loader) to the guest's
-// own translatable counterpart of that library — and return true to resume the
-// guest. Returning false, or registering no hook, delivers the default SIGSEGV.
+// Optional hook for exact host-code targets reached by guest control flow.  It
+// is consulted before translating a new PC as well as by berberis_HandleNoExec.
+// The pre-translation check is necessary when a host executable mapping shares
+// a GuestMapShadow executable page with guest code: page permissions alone
+// cannot distinguish the two instruction sets.  Since this runs on every new
+// translation, handlers must reject ordinary guest PCs cheaply and only do
+// expensive work after an exact target match.
 using HandleNoExecHook = bool (*)(ThreadState* state);
 void SetHandleNoExecHook(HandleNoExecHook hook);
+bool TryHandleNoExecHook(ThreadState* state);
 // endregion
 
 }  // namespace berberis

@@ -337,6 +337,14 @@ extern "C" __attribute__((used, __visibility__("hidden"))) void berberis_HandleI
 
 extern "C" __attribute__((used, __visibility__("hidden"))) void berberis_HandleNotTranslated(
     ThreadState* state) {
+  // A hardened guest may discover an exact host symbol through /proc/self/maps
+  // and branch to it directly.  Usually GuestMapShadow rejects host mappings,
+  // but a host function can share one of its coarse executable pages with a
+  // guest mapping.  Give the exact-target hook a chance to install a host-call
+  // wrapper before decoding host LoongArch instructions as ARM64.
+  if (TryHandleNoExecHook(state)) {
+    return;
+  }
   if (TranslateRegion(state->cpu.insn_addr)) {
     uint64_t cold = g_jit_cold_interpretations.fetch_add(1, std::memory_order_relaxed) + 1;
     if (cold <= 20 || (cold & (cold - 1)) == 0) {

@@ -34,6 +34,10 @@ HandleNoExecHook g_handle_no_exec_hook = nullptr;
 void SetHandleNoExecHook(HandleNoExecHook hook) {
   g_handle_no_exec_hook = hook;
 }
+
+bool TryHandleNoExecHook(ThreadState* state) {
+  return g_handle_no_exec_hook != nullptr && g_handle_no_exec_hook(state);
+}
 // endregion
 
 // ATTENTION: this symbol gets called directly, without PLT. To keep text
@@ -55,7 +59,7 @@ extern "C" __attribute__((used, __visibility__("hidden"))) void berberis_HandleN
   // Give a registered handler a chance to service this fault (e.g. redirect a
   // guest call that landed in a host system library to the guest's own
   // translatable copy) and resume instead of crashing the guest.
-  if (g_handle_no_exec_hook != nullptr && g_handle_no_exec_hook(state)) {
+  if (TryHandleNoExecHook(state)) {
     return;
   }
   // endregion
