@@ -1861,6 +1861,60 @@ TEST(LoongArch64RuntimeLibraryTest, LiteCachesReadOnlyVectorSources) {
   }
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteCachesWriteThroughVectorAccumulator) {
+  // Repeated FMLA reads and writes v20.  The mapped value must stay coherent
+  // with the write-through ThreadState copy after every guest instruction.
+  constexpr std::array<uint32_t, 5> kGuestCode = {
+      0x4e22'cc34,  // fmla v20.4s, v1.4s, v2.4s
+      0x4e22'cc34,
+      0x4e22'cc34,
+      0x4e22'cc34,
+      0x4e22'cc34,
+  };
+  InitHostEntries();
+  GuestAddr start_pc = ToGuestAddr(kGuestCode.data());
+
+  LiteTranslateParams params;
+  params.end_pc = start_pc + sizeof(kGuestCode);
+  params.allow_dispatch = false;
+  params.enable_reg_mapping = false;
+  MachineCode uncached_code;
+  auto [uncached_success, uncached_stop_pc] =
+      TryLiteTranslateRegion(start_pc, &uncached_code, params);
+  ASSERT_TRUE(uncached_success);
+  ASSERT_EQ(uncached_stop_pc, params.end_pc);
+
+  params.enable_reg_mapping = true;
+  MachineCode cached_code;
+  auto [cached_success, cached_stop_pc] = TryLiteTranslateRegion(start_pc, &cached_code, params);
+  ASSERT_TRUE(cached_success);
+  ASSERT_EQ(cached_stop_pc, params.end_pc);
+
+  auto count_vector_loads = [](const MachineCode& code) {
+    size_t count = 0;
+    for (size_t offset = 0; offset < code.install_size(); offset += sizeof(uint32_t)) {
+      uint32_t insn = *code.AddrAs<const uint32_t>(offset);
+      if ((insn & 0xffc0'0000u) == 0x2c00'0000u) {
+        ++count;
+      }
+    }
+    return count;
+  };
+  EXPECT_EQ(count_vector_loads(uncached_code), 15u);
+  EXPECT_EQ(count_vector_loads(cached_code), 3u);
+
+  ThreadState state{};
+  state.cpu.v[1] = MakeUint32x4(0x4000'0000, 0x4000'0000, 0x4000'0000, 0x4000'0000);
+  state.cpu.v[2] = MakeUint32x4(0x4040'0000, 0x4040'0000, 0x4040'0000, 0x4040'0000);
+  state.cpu.v[20] = MakeUint32x4(0x3f80'0000, 0x3f80'0000, 0x3f80'0000, 0x3f80'0000);
+  ScopedExecRegion exec(&cached_code);
+  SetInsnAddr(state.cpu, start_pc);
+  SetResidence(state, kOutsideGeneratedCode);
+  berberis_RunGeneratedCode(&state, AsHostCode(exec.GetHostCodeAddr()));
+  EXPECT_EQ(state.cpu.v[20],
+            MakeUint32x4(0x41f8'0000, 0x41f8'0000, 0x41f8'0000, 0x41f8'0000));
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteFabs4SUsesSourceCache) {
   constexpr std::array<uint32_t, 5> kGuestCode = {
       0x4ea0'f822,  // fabs v2.4s, v1.4s
@@ -2593,7 +2647,7 @@ TEST(LoongArch64RuntimeLibraryTest, LiteLdSt1Multiple4SMatchesInterpreter) {
 }
 
 TEST(LoongArch64RuntimeLibraryTest, LiteStructMemoryHasRecoveryPoints) {
-  constexpr std::array<uint32_t, 9> kGuestCode = {
+  constexpr std::array<uint32_t, 11> kGuestCode = {
       0x4c40'2820,  // ld1 {v0.4s-v3.4s},[x1]
       0x4c9f'2820,  // st1 {v0.4s-v3.4s},[x1],#64
       0x4c40'0820,  // ld4 {v0.4s-v3.4s},[x1]
@@ -2603,6 +2657,8 @@ TEST(LoongArch64RuntimeLibraryTest, LiteStructMemoryHasRecoveryPoints) {
       0x4ddf'8528,  // ld1 {v8.d}[1],[x9],#8
       0x0d00'84a4,  // st1 {v4.d}[0],[x5]
       0x4d91'860f,  // st1 {v15.d}[1],[x16],x17
+      0x4d9f'8080,  // st1 {v0.s}[2],[x4],#4
+      0x4dc5'8080,  // ld1 {v0.s}[2],[x4],x5
   };
   for (uint32_t insn : kGuestCode) {
     const std::array<uint32_t, 1> one_insn = {insn};
@@ -3295,7 +3351,7 @@ TEST(LoongArch64RuntimeLibraryTest, UnityInsGeneralSequenceMatchesInterpreter) {
 }
 
 TEST(LoongArch64RuntimeLibraryTest, LiteHotStructMemoryMatchesInterpreter) {
-  constexpr std::array<uint32_t, 28> kGuestCode = {
+  constexpr std::array<uint32_t, 32> kGuestCode = {
       0x4c9f'a820,  // st1 {v0.4s,v1.4s},[x1],#32
       0x0ddf'8464,  // ld1 {v4.d}[0],[x3],#8
       0x4ddf'8464,  // ld1 {v4.d}[1],[x3],#8
@@ -3321,6 +3377,10 @@ TEST(LoongArch64RuntimeLibraryTest, LiteHotStructMemoryMatchesInterpreter) {
       0x0d40'9100,  // ld1 {v0.s}[1],[x8]
       0x4d40'8100,  // ld1 {v0.s}[2],[x8]
       0x4d40'9100,  // ld1 {v0.s}[3],[x8]
+      0x4d9f'8080,  // st1 {v0.s}[2],[x4],#4
+      0x4d85'8080,  // st1 {v0.s}[2],[x4],x5
+      0x4ddf'8080,  // ld1 {v0.s}[2],[x4],#4
+      0x4dc5'8080,  // ld1 {v0.s}[2],[x4],x5
       0x4c40'091c,  // ld4 {v28.4s-v31.4s},[x8]
       0x4cdf'0950,  // ld4 {v16.4s-v19.4s},[x10],#64
       0x4cc9'0904,  // ld4 {v4.4s-v7.4s},[x8],x9

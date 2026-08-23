@@ -56,6 +56,7 @@ TranslationMode g_translation_mode = TranslationMode::kInterpretOnly;
 constexpr uint32_t kDefaultJitThreshold = 4;
 constexpr uint32_t kMaxJitThreshold = 64;
 uint32_t g_jit_threshold = kDefaultJitThreshold;
+uint32_t g_gear_switch_threshold = config::kGearSwitchThreshold;
 std::atomic<uint64_t> g_jit_successes;
 std::atomic<uint64_t> g_jit_gear_ups;
 std::atomic<uint64_t> g_jit_fallbacks;
@@ -206,6 +207,25 @@ void UpdateJitThreshold() {
   g_jit_threshold = static_cast<uint32_t>(threshold);
 }
 
+void UpdateGearSwitchThreshold() {
+  static ConfigStr config("BERBERIS_GEAR_SWITCH_THRESHOLD",
+                          "berberis.gear_switch_threshold");
+  const char* value = config.get();
+  if (!value || *value == '\0') {
+    return;
+  }
+  errno = 0;
+  char* end = nullptr;
+  unsigned long threshold = std::strtoul(value, &end, 10);
+  if (errno != 0 || end == value || *end != '\0' || threshold == 0 ||
+      threshold > UINT32_MAX) {
+    LOG_ALWAYS_FATAL("Invalid LoongArch64 gear-switch threshold '%s' (expected 1..%u)",
+                     value,
+                     UINT32_MAX);
+  }
+  g_gear_switch_threshold = static_cast<uint32_t>(threshold);
+}
+
 size_t GetExecutableRegionSize(GuestAddr pc) {
   auto [is_executable, size] =
       GuestMapShadow::GetInstance()->GetExecutableRegionSize(pc, config::kGuestPageSize);
@@ -270,6 +290,7 @@ bool TranslateRegion(GuestAddr pc, bool gear_up = false) {
     params.enable_reg_mapping = gear_up;
     params.enable_self_profiling = !gear_up;
     params.counter_location = !gear_up ? &entry->invocation_counter : nullptr;
+    params.counter_threshold = g_gear_switch_threshold;
     auto [success, piece, size] = TryLiteTranslateAndInstallRegion(pc, params);
     if (!success && gear_up) {
       // The optimized pass uses the same decoder and instruction lowerings as
@@ -329,7 +350,10 @@ void InitTranslatorArch() {
   ClaimHostFaultSignals();
   UpdateTranslationMode();
   UpdateJitThreshold();
-  TRACE_AND_ALOGD("berberis-la64: JIT cold threshold=%u", g_jit_threshold);
+  UpdateGearSwitchThreshold();
+  TRACE_AND_ALOGD("berberis-la64: JIT cold threshold=%u gear-switch threshold=%u",
+                  g_jit_threshold,
+                  g_gear_switch_threshold);
 }
 
 extern "C" __attribute__((used, __visibility__("hidden"))) void berberis_HandleInterpret(

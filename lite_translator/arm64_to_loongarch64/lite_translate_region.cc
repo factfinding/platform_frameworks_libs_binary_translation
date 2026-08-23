@@ -87,12 +87,53 @@ CachedXRegisterMap SelectCachedXRegisters(const XRegisterUsage& usage) {
 
 CachedVRegisterMap SelectCachedVRegisters(GuestAddr start_pc, GuestAddr end_pc) {
   std::array<uint16_t, 32> reads{};
-  std::array<bool, 32> written{};
-  auto mark_written = [&written](uint32_t reg) { written[reg & 31] = true; };
+  std::array<bool, 32> unsafe_write{};
+  auto mark_written = [&unsafe_write](uint32_t reg, bool cache_coherent = false) {
+    if (!cache_coherent) {
+      unsafe_write[reg & 31] = true;
+    }
+  };
   auto mark_read = [&reads](uint32_t reg) { ++reads[reg & 31]; };
 
   for (GuestAddr pc = start_pc; pc < end_pc; pc += sizeof(uint32_t)) {
     uint32_t insn = *ToHostAddr<const uint32_t>(pc);
+
+    // These hot 128-bit floating-point operations commit their destination
+    // through StoreV(), which writes ThreadState first and then refreshes a
+    // mapped LSX register.  Unlike partial/lane writes they are therefore
+    // safe to cache even when Vd is also a destination.
+    if ((insn & 0xffa0'fc00u) == 0x4e20'cc00u ||
+        (insn & 0xffa0'fc00u) == 0x4ea0'cc00u) {  // FMLA/FMLS Vd.4S
+      mark_written(insn, true);
+      mark_read(insn);
+      mark_read(insn >> 5);
+      mark_read(insn >> 16);
+      continue;
+    }
+    if ((insn & (1u << 30)) != 0 &&
+        ((insn & 0xbf20'fc00u) == 0x2e20'dc00u ||
+         (insn & 0xbf20'fc00u) == 0x2e20'fc00u ||
+         (insn & 0xbfa0'fc00u) == 0x0e20'd400u ||
+         (insn & 0xbfa0'fc00u) == 0x0ea0'd400u)) {  // FMUL/FDIV/FADD/FSUB
+      mark_written(insn, true);
+      mark_read(insn >> 5);
+      mark_read(insn >> 16);
+      continue;
+    }
+    if ((insn & 0xffc0'f400u) == 0x4f80'1000u) {  // FMLA Vd.4S, Vn.4S, Vm.S[i]
+      mark_written(insn, true);
+      mark_read(insn);
+      mark_read(insn >> 5);
+      mark_read((((insn >> 20) & 1) << 4) | ((insn >> 16) & 15));
+      continue;
+    }
+    if ((insn & (1u << 30)) != 0 &&
+        (insn & 0xbfc0'f400u) == 0x0f80'9000u) {  // FMUL Vd.4S, Vn.4S, Vm.S[i]
+      mark_written(insn, true);
+      mark_read(insn >> 5);
+      mark_read((((insn >> 20) & 1) << 4) | ((insn >> 16) & 15));
+      continue;
+    }
 
     // FABS/FNEG Vd.4S, Vn.4S are unary.  Their bits 20:16 are part of the
     // opcode, not Rm; handling them before the conservative SIMD rule avoids
@@ -226,7 +267,10 @@ CachedVRegisterMap SelectCachedVRegisters(GuestAddr start_pc, GuestAddr end_pc) 
   for (int8_t slot = 0; slot < 5; ++slot) {
     uint32_t best_reg = 32;
     for (uint32_t reg = 0; reg < reads.size(); ++reg) {
-      if (!written[reg] && reads[reg] >= 2 && (best_reg == 32 || reads[reg] > reads[best_reg])) {
+      // Cache written values only when every writer is a full-width,
+      // StoreV()-based write-through lowering audited above.
+      if (!unsafe_write[reg] && reads[reg] >= 2 &&
+          (best_reg == 32 || reads[reg] > reads[best_reg])) {
         best_reg = reg;
       }
     }
@@ -283,12 +327,14 @@ bool DecodeLogicalImmediate(uint32_t n,
 class LiteTranslator {
  public:
   explicit LiteTranslator(MachineCode* machine_code,
+                          GuestAddr start_pc,
                           CachedXRegisterMap cached_x_registers,
                           CachedVRegisterMap cached_v_registers,
                           bool enable_guest_memory,
                           bool allow_dispatch,
                           XRegisterUsage* x_register_usage = nullptr)
       : as_(machine_code),
+        start_pc_(start_pc),
         enable_guest_memory_(enable_guest_memory),
         allow_dispatch_(allow_dispatch),
         cached_x_registers_(cached_x_registers),
@@ -467,12 +513,16 @@ class LiteTranslator {
       }
       return TranslateLd1r(insn, pc);
     }
-    // LD1/ST1 of one 32-bit lane without writeback.  Q and S encode the lane.
-    if ((insn & 0xbfff'ec00u) == 0x0d40'8000u || (insn & 0xbfff'ec00u) == 0x0d00'8000u) {
+    // LD1/ST1 of one 32-bit lane, with optional immediate/register
+    // post-index writeback.  Q and S encode the lane.
+    if ((insn & 0xbfff'ec00u) == 0x0d40'8000u ||
+        (insn & 0xbfff'ec00u) == 0x0d00'8000u ||
+        (insn & 0xbfe0'ec00u) == 0x0dc0'8000u ||
+        (insn & 0xbfe0'ec00u) == 0x0d80'8000u) {
       if (!enable_guest_memory_) {
         return false;
       }
-      return TranslateLdSt1SNoWriteback(insn, pc);
+      return TranslateLdSt1S(insn, pc);
     }
     if ((insn & 0xffe0'8400u) == 0x6e00'0400u) {
       return TranslateInsElement(insn);
@@ -871,7 +921,7 @@ class LiteTranslator {
   }
 
   void Exit(GuestAddr pc) {
-    as_.Li(Assembler::s7, pc);
+    SetGuestPc(pc);
     if (allow_dispatch_ && config::kLinkJumpsBetweenRegions) {
       Assembler::Label* pending_signal = as_.MakeLabel();
       as_.LdBU(Assembler::t0,
@@ -891,7 +941,7 @@ class LiteTranslator {
   }
 
   void ExitGeneratedCode(GuestAddr pc) {
-    as_.Li(Assembler::s7, pc);
+    SetGuestPc(pc);
     ExitGeneratedCode();
   }
 
@@ -955,6 +1005,13 @@ class LiteTranslator {
   }
 
   void Finalize() {
+    // Memory faults are exceptional.  Keep their recovery exits after the
+    // normal region body so successful loads and stores neither branch over
+    // cold code nor pull it into the hot I-cache footprint.
+    for (const PendingRecoveryExit& exit : pending_recovery_exits_) {
+      as_.Bind(exit.label);
+      ExitGeneratedCode(exit.guest_pc);
+    }
     // Keep taken conditional edges out of the sequentially executed body.
     // Besides improving I-cache density, one shared stub is enough when
     // several branches in a region target the same guest address.
@@ -979,6 +1036,17 @@ class LiteTranslator {
     Assembler::Label* label;
   };
 
+  struct PendingRecoveryExit {
+    GuestAddr guest_pc;
+    Assembler::Label* label;
+  };
+
+  Assembler::Label* AddRecoveryExit(GuestAddr guest_pc) {
+    Assembler::Label* label = as_.MakeLabel();
+    pending_recovery_exits_.push_back({guest_pc, label});
+    return label;
+  }
+
   Assembler::Label* GetStaticExitLabel(GuestAddr target) {
     for (const PendingStaticExit& exit : pending_static_exits_) {
       if (exit.target == target) {
@@ -996,6 +1064,19 @@ class LiteTranslator {
 
   static constexpr int32_t VOffset(uint32_t reg) {
     return offsetof(ThreadState, cpu) + offsetof(CPUState, v) + reg * sizeof(__uint128_t);
+  }
+
+  void SetGuestPc(GuestAddr pc) {
+    // s7 still contains the region entry PC until an exit is taken.  Most
+    // Lite regions and their side exits are within ADDI.D's signed 12-bit
+    // range, so update it relative to the entry instead of materializing a
+    // 48-bit guest address with several instructions.
+    int64_t delta = static_cast<int64_t>(pc) - static_cast<int64_t>(start_pc_);
+    if (delta >= -2048 && delta <= 2047) {
+      as_.AddiD(Assembler::s7, Assembler::s7, static_cast<int32_t>(delta));
+    } else {
+      as_.Li(Assembler::s7, pc);
+    }
   }
 
   static constexpr std::array<Register, 7> kCachedXHostRegisters = {
@@ -1940,7 +2021,7 @@ class LiteTranslator {
       as_.And(Assembler::t1, Assembler::t1, Assembler::t2);
       ApplyTbi(Assembler::t1);
 
-      Assembler::Label* recovery = as_.MakeLabel();
+      Assembler::Label* recovery = AddRecoveryExit(pc);
       Assembler::Label* done = as_.MakeLabel();
       const uint32_t byte_count = is_stz2g ? 32 : 16;
       for (uint32_t byte_offset = 0; byte_offset < byte_count; byte_offset += 8) {
@@ -1953,8 +2034,6 @@ class LiteTranslator {
         StoreXOrSp(rn, Assembler::t0);
       }
       as_.B(*done);
-      as_.Bind(recovery);
-      ExitGeneratedCode(pc);
       as_.Bind(done);
       return true;
     }
@@ -2129,7 +2208,7 @@ class LiteTranslator {
       as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
     }
     ApplyTbi(Assembler::t0);
-    Assembler::Label* recovery = as_.MakeLabel();
+    Assembler::Label* recovery = AddRecoveryExit(pc);
     Assembler::Label* done = as_.MakeLabel();
     if (load) {
       as_.SetRecoveryPoint(recovery);
@@ -2159,8 +2238,6 @@ class LiteTranslator {
       }
     }
     as_.B(*done);
-    as_.Bind(recovery);
-    ExitGeneratedCode(pc);
     as_.Bind(done);
     if (mode == 1 || mode == 3) {
       LoadXOrSp(rn, Assembler::t0);
@@ -2181,7 +2258,7 @@ class LiteTranslator {
     as_.Move(Assembler::t3, Assembler::t0);
     ApplyTbi(Assembler::t0);
 
-    Assembler::Label* recovery = as_.MakeLabel();
+    Assembler::Label* recovery = AddRecoveryExit(pc);
     Assembler::Label* done = as_.MakeLabel();
     as_.SetRecoveryPoint(recovery);
     switch (size) {
@@ -2209,8 +2286,6 @@ class LiteTranslator {
             offsetof(ThreadState, cpu) + offsetof(CPUState, reservation_value));
     StoreXOrDiscard(rt, Assembler::t1);
     as_.B(*done);
-    as_.Bind(recovery);
-    ExitGeneratedCode(pc);
     as_.Bind(done);
     return true;
   }
@@ -2224,7 +2299,7 @@ class LiteTranslator {
     ApplyTbi(Assembler::t0);
     LoadXOrZero(rt, Assembler::t1);
 
-    Assembler::Label* recovery = as_.MakeLabel();
+    Assembler::Label* recovery = AddRecoveryExit(pc);
     Assembler::Label* done = as_.MakeLabel();
     as_.SetRecoveryPoint(recovery);
     switch (size) {
@@ -2246,8 +2321,6 @@ class LiteTranslator {
     // runtime).  It is lighter than a full DBAR 0 in this very hot path.
     as_.Dbar(0x12);
     as_.B(*done);
-    as_.Bind(recovery);
-    ExitGeneratedCode(pc);
     as_.Bind(done);
     return true;
   }
@@ -2266,7 +2339,7 @@ class LiteTranslator {
     if (size < 2) {
       Assembler::Label* fail = as_.MakeLabel();
       Assembler::Label* success = as_.MakeLabel();
-      Assembler::Label* recovery = as_.MakeLabel();
+      Assembler::Label* recovery = AddRecoveryExit(pc);
       Assembler::Label* done = as_.MakeLabel();
 
       // LAM_BH provides native byte/halfword compare-and-exchange.  Combine
@@ -2304,9 +2377,6 @@ class LiteTranslator {
       as_.StD(Assembler::zero, Assembler::s8, kReservationAddressOffset);
       StoreXOrDiscard(rs, Assembler::zero);
       as_.B(*done);
-
-      as_.Bind(recovery);
-      ExitGeneratedCode(pc);
       as_.Bind(done);
       return true;
     }
@@ -2314,7 +2384,7 @@ class LiteTranslator {
     Assembler::Label* retry = as_.MakeLabel();
     Assembler::Label* fail = as_.MakeLabel();
     Assembler::Label* success = as_.MakeLabel();
-    Assembler::Label* recovery = as_.MakeLabel();
+    Assembler::Label* recovery = AddRecoveryExit(pc);
     Assembler::Label* done = as_.MakeLabel();
 
     // Check the architectural reservation before touching memory.  Keep it
@@ -2363,9 +2433,6 @@ class LiteTranslator {
     as_.StD(Assembler::zero, Assembler::s8, kReservationAddressOffset);
     StoreXOrDiscard(rs, Assembler::zero);
     as_.B(*done);
-
-    as_.Bind(recovery);
-    ExitGeneratedCode(pc);
     as_.Bind(done);
     return true;
   }
@@ -2387,7 +2454,7 @@ class LiteTranslator {
     LoadXOrSp(rn, Assembler::t0);
     as_.Move(Assembler::t3, Assembler::t0);
     ApplyTbi(Assembler::t0);
-    Assembler::Label* recovery = as_.MakeLabel();
+    Assembler::Label* recovery = AddRecoveryExit(pc);
     Assembler::Label* done = as_.MakeLabel();
     as_.SetRecoveryPoint(recovery);
     as_.LlD(Assembler::t1, Assembler::t0);
@@ -2414,8 +2481,6 @@ class LiteTranslator {
     StoreXOrDiscard(rt, Assembler::t1);
     StoreXOrDiscard(rt2, Assembler::t2);
     as_.B(*done);
-    as_.Bind(recovery);
-    ExitGeneratedCode(pc);
     as_.Bind(done);
     return true;
   }
@@ -2438,7 +2503,7 @@ class LiteTranslator {
     Assembler::Label* retry = as_.MakeLabel();
     Assembler::Label* fail = as_.MakeLabel();
     Assembler::Label* success = as_.MakeLabel();
-    Assembler::Label* recovery = as_.MakeLabel();
+    Assembler::Label* recovery = AddRecoveryExit(pc);
     Assembler::Label* done = as_.MakeLabel();
 
     LoadXOrSp(rn, Assembler::t0);
@@ -2496,9 +2561,6 @@ class LiteTranslator {
     as_.StD(Assembler::zero, Assembler::s8, kReservationAddressOffset);
     StoreXOrDiscard(rs, Assembler::zero);
     as_.B(*done);
-
-    as_.Bind(recovery);
-    ExitGeneratedCode(pc);
     as_.Bind(done);
     return true;
   }
@@ -2516,7 +2578,7 @@ class LiteTranslator {
     Assembler::Label* retry = as_.MakeLabel();
     Assembler::Label* compare_failed = as_.MakeLabel();
     Assembler::Label* success = as_.MakeLabel();
-    Assembler::Label* recovery = as_.MakeLabel();
+    Assembler::Label* recovery = AddRecoveryExit(pc);
     Assembler::Label* done = as_.MakeLabel();
 
     LoadXOrSp(rn, Assembler::t0);
@@ -2531,7 +2593,7 @@ class LiteTranslator {
     // used by Clang's own __atomic lowering and are essential for pthread and
     // libc++ synchronization.  B/H still require a containing-word LL/SC.
     if (size >= 2 && operation != AtomicMemoryOp::kCas) {
-      Assembler::Label* recovery = as_.MakeLabel();
+      Assembler::Label* recovery = AddRecoveryExit(pc);
       Assembler::Label* done = as_.MakeLabel();
       as_.SetRecoveryPoint(recovery);
       if (operation == AtomicMemoryOp::kSwp) {
@@ -2546,8 +2608,6 @@ class LiteTranslator {
       }
       StoreXOrDiscard(rt, Assembler::t5);
       as_.B(*done);
-      as_.Bind(recovery);
-      ExitGeneratedCode(pc);
       as_.Bind(done);
       return true;
     }
@@ -2644,9 +2704,6 @@ class LiteTranslator {
     }
     StoreXOrDiscard(operation == AtomicMemoryOp::kCas ? rs : rt, Assembler::t5);
     as_.B(*done);
-
-    as_.Bind(recovery);
-    ExitGeneratedCode(pc);
     as_.Bind(done);
     return true;
   }
@@ -2671,7 +2728,7 @@ class LiteTranslator {
       as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
     }
     ApplyTbi(Assembler::t0);
-    Assembler::Label* recovery = as_.MakeLabel();
+    Assembler::Label* recovery = AddRecoveryExit(pc);
     Assembler::Label* done = as_.MakeLabel();
     if (load) {
       if (element_size == 16) {
@@ -2739,8 +2796,6 @@ class LiteTranslator {
       }
     }
     as_.B(*done);
-    as_.Bind(recovery);
-    ExitGeneratedCode(pc);
     as_.Bind(done);
     if (mode == 1 || mode == 3) {
       LoadXOrSp(rn, Assembler::t0);
@@ -2789,8 +2844,7 @@ class LiteTranslator {
     const uint32_t value_count = register_count * 2;
     LoadXOrSp(rn, Assembler::t0);
     ApplyTbi(Assembler::t0);
-    Assembler::Label* recovery = as_.MakeLabel();
-    Assembler::Label* done = as_.MakeLabel();
+    Assembler::Label* recovery = AddRecoveryExit(pc);
 
     if (load) {
       // Delay every architectural V-register write until all potentially
@@ -2819,11 +2873,6 @@ class LiteTranslator {
         as_.StD(kValues[value], Assembler::t0, value * 8);
       }
     }
-    as_.B(*done);
-    as_.Bind(recovery);
-    ExitGeneratedCode(pc);
-    as_.Bind(done);
-
     if (post_index) {
       LoadXOrSp(rn, Assembler::t0);
       if (rm == 31) {
@@ -2844,8 +2893,7 @@ class LiteTranslator {
     const uint32_t rt = insn & 31;
     LoadXOrSp(rn, Assembler::t0);
     ApplyTbi(Assembler::t0);
-    Assembler::Label* recovery = as_.MakeLabel();
-    Assembler::Label* done = as_.MakeLabel();
+    Assembler::Label* recovery = AddRecoveryExit(pc);
 
     // Memory holds four interleaved 4S vectors as four 16-byte rows.  Keep
     // every row in scratch LSX registers until all accesses have succeeded,
@@ -2871,11 +2919,6 @@ class LiteTranslator {
     StoreV((rt + 1) & 31, Assembler::vr1);
     StoreV((rt + 2) & 31, Assembler::vr2);
     StoreV((rt + 3) & 31, Assembler::vr3);
-    as_.B(*done);
-    as_.Bind(recovery);
-    ExitGeneratedCode(pc);
-    as_.Bind(done);
-
     if (post_index) {
       LoadXOrSp(rn, Assembler::t0);
       if (rm == 31) {
@@ -2898,8 +2941,7 @@ class LiteTranslator {
     const int32_t lane_offset = ((insn >> 30) & 1) * 8;
     LoadXOrSp(rn, Assembler::t0);
     ApplyTbi(Assembler::t0);
-    Assembler::Label* recovery = as_.MakeLabel();
-    Assembler::Label* done = as_.MakeLabel();
+    Assembler::Label* recovery = AddRecoveryExit(pc);
     if (load) {
       // Preserve the destination until the potentially faulting load has
       // completed so interpreter recovery can restart the instruction.
@@ -2911,10 +2953,6 @@ class LiteTranslator {
       as_.SetRecoveryPoint(recovery);
       as_.StD(Assembler::t1, Assembler::t0, 0);
     }
-    as_.B(*done);
-    as_.Bind(recovery);
-    ExitGeneratedCode(pc);
-    as_.Bind(done);
     if (post_index) {
       // Reload the untagged architectural value rather than writing the TBI
       // memory address back to the guest register.
@@ -2938,8 +2976,7 @@ class LiteTranslator {
     const uint32_t rm = (insn >> 16) & 31;
     LoadXOrSp(rn, Assembler::t0);
     ApplyTbi(Assembler::t0);
-    Assembler::Label* recovery = as_.MakeLabel();
-    Assembler::Label* done = as_.MakeLabel();
+    Assembler::Label* recovery = AddRecoveryExit(pc);
     as_.SetRecoveryPoint(recovery);
     if (element_64) {
       as_.LdD(Assembler::t1, Assembler::t0, 0);
@@ -2949,10 +2986,6 @@ class LiteTranslator {
       as_.Vreplgr2vrW(Assembler::vr0, Assembler::t1);
     }
     StoreV(rt, Assembler::vr0);
-    as_.B(*done);
-    as_.Bind(recovery);
-    ExitGeneratedCode(pc);
-    as_.Bind(done);
     if (post_index) {
       LoadXOrSp(rn, Assembler::t0);
       if (rm == 31) {
@@ -2966,15 +2999,16 @@ class LiteTranslator {
     return true;
   }
 
-  bool TranslateLdSt1SNoWriteback(uint32_t insn, GuestAddr pc) {
+  bool TranslateLdSt1S(uint32_t insn, GuestAddr pc) {
     const bool load = (insn & (1u << 22)) != 0;
+    const bool post_index = (insn & (1u << 23)) != 0;
     const uint32_t rn = (insn >> 5) & 31;
     const uint32_t rt = insn & 31;
+    const uint32_t rm = (insn >> 16) & 31;
     const uint32_t lane = (((insn >> 30) & 1) << 1) | ((insn >> 12) & 1);
     LoadXOrSp(rn, Assembler::t0);
     ApplyTbi(Assembler::t0);
-    Assembler::Label* recovery = as_.MakeLabel();
-    Assembler::Label* done = as_.MakeLabel();
+    Assembler::Label* recovery = AddRecoveryExit(pc);
     if (load) {
       // Do not modify the destination until the potentially faulting access
       // succeeds, so interpreter recovery can restart the instruction.
@@ -2986,10 +3020,18 @@ class LiteTranslator {
       as_.SetRecoveryPoint(recovery);
       as_.StW(Assembler::t1, Assembler::t0, 0);
     }
-    as_.B(*done);
-    as_.Bind(recovery);
-    ExitGeneratedCode(pc);
-    as_.Bind(done);
+    if (post_index) {
+      // Reload the architectural base so a tagged pointer retains its top
+      // byte on writeback; the TBI-stripped temporary is for memory only.
+      LoadXOrSp(rn, Assembler::t0);
+      if (rm == 31) {
+        as_.AddiD(Assembler::t0, Assembler::t0, 4);
+      } else {
+        LoadXOrZero(rm, Assembler::t1);
+        as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
+      }
+      StoreXOrSp(rn, Assembler::t0);
+    }
     return true;
   }
 
@@ -4293,7 +4335,7 @@ class LiteTranslator {
   }
 
   void EmitSimd32LoadStore(bool is_store, uint32_t rt, GuestAddr pc) {
-    Assembler::Label* recovery = as_.MakeLabel();
+    Assembler::Label* recovery = AddRecoveryExit(pc);
     Assembler::Label* done = as_.MakeLabel();
     if (!is_store) {
       as_.SetRecoveryPoint(recovery);
@@ -4307,13 +4349,11 @@ class LiteTranslator {
       as_.StW(Assembler::t1, Assembler::t0, 0);
     }
     as_.B(*done);
-    as_.Bind(recovery);
-    ExitGeneratedCode(pc);
     as_.Bind(done);
   }
 
   void EmitSimd64LoadStore(bool is_store, uint32_t rt, GuestAddr pc) {
-    Assembler::Label* recovery = as_.MakeLabel();
+    Assembler::Label* recovery = AddRecoveryExit(pc);
     Assembler::Label* done = as_.MakeLabel();
     if (!is_store) {
       as_.SetRecoveryPoint(recovery);
@@ -4326,13 +4366,11 @@ class LiteTranslator {
       as_.StD(Assembler::t1, Assembler::t0, 0);
     }
     as_.B(*done);
-    as_.Bind(recovery);
-    ExitGeneratedCode(pc);
     as_.Bind(done);
   }
 
   void EmitSimd128LoadStore(bool is_store, uint32_t rt, GuestAddr pc) {
-    Assembler::Label* recovery = as_.MakeLabel();
+    Assembler::Label* recovery = AddRecoveryExit(pc);
     Assembler::Label* done = as_.MakeLabel();
     if (!is_store) {
       as_.SetRecoveryPoint(recovery);
@@ -4350,13 +4388,11 @@ class LiteTranslator {
       as_.StD(Assembler::t2, Assembler::t0, 8);
     }
     as_.B(*done);
-    as_.Bind(recovery);
-    ExitGeneratedCode(pc);
     as_.Bind(done);
   }
 
   void EmitLoadStore(uint32_t size, uint32_t opc, uint32_t rt, GuestAddr pc) {
-    Assembler::Label* recovery = as_.MakeLabel();
+    Assembler::Label* recovery = AddRecoveryExit(pc);
     Assembler::Label* done = as_.MakeLabel();
     if (opc != 0) {
       as_.SetRecoveryPoint(recovery);
@@ -4417,8 +4453,6 @@ class LiteTranslator {
       }
     }
     as_.B(*done);
-    as_.Bind(recovery);
-    ExitGeneratedCode(pc);
     as_.Bind(done);
   }
 
@@ -4611,18 +4645,25 @@ class LiteTranslator {
     bool link = (insn & 0xffff'fc1fu) == 0xd63f'0000u;
     LoadXOrZero(rn, Assembler::t1);
     if (link) {
-      as_.Li(Assembler::t0, pc + 4);
+      int64_t delta = static_cast<int64_t>(pc + 4) - static_cast<int64_t>(start_pc_);
+      if (delta >= -2048 && delta <= 2047) {
+        as_.AddiD(Assembler::t0, Assembler::s7, static_cast<int32_t>(delta));
+      } else {
+        as_.Li(Assembler::t0, pc + 4);
+      }
       StoreXOrDiscard(30, Assembler::t0);
     }
     ExitIndirect(Assembler::t1);
   }
 
   Assembler as_;
+  GuestAddr start_pc_;
   bool enable_guest_memory_;
   bool allow_dispatch_;
   CachedXRegisterMap cached_x_registers_;
   CachedVRegisterMap cached_v_registers_;
   XRegisterUsage* x_register_usage_;
+  std::vector<PendingRecoveryExit> pending_recovery_exits_;
   std::vector<PendingStaticExit> pending_static_exits_;
   Assembler::Label* profile_hot_exit_ = nullptr;
   HostCode profile_threshold_callback_ = nullptr;
@@ -4650,6 +4691,7 @@ std::tuple<bool, GuestAddr> TryLiteTranslateRegion(GuestAddr start_pc,
     CachedVRegisterMap no_cached_v_registers{};
     no_cached_v_registers.fill(-1);
     LiteTranslator analyzer(&analysis_code,
+                            start_pc,
                             no_cached_x_registers,
                             no_cached_v_registers,
                             params.enable_guest_memory,
@@ -4667,6 +4709,7 @@ std::tuple<bool, GuestAddr> TryLiteTranslateRegion(GuestAddr start_pc,
     cached_v_registers = SelectCachedVRegisters(start_pc, analysis_pc);
   }
   LiteTranslator translator(machine_code,
+                            start_pc,
                             cached_x_registers,
                             cached_v_registers,
                             params.enable_guest_memory,
