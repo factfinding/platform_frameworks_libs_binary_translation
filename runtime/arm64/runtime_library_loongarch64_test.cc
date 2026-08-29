@@ -4560,6 +4560,30 @@ TEST(LoongArch64RuntimeLibraryTest, LiteHotModifiedImmediatesMatchInterpreter) {
   }
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteModifiedImmediateDoesNotAliasSshll8H) {
+  constexpr std::array<uint32_t, 3> kGuestCode = {
+      0x0f00'a400,  // movi v0.4h,#0,lsl#8
+      0x4f00'a7e1,  // movi v1.8h,#31,lsl#8
+      0x0f07'a7ff,  // movi v31.4h,#255,lsl#8
+  };
+
+  for (uint32_t insn : kGuestCode) {
+    const std::array<uint32_t, 1> one_insn = {insn};
+    const GuestAddr start_pc = ToGuestAddr(one_insn.data());
+    MachineCode code;
+    LiteTranslateParams params;
+    params.end_pc = start_pc + sizeof(one_insn);
+    params.allow_dispatch = false;
+    params.enable_reg_mapping = true;
+
+    auto [success, stop_pc] = TryLiteTranslateRegion(start_pc, &code, params);
+
+    SCOPED_TRACE(testing::Message() << "insn=" << std::hex << insn);
+    EXPECT_FALSE(success);
+    EXPECT_EQ(stop_pc, start_pc);
+  }
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteUaddlv8BMatchesInterpreter) {
   constexpr std::array<uint32_t, 2> kGuestCode = {
       0x2e30'3820,  // uaddlv h0,v1.8b

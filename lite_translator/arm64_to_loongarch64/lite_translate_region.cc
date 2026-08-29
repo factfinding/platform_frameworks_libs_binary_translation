@@ -171,7 +171,7 @@ CachedVRegisterMap SelectCachedVRegisters(GuestAddr start_pc, GuestAddr end_pc) 
     if ((insn & 0xffbf'fc00u) == 0x5e21'd800u || (insn & 0xffbf'fc00u) == 0x7e21'd800u ||
         (insn & 0xbfff'fc00u) == 0x0e21'd800u ||
         ((insn & 0xff80'fc00u) == 0x2f00'a400u && (((insn >> 19) & 0xeu) == 0x2u)) ||
-        ((insn & 0xbf80'fc00u) == 0x0f00'a400u && (((insn >> 19) & 0xeu) == 0u)) ||
+        ((insn & 0xbf80'fc00u) == 0x0f00'a400u && (((insn >> 19) & 0xfu) == 0x1u)) ||
         (insn & 0xffff'fc00u) == 0x4ea1'd800u || (insn & 0xffff'fc00u) == 0x0e61'2800u) {
       mark_written(insn);
       mark_read(insn >> 5);
@@ -631,7 +631,7 @@ class LiteTranslator {
     }
     // SSHLL/SSHLL2 Vd.8H, Vn.8B/16B, #shift.  Unity texture and resource
     // conversion uses the zero-shift form as a signed byte unpack.
-    if ((insn & 0xbf80'fc00u) == 0x0f00'a400u && (((insn >> 19) & 0xeu) == 0u)) {
+    if ((insn & 0xbf80'fc00u) == 0x0f00'a400u && (((insn >> 19) & 0xfu) == 0x1u)) {
       return TranslateSshll8H(insn);
     }
     // USHLL Vd.4S, Vn.4H, #shift.  The unsigned LSX widening shift has the
