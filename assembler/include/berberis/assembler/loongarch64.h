@@ -294,6 +294,18 @@ class Assembler : public AssemblerBase {
   void VfcmpCltS(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
     Emit32(0x0c51'0000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
   }
+  void VfcmpCunS(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
+    Emit32(0x0c54'0000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
+  }
+  void VfcmpCunD(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
+    Emit32(0x0c64'0000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
+  }
+  void VfminS(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
+    Emit32(0x713e'8000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
+  }
+  void VfminD(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
+    Emit32(0x713f'0000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
+  }
   void VseqB(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
     Emit32(0x7000'0000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
   }
@@ -344,6 +356,18 @@ class Assembler : public AssemblerBase {
   }
   void FmsubD(SimdRegister fd, SimdRegister fj, SimdRegister fk, SimdRegister fa) {
     Emit32(0x0860'0000 | EncodeVa(fa) | EncodeVk(fk) | EncodeVj(fj) | EncodeVd(fd));
+  }
+  void FnmaddS(SimdRegister fd, SimdRegister fj, SimdRegister fk, SimdRegister fa) {
+    Emit32(0x0890'0000 | EncodeVa(fa) | EncodeVk(fk) | EncodeVj(fj) | EncodeVd(fd));
+  }
+  void FnmaddD(SimdRegister fd, SimdRegister fj, SimdRegister fk, SimdRegister fa) {
+    Emit32(0x08a0'0000 | EncodeVa(fa) | EncodeVk(fk) | EncodeVj(fj) | EncodeVd(fd));
+  }
+  void FnmsubS(SimdRegister fd, SimdRegister fj, SimdRegister fk, SimdRegister fa) {
+    Emit32(0x08d0'0000 | EncodeVa(fa) | EncodeVk(fk) | EncodeVj(fj) | EncodeVd(fd));
+  }
+  void FnmsubD(SimdRegister fd, SimdRegister fj, SimdRegister fk, SimdRegister fa) {
+    Emit32(0x08e0'0000 | EncodeVa(fa) | EncodeVk(fk) | EncodeVj(fj) | EncodeVd(fd));
   }
   void FcvtDS(SimdRegister fd, SimdRegister fj) {
     Emit32(0x0119'2400 | EncodeVj(fj) | EncodeVd(fd));

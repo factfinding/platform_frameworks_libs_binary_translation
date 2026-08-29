@@ -111,10 +111,9 @@ CachedVRegisterMap SelectCachedVRegisters(GuestAddr start_pc, GuestAddr end_pc) 
       continue;
     }
     if ((insn & (1u << 30)) != 0 &&
-        ((insn & 0xbf20'fc00u) == 0x2e20'dc00u ||
-         (insn & 0xbf20'fc00u) == 0x2e20'fc00u ||
-         (insn & 0xbfa0'fc00u) == 0x0e20'd400u ||
-         (insn & 0xbfa0'fc00u) == 0x0ea0'd400u)) {  // FMUL/FDIV/FADD/FSUB
+        ((insn & 0xbf20'fc00u) == 0x2e20'dc00u || (insn & 0xbf20'fc00u) == 0x2e20'fc00u ||
+         (insn & 0xbfa0'fc00u) == 0x0e20'd400u || (insn & 0xbfa0'fc00u) == 0x0ea0'd400u ||
+         (insn & 0xbfa0'fc00u) == 0x0ea0'f400u)) {  // FMUL/FDIV/FADD/FSUB/FMIN
       mark_written(insn, true);
       mark_read(insn >> 5);
       mark_read(insn >> 16);
@@ -169,11 +168,11 @@ CachedVRegisterMap SelectCachedVRegisters(GuestAddr start_pc, GuestAddr end_pc) 
 
     // Unary narrowing/widening and scalar vector conversion have only Vn as
     // a vector source.  The general-register SCVTF forms have none.
-    if ((insn & 0xffbf'fc00u) == 0x5e21'd800u || (insn & 0xbfff'fc00u) == 0x0e21'd800u ||
+    if ((insn & 0xffbf'fc00u) == 0x5e21'd800u || (insn & 0xffbf'fc00u) == 0x7e21'd800u ||
+        (insn & 0xbfff'fc00u) == 0x0e21'd800u ||
         ((insn & 0xff80'fc00u) == 0x2f00'a400u && (((insn >> 19) & 0xeu) == 0x2u)) ||
         ((insn & 0xbf80'fc00u) == 0x0f00'a400u && (((insn >> 19) & 0xeu) == 0u)) ||
-        (insn & 0xffff'fc00u) == 0x4ea1'd800u ||
-        (insn & 0xffff'fc00u) == 0x0e61'2800u) {
+        (insn & 0xffff'fc00u) == 0x4ea1'd800u || (insn & 0xffff'fc00u) == 0x0e61'2800u) {
       mark_written(insn);
       mark_read(insn >> 5);
       continue;
@@ -189,7 +188,8 @@ CachedVRegisterMap SelectCachedVRegisters(GuestAddr start_pc, GuestAddr end_pc) 
     // DUP from a general register and modified-immediate constants have no
     // vector source.  UMOV is the opposite: it reads a vector but writes a
     // general register.  Handle them before the conservative SIMD rule.
-    if ((insn & 0xbfff'fc00u) == 0x0e04'0c00u || (insn & 0xffff'ffe0u) == 0x4f04'8400u ||
+    if ((insn & 0xbfff'fc00u) == 0x0e04'0c00u || (insn & 0xbff8'fc00u) == 0x0f00'f400u ||
+        (insn & 0xfff8'fc00u) == 0x6f00'f400u || (insn & 0xffff'ffe0u) == 0x4f04'8400u ||
         (insn & 0xffff'ffe0u) == 0x4f04'6400u || (insn & 0xffff'ffe0u) == 0x4f05'67e0u ||
         (insn & 0xffff'ffe0u) == 0x4f03'f600u || (insn & 0xffff'ffe0u) == 0x4f06'f600u ||
         (insn & 0xffff'ffe0u) == 0x4f07'f600u || (insn & 0xffff'ffe0u) == 0x0f07'f600u) {
@@ -324,6 +324,22 @@ bool DecodeLogicalImmediate(uint32_t n,
   }
   *result = value;
   return true;
+}
+
+constexpr uint32_t ExpandFpImmediate32(uint8_t imm8) {
+  const uint32_t sign = (imm8 >> 7) & 1;
+  const uint32_t b = (imm8 >> 6) & 1;
+  const uint32_t exponent = ((1 - b) << 7) | ((b ? 0x1fu : 0u) << 2) | ((imm8 >> 4) & 3);
+  const uint32_t fraction = static_cast<uint32_t>(imm8 & 0xf) << 19;
+  return (sign << 31) | (exponent << 23) | fraction;
+}
+
+constexpr uint64_t ExpandFpImmediate64(uint8_t imm8) {
+  const uint64_t sign = (imm8 >> 7) & 1;
+  const uint64_t b = (imm8 >> 6) & 1;
+  const uint64_t exponent = ((1 - b) << 10) | ((b ? 0xffull : 0ull) << 2) | ((imm8 >> 4) & 3);
+  const uint64_t fraction = static_cast<uint64_t>(imm8 & 0xf) << 48;
+  return (sign << 63) | (exponent << 52) | fraction;
 }
 
 class LiteTranslator {
@@ -517,10 +533,8 @@ class LiteTranslator {
     }
     // LD1/ST1 of one 32-bit lane, with optional immediate/register
     // post-index writeback.  Q and S encode the lane.
-    if ((insn & 0xbfff'ec00u) == 0x0d40'8000u ||
-        (insn & 0xbfff'ec00u) == 0x0d00'8000u ||
-        (insn & 0xbfe0'ec00u) == 0x0dc0'8000u ||
-        (insn & 0xbfe0'ec00u) == 0x0d80'8000u) {
+    if ((insn & 0xbfff'ec00u) == 0x0d40'8000u || (insn & 0xbfff'ec00u) == 0x0d00'8000u ||
+        (insn & 0xbfe0'ec00u) == 0x0dc0'8000u || (insn & 0xbfe0'ec00u) == 0x0d80'8000u) {
       if (!enable_guest_memory_) {
         return false;
       }
@@ -676,6 +690,12 @@ class LiteTranslator {
     if ((insn & 0xffe0'fc00u) == 0x4ec0'7800u) {
       return TranslateZip2D(insn);
     }
+    // FMOV Vd.2S/4S/2D, #imm uses ARM's compact VFP immediate expansion.
+    // Cover the complete legal immediate space rather than enumerating the
+    // constants seen in individual applications.
+    if ((insn & 0xbff8'fc00u) == 0x0f00'f400u || (insn & 0xfff8'fc00u) == 0x6f00'f400u) {
+      return TranslateVectorFmovImmediate(insn);
+    }
     // MOVI Vd.2D, #0.  Compilers use this reserved modified-immediate form
     // as the canonical full-width vector clear.
     if ((insn & 0xffff'ffe0u) == 0x6f00'e400u) {
@@ -755,6 +775,9 @@ class LiteTranslator {
     if ((insn & 0xffe0'fc00u) == 0x2e20'd400u) {
       return TranslateFaddp2S(insn);
     }
+    if ((insn & 0xffe0'fc00u) == 0x2ea0'f400u) {
+      return TranslateFminp2S(insn);
+    }
     // AdvSIMD floating-point add/sub and mul/div.  Q and size select 2S/4S/2D;
     // half-precision encodings remain in the interpreter.
     if ((insn & 0xbfa0'fc00u) == 0x0e20'd400u) {
@@ -762,6 +785,9 @@ class LiteTranslator {
     }
     if ((insn & 0xbfa0'fc00u) == 0x0ea0'd400u) {
       return TranslateVectorFpBinary(insn, 3);  // FSUB
+    }
+    if ((insn & 0xbfa0'fc00u) == 0x0ea0'f400u) {
+      return TranslateVectorFmin(insn);
     }
     if ((insn & 0xffff'fc00u) == 0x4ea0'd800u) {
       return TranslateFcmeq4SZero(insn);
@@ -798,6 +824,9 @@ class LiteTranslator {
     }
     if ((insn & 0xffbf'fc00u) == 0x5e21'd800u) {
       return TranslateScvtfScalarVector(insn);
+    }
+    if ((insn & 0xffbf'fc00u) == 0x7e21'd800u) {
+      return TranslateUcvtfScalarVector(insn);
     }
     if ((insn & 0x7fbf'fc00u) == 0x1e22'0000u) {
       return TranslateScvtfScalarGeneral(insn);
@@ -1292,8 +1321,12 @@ class LiteTranslator {
     as_.SrliD(reg, reg, 8);
   }
 
-  bool ShiftOperand(Register reg, uint32_t shift_kind, uint32_t amount, bool is_64_bit) {
-    if (shift_kind == 3 || (!is_64_bit && amount >= 32)) {
+  bool ShiftOperand(Register reg,
+                    uint32_t shift_kind,
+                    uint32_t amount,
+                    bool is_64_bit,
+                    bool allow_rotate = false) {
+    if ((shift_kind == 3 && !allow_rotate) || (!is_64_bit && amount >= 32)) {
       return false;
     }
     if (!is_64_bit) {
@@ -1312,6 +1345,10 @@ class LiteTranslator {
         break;
       case 2:
         as_.SraiD(reg, reg, amount);
+        break;
+      case 3:
+        as_.Li(Assembler::t2, amount);
+        is_64_bit ? as_.RotrD(reg, reg, Assembler::t2) : as_.RotrW(reg, reg, Assembler::t2);
         break;
     }
     return true;
@@ -1556,7 +1593,7 @@ class LiteTranslator {
     uint32_t rd = insn & 31;
     LoadXOrZero(rn, Assembler::t0);
     LoadXOrZero(rm, Assembler::t1);
-    if (!ShiftOperand(Assembler::t1, shift_kind, amount, is_64_bit)) {
+    if (!ShiftOperand(Assembler::t1, shift_kind, amount, is_64_bit, true)) {
       return false;
     }
     if (invert) {
@@ -3505,6 +3542,52 @@ class LiteTranslator {
     return true;
   }
 
+  bool TranslateFminp2S(uint32_t insn) {
+    const uint32_t rm = (insn >> 16) & 31;
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    LoadV(rn, Assembler::vr1);
+    LoadV(rm, Assembler::vr2);
+    as_.Vshuf4iW(Assembler::vr3, Assembler::vr1, 0xb1);
+    as_.FminS(Assembler::vr1, Assembler::vr1, Assembler::vr3);
+    as_.Vshuf4iW(Assembler::vr3, Assembler::vr2, 0xb1);
+    as_.FminS(Assembler::vr2, Assembler::vr2, Assembler::vr3);
+    as_.VilvlW(Assembler::vr0, Assembler::vr2, Assembler::vr1);
+    StoreV(rd, Assembler::vr0);
+    as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
+    return true;
+  }
+
+  bool TranslateVectorFmin(uint32_t insn) {
+    const bool is_128_bit = (insn & (1u << 30)) != 0;
+    const bool is_double = (insn & (1u << 22)) != 0;
+    const uint32_t rm = (insn >> 16) & 31;
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    LoadV(rn, Assembler::vr1);
+    LoadV(rm, Assembler::vr2);
+    is_double ? as_.VfminD(Assembler::vr0, Assembler::vr1, Assembler::vr2)
+              : as_.VfminS(Assembler::vr0, Assembler::vr1, Assembler::vr2);
+    // LoongArch VFMIN has min-number NaN behavior, while ARM FMIN requires a
+    // default NaN whenever either input lane is NaN.  Select the architectural
+    // default NaN under an unordered-comparison mask.
+    is_double ? as_.VfcmpCunD(Assembler::vr3, Assembler::vr1, Assembler::vr2)
+              : as_.VfcmpCunS(Assembler::vr3, Assembler::vr1, Assembler::vr2);
+    if (is_double) {
+      as_.Li(Assembler::t0, 0x7ff8'0000'0000'0000ULL);
+      as_.Vreplgr2vrD(Assembler::vr2, Assembler::t0);
+    } else {
+      as_.Li(Assembler::t0, 0x7fc0'0000u);
+      as_.Vreplgr2vrW(Assembler::vr2, Assembler::t0);
+    }
+    as_.VbitselV(Assembler::vr0, Assembler::vr0, Assembler::vr2, Assembler::vr3);
+    StoreV(rd, Assembler::vr0);
+    if (!is_128_bit) {
+      as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
+    }
+    return true;
+  }
+
   bool TranslateFcmeq4SZero(uint32_t insn) {
     const uint32_t rn = (insn >> 5) & 31;
     const uint32_t rd = insn & 31;
@@ -3646,6 +3729,46 @@ class LiteTranslator {
       as_.Movgr2frW(Assembler::vr0, Assembler::t0);
       as_.FfintSW(Assembler::vr0, Assembler::vr0);
     }
+    as_.Vst(Assembler::vr0, Assembler::s8, VOffset(rd));
+    if (!is_double) {
+      as_.StW(Assembler::zero, Assembler::s8, VOffset(rd) + 4);
+    }
+    as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
+    return true;
+  }
+
+  bool TranslateUcvtfScalarVector(uint32_t insn) {
+    const bool is_double = (insn & (1u << 22)) != 0;
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    Assembler::Label* convert = as_.MakeLabel();
+    Assembler::Label* done = as_.MakeLabel();
+
+    if (!is_double) {
+      as_.LdWU(Assembler::t0, Assembler::s8, VOffset(rn));
+      as_.Movgr2frD(Assembler::vr0, Assembler::t0);
+      as_.FfintSL(Assembler::vr0, Assembler::vr0);
+    } else {
+      as_.LdD(Assembler::t0, Assembler::s8, VOffset(rn));
+      as_.SrliD(Assembler::t1, Assembler::t0, 63);
+      as_.Beqz(Assembler::t1, *convert);
+      as_.Li(Assembler::t1, 1);
+      as_.And(Assembler::t1, Assembler::t0, Assembler::t1);
+      as_.SrliD(Assembler::t0, Assembler::t0, 1);
+      as_.Or(Assembler::t0, Assembler::t0, Assembler::t1);
+      as_.Movgr2frD(Assembler::vr0, Assembler::t0);
+      as_.FfintDL(Assembler::vr0, Assembler::vr0);
+      as_.Li(Assembler::t1, 0x4000'0000'0000'0000ULL);
+      as_.Movgr2frD(Assembler::vr1, Assembler::t1);
+      as_.FmulD(Assembler::vr0, Assembler::vr0, Assembler::vr1);
+      as_.B(*done);
+
+      as_.Bind(convert);
+      as_.Movgr2frD(Assembler::vr0, Assembler::t0);
+      as_.FfintDL(Assembler::vr0, Assembler::vr0);
+      as_.Bind(done);
+    }
+
     as_.Vst(Assembler::vr0, Assembler::s8, VOffset(rd));
     if (!is_double) {
       as_.StW(Assembler::zero, Assembler::s8, VOffset(rd) + 4);
@@ -3994,6 +4117,23 @@ class LiteTranslator {
     return true;
   }
 
+  bool TranslateVectorFmovImmediate(uint32_t insn) {
+    const bool is_double = (insn & (1u << 29)) != 0;
+    const bool is_128_bit = (insn & (1u << 30)) != 0;
+    const uint8_t imm8 = static_cast<uint8_t>((((insn >> 16) & 7) << 5) | ((insn >> 5) & 0x1f));
+    uint64_t low;
+    uint64_t high;
+    if (is_double) {
+      low = ExpandFpImmediate64(imm8);
+      high = low;
+    } else {
+      const uint64_t word = ExpandFpImmediate32(imm8);
+      low = word | (word << 32);
+      high = is_128_bit ? low : 0;
+    }
+    return TranslateMoviConstant(insn, low, high);
+  }
+
   bool TranslateMoviConstant(uint32_t insn, uint64_t low, uint64_t high) {
     const uint32_t rd = insn & 31;
     as_.Li(Assembler::t0, low);
@@ -4162,10 +4302,7 @@ class LiteTranslator {
     const uint32_t ra = (insn >> 10) & 31;
     const uint32_t rn = (insn >> 5) & 31;
     const uint32_t rd = insn & 31;
-    // This lowering currently covers ARM FMADD and FNMSUB.  LoongArch FMSUB
-    // has exactly FNMSUB's Rn*Rm-Ra semantics; the other two sign variants
-    // need their corresponding host fused operations.
-    if (ftype > 1 || negate_product != subtract_addend) {
+    if (ftype > 1) {
       return false;
     }
 
@@ -4173,18 +4310,26 @@ class LiteTranslator {
     LoadV(rm, Assembler::vr2);
     LoadV(ra, Assembler::vr3);
     if (ftype == 0) {
-      if (negate_product) {
-        as_.FmsubS(Assembler::vr0, Assembler::vr1, Assembler::vr2, Assembler::vr3);
-      } else {
+      if (!negate_product && !subtract_addend) {
         as_.FmaddS(Assembler::vr0, Assembler::vr1, Assembler::vr2, Assembler::vr3);
+      } else if (!negate_product && subtract_addend) {
+        as_.FnmsubS(Assembler::vr0, Assembler::vr1, Assembler::vr2, Assembler::vr3);
+      } else if (negate_product && !subtract_addend) {
+        as_.FnmaddS(Assembler::vr0, Assembler::vr1, Assembler::vr2, Assembler::vr3);
+      } else {
+        as_.FmsubS(Assembler::vr0, Assembler::vr1, Assembler::vr2, Assembler::vr3);
       }
       as_.Vst(Assembler::vr0, Assembler::s8, VOffset(rd));
       as_.StW(Assembler::zero, Assembler::s8, VOffset(rd) + 4);
     } else {
-      if (negate_product) {
-        as_.FmsubD(Assembler::vr0, Assembler::vr1, Assembler::vr2, Assembler::vr3);
-      } else {
+      if (!negate_product && !subtract_addend) {
         as_.FmaddD(Assembler::vr0, Assembler::vr1, Assembler::vr2, Assembler::vr3);
+      } else if (!negate_product && subtract_addend) {
+        as_.FnmsubD(Assembler::vr0, Assembler::vr1, Assembler::vr2, Assembler::vr3);
+      } else if (negate_product && !subtract_addend) {
+        as_.FnmaddD(Assembler::vr0, Assembler::vr1, Assembler::vr2, Assembler::vr3);
+      } else {
+        as_.FmsubD(Assembler::vr0, Assembler::vr1, Assembler::vr2, Assembler::vr3);
       }
       as_.Vst(Assembler::vr0, Assembler::s8, VOffset(rd));
     }
