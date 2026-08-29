@@ -83,6 +83,97 @@ bool WriteExtractedLibMetadata(const std::string& path,
   return true;
 }
 
+std::string ExtractApkEntryToCache(ZipArchiveHandle zip,
+                                   const std::string& apk_path,
+                                   const std::string& entry_name,
+                                   const std::string& cache_dir,
+                                   mode_t mode) {
+  const char* basename = strrchr(entry_name.c_str(), '/');
+  basename = basename ? basename + 1 : entry_name.c_str();
+  std::string out_path = cache_dir + "/" + basename;
+
+  ZipEntry entry;
+  if (FindEntry(zip, entry_name, &entry) != 0) {
+    DIGITALIS_LOG(
+        "ExtractInApkLibToCache: entry %s not found in %s", entry_name.c_str(), apk_path.c_str());
+    return {};
+  }
+
+  // Package updates may replace a library without clearing the application's
+  // cache directory.  Reusing a file based on its basename alone can then pair
+  // old native code with new Java bytecode.  Conscrypt, for example, aborts at
+  // JNI registration when its callback signatures change.  Persist the ZIP
+  // entry identity next to the extracted file and only reuse an exact match.
+  std::string metadata_path = out_path + ".meta";
+  ExtractedLibMetadata expected_metadata = {
+      .magic = kExtractedLibMetadataMagic,
+      .crc32 = entry.crc32,
+      .uncompressed_length = entry.uncompressed_length,
+  };
+  ExtractedLibMetadata cached_metadata;
+  struct stat st_out;
+  if (stat(out_path.c_str(), &st_out) == 0 &&
+      static_cast<uint64_t>(st_out.st_size) == entry.uncompressed_length &&
+      ReadExtractedLibMetadata(metadata_path, &cached_metadata) &&
+      cached_metadata.magic == expected_metadata.magic &&
+      cached_metadata.crc32 == expected_metadata.crc32 &&
+      cached_metadata.uncompressed_length == expected_metadata.uncompressed_length) {
+    // Some APK libraries, notably Chromium's Crashpad trampoline, are
+    // executed through the guest linker rather than only passed to dlopen().
+    // Repair the mode on cache hits as well as on first extraction.
+    if ((st_out.st_mode & 0777) != mode && chmod(out_path.c_str(), mode) != 0) {
+      DIGITALIS_LOG(
+          "ExtractInApkLibToCache: chmod(%s) failed: %s", out_path.c_str(), strerror(errno));
+      return {};
+    }
+    return out_path;
+  }
+
+  // Extract to a temp file and rename so partial reads from concurrent
+  // launches don't see a half-written .so.
+  std::string tmp_suffix = ".tmp." + std::to_string(getpid());
+  std::string tmp_path = out_path + tmp_suffix;
+  int out_fd = open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, mode);
+  if (out_fd < 0) {
+    DIGITALIS_LOG("ExtractInApkLibToCache: open(%s) failed: %s", tmp_path.c_str(), strerror(errno));
+    return {};
+  }
+  int32_t rc = ExtractEntryToFile(zip, &entry, out_fd);
+  if (fchmod(out_fd, mode) != 0) {
+    DIGITALIS_LOG(
+        "ExtractInApkLibToCache: fchmod(%s) failed: %s", tmp_path.c_str(), strerror(errno));
+    rc = -1;
+  }
+  close(out_fd);
+  if (rc != 0) {
+    unlink(tmp_path.c_str());
+    DIGITALIS_LOG(
+        "ExtractInApkLibToCache: ExtractEntryToFile rc=%d for %s", rc, entry_name.c_str());
+    return {};
+  }
+  if (rename(tmp_path.c_str(), out_path.c_str()) != 0) {
+    unlink(tmp_path.c_str());
+    DIGITALIS_LOG("ExtractInApkLibToCache: rename(%s,%s) failed: %s",
+                  tmp_path.c_str(),
+                  out_path.c_str(),
+                  strerror(errno));
+    return {};
+  }
+  std::string tmp_metadata_path = metadata_path + tmp_suffix;
+  if (!WriteExtractedLibMetadata(tmp_metadata_path, expected_metadata) ||
+      rename(tmp_metadata_path.c_str(), metadata_path.c_str()) != 0) {
+    unlink(tmp_metadata_path.c_str());
+    DIGITALIS_LOG("ExtractInApkLibToCache: failed to update metadata for %s: %s",
+                  out_path.c_str(),
+                  strerror(errno));
+  }
+  DIGITALIS_LOG("ExtractInApkLibToCache: %s!/%s -> %s",
+                apk_path.c_str(),
+                entry_name.c_str(),
+                out_path.c_str());
+  return out_path;
+}
+
 }  // namespace
 
 // Extract <apk_path>!/<entry> to /data/data/<pkg>/cache/berberis_extract/<basename>
@@ -107,8 +198,6 @@ std::string ExtractInApkLibToCache(const char* libpath) {
   }
   std::string apk_path(libpath, static_cast<size_t>(bang - libpath));
   std::string entry_name(bang + 2);  // skip "!/"
-  const char* basename = strrchr(entry_name.c_str(), '/');
-  basename = basename ? basename + 1 : entry_name.c_str();
 
   const char* private_dir = berberis::GetAppPrivateDir();
   if (private_dir == nullptr || private_dir[0] == '\0') {
@@ -120,77 +209,34 @@ std::string ExtractInApkLibToCache(const char* libpath) {
   mkdir((std::string(private_dir) + "/cache").c_str(), 0700);
   mkdir(cache_dir.c_str(), 0700);
 
-  std::string out_path = cache_dir + "/" + basename;
-
   ZipArchiveHandle zip = nullptr;
   if (OpenArchive(apk_path.c_str(), &zip) != 0) {
     DIGITALIS_LOG("ExtractInApkLibToCache: OpenArchive(%s) failed", apk_path.c_str());
     if (zip) CloseArchive(zip);
     return {};
   }
-  ZipEntry entry;
-  if (FindEntry(zip, entry_name, &entry) != 0) {
-    DIGITALIS_LOG("ExtractInApkLibToCache: entry %s not found in %s",
-                  entry_name.c_str(), apk_path.c_str());
-    CloseArchive(zip);
-    return {};
+
+  std::string out_path = ExtractApkEntryToCache(zip, apk_path, entry_name, cache_dir, 0600);
+
+  // Chromium locates its Crashpad trampoline relative to the loaded
+  // libmonochrome path.  Since the native bridge redirects that library to
+  // this cache, place an executable copy of the sibling trampoline here too.
+  // Probe by entry name rather than by Chromium library name so future
+  // monochrome naming changes and other Chromium packages remain covered.
+  if (!out_path.empty()) {
+    size_t slash = entry_name.rfind('/');
+    std::string entry_dir = slash == std::string::npos ? "" : entry_name.substr(0, slash + 1);
+    std::string crashpad_entry = entry_dir + "libcrashpad_handler_trampoline.so";
+    ZipEntry crashpad_zip_entry;
+    if (entry_name != crashpad_entry && FindEntry(zip, crashpad_entry, &crashpad_zip_entry) == 0) {
+      if (ExtractApkEntryToCache(zip, apk_path, crashpad_entry, cache_dir, 0700).empty()) {
+        DIGITALIS_LOG("ExtractInApkLibToCache: failed to cache Crashpad trampoline from %s",
+                      apk_path.c_str());
+      }
+    }
   }
 
-  // Package updates may replace a library without clearing the application's
-  // cache directory.  Reusing a file based on its basename alone can then pair
-  // old native code with new Java bytecode.  Conscrypt, for example, aborts at
-  // JNI registration when its callback signatures change.  Persist the ZIP
-  // entry identity next to the extracted file and only reuse an exact match.
-  std::string metadata_path = out_path + ".meta";
-  ExtractedLibMetadata expected_metadata = {
-      .magic = kExtractedLibMetadataMagic,
-      .crc32 = entry.crc32,
-      .uncompressed_length = entry.uncompressed_length,
-  };
-  ExtractedLibMetadata cached_metadata;
-  struct stat st_out;
-  if (stat(out_path.c_str(), &st_out) == 0 &&
-      static_cast<uint64_t>(st_out.st_size) == entry.uncompressed_length &&
-      ReadExtractedLibMetadata(metadata_path, &cached_metadata) &&
-      cached_metadata.magic == expected_metadata.magic &&
-      cached_metadata.crc32 == expected_metadata.crc32 &&
-      cached_metadata.uncompressed_length == expected_metadata.uncompressed_length) {
-    CloseArchive(zip);
-    return out_path;
-  }
-
-  // Extract to a temp file and rename so partial reads from concurrent
-  // launches don't see a half-written .so.
-  std::string tmp_suffix = ".tmp." + std::to_string(getpid());
-  std::string tmp_path = out_path + tmp_suffix;
-  int out_fd = open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-  if (out_fd < 0) {
-    DIGITALIS_LOG("ExtractInApkLibToCache: open(%s) failed: %s", tmp_path.c_str(), strerror(errno));
-    CloseArchive(zip);
-    return {};
-  }
-  int32_t rc = ExtractEntryToFile(zip, &entry, out_fd);
-  close(out_fd);
   CloseArchive(zip);
-  if (rc != 0) {
-    unlink(tmp_path.c_str());
-    DIGITALIS_LOG("ExtractInApkLibToCache: ExtractEntryToFile rc=%d for %s", rc, entry_name.c_str());
-    return {};
-  }
-  if (rename(tmp_path.c_str(), out_path.c_str()) != 0) {
-    unlink(tmp_path.c_str());
-    DIGITALIS_LOG("ExtractInApkLibToCache: rename(%s,%s) failed: %s",
-                  tmp_path.c_str(), out_path.c_str(), strerror(errno));
-    return {};
-  }
-  std::string tmp_metadata_path = metadata_path + tmp_suffix;
-  if (!WriteExtractedLibMetadata(tmp_metadata_path, expected_metadata) ||
-      rename(tmp_metadata_path.c_str(), metadata_path.c_str()) != 0) {
-    unlink(tmp_metadata_path.c_str());
-    DIGITALIS_LOG("ExtractInApkLibToCache: failed to update metadata for %s: %s",
-                  out_path.c_str(), strerror(errno));
-  }
-  DIGITALIS_LOG("ExtractInApkLibToCache: %s -> %s", libpath, out_path.c_str());
   return out_path;
 }
 
