@@ -407,9 +407,18 @@ bool NdktNativeBridge::LinkNamespaces(native_bridge_namespace_t* from,
   std::string guest_shared_libs;
   if (shared_libs_sonames != nullptr) {
     guest_shared_libs = shared_libs_sonames;
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+    // The legacy RenderScript Java API lazily loads its JNI implementation
+    // from an ARM64 application process.  Keep the host library private, but
+    // make the ARM64 guest implementation reachable through the system link.
+    guest_shared_libs += ":librs_jni.so";
+#endif
     guest_shared_libs += ":linux-vdso.so.1";
   } else {
-    guest_shared_libs = "linux-vdso.so.1";
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+    guest_shared_libs = "librs_jni.so:";
+#endif
+    guest_shared_libs += "linux-vdso.so.1";
   }
   // endregion
   return guest_loader_->LinkNamespaces(
