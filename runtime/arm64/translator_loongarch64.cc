@@ -60,6 +60,7 @@ constexpr uint32_t kMaxRegionInsns = 256;
 uint32_t g_jit_threshold = kDefaultJitThreshold;
 uint32_t g_gear_switch_threshold = config::kGearSwitchThreshold;
 uint32_t g_max_region_insns = kDefaultMaxRegionInsns;
+bool g_runtime_diagnostics_enabled;
 std::atomic<uint64_t> g_jit_successes;
 std::atomic<uint64_t> g_jit_gear_ups;
 std::atomic<uint64_t> g_jit_fallbacks;
@@ -118,7 +119,7 @@ uint64_t RecordJitRegion(size_t guest_size, size_t host_size) {
   // Region installation is cold compared with region execution.  Report a
   // cumulative snapshot at exponentially increasing intervals so production
   // runs retain useful region-quality data without per-dispatch overhead.
-  if ((regions & (regions - 1)) == 0) {
+  if (g_runtime_diagnostics_enabled && (regions & (regions - 1)) == 0) {
     uint64_t total_guest_insns = g_jit_guest_insns.load(std::memory_order_relaxed);
     uint64_t total_host_bytes = g_jit_host_bytes.load(std::memory_order_relaxed);
     TRACE_AND_ALOGD(
@@ -164,6 +165,9 @@ constexpr size_t kInterpreterOpcodeBucketCount = 1 << kInterpreterOpcodeBucketBi
 thread_local std::array<uint32_t, kInterpreterOpcodeBucketCount> g_interpreter_opcode_counts{};
 
 void RecordInterpreterEntry(ThreadState* state) {
+  if (!g_runtime_diagnostics_enabled) {
+    return;
+  }
   GuestAddr pc = state->cpu.insn_addr;
   uint32_t insn = *ToHostAddr<const uint32_t>(pc);
   size_t bucket = insn >> (32 - kInterpreterOpcodeBucketBits);
@@ -180,6 +184,14 @@ void RecordInterpreterEntry(ThreadState* state) {
         static_cast<unsigned long>(pc),
         insn);
   }
+}
+
+void UpdateRuntimeDiagnostics() {
+  const char* profiling = GetProfilingConfig();
+  const char* package = GetAppPackageName();
+  g_runtime_diagnostics_enabled =
+      profiling &&
+      (strcmp(profiling, "1") == 0 || (package && strcmp(profiling, package) == 0));
 }
 
 void UpdateTranslationMode() {
@@ -324,7 +336,8 @@ bool TranslateRegion(GuestAddr pc, bool gear_up = false) {
       g_next_interpreter_batch_size = 0;
       if (gear_up) {
         uint64_t gear_ups = g_jit_gear_ups.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (gear_ups <= 20 || gear_ups % 1000 == 0) {
+        if (g_runtime_diagnostics_enabled &&
+            (gear_ups <= 20 || gear_ups % 1000 == 0)) {
           TRACE_AND_ALOGD("berberis-la64: gear-up #%lu pc=0x%lx insns=%lu",
                           static_cast<unsigned long>(gear_ups),
                           static_cast<unsigned long>(pc),
@@ -332,7 +345,8 @@ bool TranslateRegion(GuestAddr pc, bool gear_up = false) {
         }
       } else {
         uint64_t jit_successes = RecordJitRegion(size, piece.size);
-        if (jit_successes <= 20 || jit_successes % 1000 == 0) {
+        if (g_runtime_diagnostics_enabled &&
+            (jit_successes <= 20 || jit_successes % 1000 == 0)) {
           TRACE_AND_ALOGD("berberis-la64: JIT #%lu pc=0x%lx insns=%lu",
                           static_cast<unsigned long>(jit_successes),
                           static_cast<unsigned long>(pc),
@@ -350,7 +364,8 @@ bool TranslateRegion(GuestAddr pc, bool gear_up = false) {
     g_next_interpreter_batch_size =
         GetJitFallbackBatchSize(g_consecutive_jit_fallbacks);
     uint64_t jit_fallbacks = g_jit_fallbacks.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (jit_fallbacks <= 20 || jit_fallbacks % 1000 == 0) {
+    if (g_runtime_diagnostics_enabled &&
+        (jit_fallbacks <= 20 || jit_fallbacks % 1000 == 0)) {
       TRACE_AND_ALOGD("berberis-la64: fallback #%lu pc=0x%lx insn=0x%08x batch=%d",
                       static_cast<unsigned long>(jit_fallbacks),
                       static_cast<unsigned long>(pc),
@@ -371,11 +386,14 @@ void InitTranslatorArch() {
   UpdateJitThreshold();
   UpdateGearSwitchThreshold();
   UpdateMaxRegionInsns();
-  TRACE_AND_ALOGD("berberis-la64: JIT cold threshold=%u gear-switch threshold=%u "
-                  "max-region-insns=%u",
-                  g_jit_threshold,
-                  g_gear_switch_threshold,
-                  g_max_region_insns);
+  UpdateRuntimeDiagnostics();
+  if (g_runtime_diagnostics_enabled) {
+    TRACE_AND_ALOGD("berberis-la64: JIT cold threshold=%u gear-switch threshold=%u "
+                    "max-region-insns=%u",
+                    g_jit_threshold,
+                    g_gear_switch_threshold,
+                    g_max_region_insns);
+  }
 }
 
 extern "C" __attribute__((used, __visibility__("hidden"))) void berberis_HandleInterpret(
@@ -393,7 +411,8 @@ extern "C" __attribute__((used, __visibility__("hidden"))) void berberis_HandleN
   }
   if (TranslateRegion(state->cpu.insn_addr)) {
     uint64_t cold = g_jit_cold_interpretations.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (cold <= 20 || (cold & (cold - 1)) == 0) {
+    if (g_runtime_diagnostics_enabled &&
+        (cold <= 20 || (cold & (cold - 1)) == 0)) {
       TRACE_AND_ALOGD("berberis-la64: cold-interpret #%lu pc=0x%lx threshold=%u",
                       static_cast<unsigned long>(cold),
                       static_cast<unsigned long>(state->cpu.insn_addr),
