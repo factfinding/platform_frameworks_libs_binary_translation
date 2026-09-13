@@ -435,7 +435,8 @@ void DoTrampoline_JNIEnv_CallStaticVoidMethodV(HostCode /* callee */, ProcessSta
   auto [arg_env, arg_1, arg_2, arg_va] = GuestParamsValues<PFN_callee>(state);
   JNIEnv* arg_0 = ToHostJNIEnv(arg_env);
   std::vector<jvalue> arg_vector = ConvertVAList(arg_0, arg_2, ToGuestAddr(arg_va));
-  jvalue* arg_3 = &arg_vector[0];
+  jvalue empty_arg_3{};
+  jvalue* arg_3 = arg_vector.empty() ? &empty_arg_3 : arg_vector.data();
 
   // Note, this call is the only difference from the auto-generated trampoline.
   profile.StartHostCall();

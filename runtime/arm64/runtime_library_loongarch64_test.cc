@@ -68,6 +68,29 @@ void RunStackClosure(GuestAddr pc, GuestArgumentBuffer* buffer) {
   buffer->argv[0] = result;
 }
 
+void RunMixedSpillClosure(GuestAddr pc, GuestArgumentBuffer* buffer) {
+  float fp_arg;
+  memcpy(&fp_arg, &buffer->simd_argv[0], sizeof(fp_arg));
+
+  EXPECT_EQ(pc, 0x1234u);
+  EXPECT_EQ(buffer->argc, 8);
+  EXPECT_EQ(buffer->simd_argc, 1);
+  EXPECT_EQ(buffer->stack_argc, static_cast<int>(10 * sizeof(uint64_t)));
+  EXPECT_EQ(buffer->argv[0], 0x1111u);
+  EXPECT_EQ(buffer->argv[1], 0x2222u);
+  EXPECT_FLOAT_EQ(fp_arg, 18.0f);
+  for (size_t i = 0; i < 6; ++i) {
+    EXPECT_EQ(buffer->argv[i + 2], i + 1);
+  }
+  for (size_t i = 0; i < 7; ++i) {
+    EXPECT_EQ(buffer->stack_argv[i], i + 7);
+  }
+  EXPECT_EQ(buffer->stack_argv[7], 0x1234'5678'9abc'def0ULL);
+  EXPECT_EQ(buffer->stack_argv[8], 1u);
+  EXPECT_EQ(buffer->stack_argv[9], 0u);
+  buffer->argv[0] = 0xfeed'faceULL;
+}
+
 void RunConcurrentClosure(GuestAddr pc, GuestArgumentBuffer* buffer) {
   buffer->argv[0] += pc;
 }
@@ -138,6 +161,53 @@ TEST(LoongArch64RuntimeLibraryTest, StaticClosureTrampolinePreservesArguments) {
   StackCallback stack_callback = AsFuncPtr<StackCallback>(CreateGuestFunctionWrapper(
       10, "lllllllllll", AsHostCode(&RunStackClosure), "stack_closure_test"));
   EXPECT_EQ(stack_callback(1, 2, 3, 4, 5, 6, 7, 8, 9, 10), 65u);
+}
+
+TEST(LoongArch64RuntimeLibraryTest, StaticClosureTrampolinePreservesMixedSpilledArguments) {
+  using MixedCallback = uint64_t (*)(void*,
+                                     void*,
+                                     float,
+                                     int32_t,
+                                     int32_t,
+                                     int32_t,
+                                     int32_t,
+                                     int32_t,
+                                     int32_t,
+                                     int32_t,
+                                     int32_t,
+                                     int32_t,
+                                     int32_t,
+                                     int32_t,
+                                     int32_t,
+                                     int32_t,
+                                     int64_t,
+                                     bool,
+                                     bool);
+  MixedCallback mixed_callback = AsFuncPtr<MixedCallback>(CreateGuestFunctionWrapper(
+      0x1234,
+      "lppfiiiiiiiiiiiiilzz",
+      AsHostCode(&RunMixedSpillClosure),
+      "mixed_spill_closure_test"));
+  EXPECT_EQ(mixed_callback(reinterpret_cast<void*>(0x1111),
+                           reinterpret_cast<void*>(0x2222),
+                           18.0f,
+                           1,
+                           2,
+                           3,
+                           4,
+                           5,
+                           6,
+                           7,
+                           8,
+                           9,
+                           10,
+                           11,
+                           12,
+                           13,
+                           0x1234'5678'9abc'def0LL,
+                           true,
+                           false),
+            0xfeed'faceULL);
 }
 
 TEST(LoongArch64RuntimeLibraryTest, StaticClosureTrampolineAllocationIsConcurrent) {

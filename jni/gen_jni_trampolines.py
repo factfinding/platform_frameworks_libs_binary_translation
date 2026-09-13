@@ -45,7 +45,8 @@ _ARG = {
         'init': """\
   std::vector<jvalue> arg_vector = ConvertVAList(
     arg_0, arg_{arg_va_method_id}, GuestParamsValues<PFN_callee>(state));
-  jvalue* arg_{index} = &arg_vector[0];""",
+  jvalue empty_arg_{index}{{}};
+  jvalue* arg_{index} = arg_vector.empty() ? &empty_arg_{index} : arg_vector.data();""",
     },
   # Note: we couldn't teach GuestParams class to distinguish Va_list because on
   # ARM it's simply a char*, not a distint type.
@@ -53,7 +54,8 @@ _ARG = {
         'init': """\
   std::vector<jvalue> arg_vector = ConvertVAList(
     arg_0, arg_{arg_va_method_id}, ToGuestAddr(arg_va));
-  jvalue* arg_{index} = &arg_vector[0];""",
+  jvalue empty_arg_{index}{{}};
+  jvalue* arg_{index} = arg_vector.empty() ? &empty_arg_{index} : arg_vector.data();""",
     },
 }
 
