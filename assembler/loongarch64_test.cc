@@ -26,6 +26,92 @@
 namespace berberis::loongarch64 {
 namespace {
 
+TEST(LoongArch64AssemblerTest, EncodesVectorShiftTestAndMax) {
+  MachineCode code;
+  Assembler as(&code);
+  as.VfmaxS(Assembler::vr0, Assembler::vr1, Assembler::vr2);
+  as.VseqW(Assembler::vr0, Assembler::vr1, Assembler::vr2);
+  as.VslliW(Assembler::vr0, Assembler::vr1, 0);
+  as.VslliW(Assembler::vr2, Assembler::vr3, 31);
+  as.VsrliW(Assembler::vr0, Assembler::vr1, 0);
+  as.VsrliW(Assembler::vr2, Assembler::vr3, 31);
+  as.VnorV(Assembler::vr0, Assembler::vr1, Assembler::vr2);
+  // Independently assembled using LLVM's LSX backend.
+  constexpr std::array<uint32_t, 7> kExpected = {
+      0x713c'8820, 0x7001'0820, 0x732c'8020, 0x732c'fc62, 0x7330'8020, 0x7330'fc62, 0x7127'8820};
+  ASSERT_EQ(code.install_size(), sizeof(kExpected));
+  for (size_t i = 0; i < kExpected.size(); ++i) {
+    EXPECT_EQ(*code.AddrAs<const uint32_t>(i * 4), kExpected[i]) << i;
+  }
+}
+
+TEST(LoongArch64AssemblerTest, EncodesBitExtractionAndWordExtension) {
+  MachineCode code;
+  Assembler as(&code);
+  as.BstrpickD(Assembler::t0, Assembler::t1, 0, 0);
+  as.BstrpickD(Assembler::t0, Assembler::t1, 31, 0);
+  as.BstrpickD(Assembler::t0, Assembler::t1, 55, 0);
+  as.BstrpickD(Assembler::t0, Assembler::t1, 63, 0);
+  as.BstrpickD(Assembler::t0, Assembler::t1, 63, 63);
+  as.AddiW(Assembler::t0, Assembler::t1, 0);
+  as.AddiW(Assembler::t2, Assembler::t3, -2048);
+  as.AddiW(Assembler::t4, Assembler::t5, 2047);
+  // Independently assembled using LLVM's LoongArch backend.
+  constexpr std::array<uint32_t, 8> kExpected = {0x00c0'01ac,
+                                                 0x00df'01ac,
+                                                 0x00f7'01ac,
+                                                 0x00ff'01ac,
+                                                 0x00ff'fdac,
+                                                 0x0280'01ac,
+                                                 0x02a0'01ee,
+                                                 0x029f'fe30};
+  ASSERT_EQ(code.install_size(), sizeof(kExpected));
+  for (size_t i = 0; i < kExpected.size(); ++i) {
+    EXPECT_EQ(*code.AddrAs<const uint32_t>(i * 4), kExpected[i]) << i;
+  }
+}
+
+TEST(LoongArch64AssemblerTest, EncodesImmediateConditionMasks) {
+  MachineCode code;
+  Assembler assembler(&code);
+  assembler.Andi(Assembler::t0, Assembler::t1, 1);
+  assembler.Xori(Assembler::t2, Assembler::t3, 2);
+  // Independently assembled with LLVM's LoongArch backend.
+  ASSERT_EQ(code.install_size(), 8u);
+  EXPECT_EQ(*code.AddrAs<const uint32_t>(0), 0x0340'05acu);
+  EXPECT_EQ(*code.AddrAs<const uint32_t>(4), 0x03c0'09eeu);
+}
+
+TEST(LoongArch64AssemblerTest, EncodesShortConstantsWithoutChangingFixedLi) {
+  MachineCode code;
+  Assembler assembler(&code);
+  for (uint64_t value : {UINT64_C(0),
+                         UINT64_C(1),
+                         UINT64_C(2048),
+                         UINT64_MAX - 2047,
+                         UINT64_C(4096),
+                         UINT64_C(0x1'0000'0000),
+                         UINT64_C(0x8000'0000)}) {
+    assembler.LiOptimized(Assembler::a0, value);
+  }
+  // Independently assembled with LLVM's LoongArch backend.
+  constexpr std::array<uint32_t, 9> kExpected = {0x02c0'0004,
+                                                 0x02c0'0404,
+                                                 0x03a0'0004,
+                                                 0x02e0'0004,
+                                                 0x1400'0024,
+                                                 0x1400'0004,
+                                                 0x1600'0024,
+                                                 0x1500'0004,
+                                                 0x1600'0004};
+  ASSERT_EQ(code.install_size(), sizeof(kExpected));
+  for (size_t i = 0; i < kExpected.size(); ++i) {
+    EXPECT_EQ(*code.AddrAs<const uint32_t>(i * sizeof(uint32_t)), kExpected[i]) << i;
+  }
+  assembler.Li(Assembler::a0, 1);
+  EXPECT_EQ(code.install_size(), sizeof(kExpected) + 4 * sizeof(uint32_t));
+}
+
 TEST(LoongArch64AssemblerTest, EncodesLiteSimdFallbackInstructions) {
   MachineCode code;
   Assembler assembler(&code);

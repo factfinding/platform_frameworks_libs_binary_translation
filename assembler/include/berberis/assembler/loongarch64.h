@@ -157,12 +157,28 @@ class Assembler : public AssemblerBase {
   void Revb2W(Register rd, Register rj) { Emit2R(0x0000'3800, rd, rj); }
   void RevbD(Register rd, Register rj) { Emit2R(0x0000'3c00, rd, rj); }
 
+  void AddiW(Register rd, Register rj, int32_t imm12) {
+    Emit2RI12(0x0280'0000, rd, rj, EncodeSigned(imm12, 12));
+  }
+  void BstrpickD(Register rd, Register rj, uint32_t msb, uint32_t lsb) {
+    CHECK_LT(msb, 64u);
+    CHECK_LE(lsb, msb);
+    Emit32(0x00c0'0000 | (msb << 16) | (lsb << 10) | EncodeRj(rj) | EncodeRd(rd));
+  }
   void AddiD(Register rd, Register rj, int32_t imm12) {
     Emit2RI12(0x02c0'0000, rd, rj, EncodeSigned(imm12, 12));
   }
   void Ori(Register rd, Register rj, uint32_t imm12) {
     CHECK_LT(imm12, 1u << 12);
     Emit2RI12(0x0380'0000, rd, rj, imm12);
+  }
+  void Andi(Register rd, Register rj, uint32_t imm12) {
+    CHECK_LT(imm12, 1u << 12);
+    Emit2RI12(0x0340'0000, rd, rj, imm12);
+  }
+  void Xori(Register rd, Register rj, uint32_t imm12) {
+    CHECK_LT(imm12, 1u << 12);
+    Emit2RI12(0x03c0'0000, rd, rj, imm12);
   }
   void Lu52iD(Register rd, Register rj, int32_t imm12) {
     Emit2RI12(0x0300'0000, rd, rj, EncodeSigned(imm12, 12));
@@ -178,6 +194,33 @@ class Assembler : public AssemblerBase {
     Ori(rd, rd, value & 0xfff);
     Lu32iD(rd, SignExtend(value >> 32, 20));
     Lu52iD(rd, rd, SignExtend(value >> 52, 12));
+  }
+
+  // Short constant materialization for ordinary translated instructions.
+  // Keep Li() available for callers that require its fixed four-word layout.
+  void LiOptimized(Register rd, uint64_t value) {
+    if (value <= 2047 || value >= UINT64_MAX - 2047) {
+      AddiD(rd, zero, SignExtend(value, 12));
+      return;
+    }
+    if (value <= 4095) {
+      Ori(rd, zero, value);
+      return;
+    }
+    Lu12iW(rd, SignExtend(value >> 12, 20));
+    if ((value & 0xfff) != 0) {
+      Ori(rd, rd, value & 0xfff);
+    }
+    const uint64_t signed_low32 = static_cast<int64_t>(static_cast<int32_t>(value));
+    if (value == signed_low32) {
+      return;
+    }
+    Lu32iD(rd, SignExtend(value >> 32, 20));
+    // LU32I.D sign-extends bit 51 into bits 63:52.
+    const uint64_t upper12 = (value >> 51) & 1 ? 0xfff : 0;
+    if ((value >> 52) != upper12) {
+      Lu52iD(rd, rd, SignExtend(value >> 52, 12));
+    }
   }
 
   void LdD(Register rd, Register rj, int32_t imm12) {
@@ -299,6 +342,20 @@ class Assembler : public AssemblerBase {
   }
   void VfcmpCunD(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
     Emit32(0x0c64'0000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
+  }
+  void VfmaxS(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
+    Emit32(0x713c'8000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
+  }
+  void VseqW(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
+    Emit32(0x7001'0000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
+  }
+  void VslliW(SimdRegister vd, SimdRegister vj, uint32_t shift) {
+    CHECK_LT(shift, 32u);
+    Emit32(0x732c'8000 | (shift << 10) | EncodeVj(vj) | EncodeVd(vd));
+  }
+  void VsrliW(SimdRegister vd, SimdRegister vj, uint32_t shift) {
+    CHECK_LT(shift, 32u);
+    Emit32(0x7330'8000 | (shift << 10) | EncodeVj(vj) | EncodeVd(vd));
   }
   void VfminS(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
     Emit32(0x713e'8000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
@@ -423,6 +480,9 @@ class Assembler : public AssemblerBase {
   }
   void VxorV(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
     Emit32(0x7127'0000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
+  }
+  void VnorV(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
+    Emit32(0x7127'8000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));
   }
   void VorV(SimdRegister vd, SimdRegister vj, SimdRegister vk) {
     Emit32(0x7126'8000 | EncodeVk(vk) | EncodeVj(vj) | EncodeVd(vd));

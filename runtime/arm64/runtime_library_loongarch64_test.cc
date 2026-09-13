@@ -14,6 +14,11 @@
  * limitations under the License.
  */
 
+#include <signal.h>
+#include <sys/mman.h>
+#include <sys/ucontext.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -183,11 +188,11 @@ TEST(LoongArch64RuntimeLibraryTest, StaticClosureTrampolinePreservesMixedSpilled
                                      int64_t,
                                      bool,
                                      bool);
-  MixedCallback mixed_callback = AsFuncPtr<MixedCallback>(CreateGuestFunctionWrapper(
-      0x1234,
-      "lppfiiiiiiiiiiiiilzz",
-      AsHostCode(&RunMixedSpillClosure),
-      "mixed_spill_closure_test"));
+  MixedCallback mixed_callback =
+      AsFuncPtr<MixedCallback>(CreateGuestFunctionWrapper(0x1234,
+                                                          "lppfiiiiiiiiiiiiilzz",
+                                                          AsHostCode(&RunMixedSpillClosure),
+                                                          "mixed_spill_closure_test"));
   EXPECT_EQ(mixed_callback(reinterpret_cast<void*>(0x1111),
                            reinterpret_cast<void*>(0x2222),
                            18.0f,
@@ -419,6 +424,142 @@ TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesMoveWideAndAddSubImmediate) {
   EXPECT_EQ(GetInsnAddr(state.cpu), ToGuestAddr(kGuestCode.data() + kGuestCode.size()));
 }
 
+TEST(LoongArch64RuntimeLibraryTest, OptimizedImmediateLoadsPreserveAll64Bits) {
+  InitHostEntries();
+  using Assembler = loongarch64::Assembler;
+  constexpr std::array<uint64_t, 25> kValues = {
+      0,
+      1,
+      2047,
+      2048,
+      4095,
+      4096,
+      4097,
+      0x7fff'ffff,
+      0x8000'0000,
+      0xffff'ffff,
+      0x1'0000'0000,
+      0x0007'ffff'ffff'ffff,
+      0x0008'0000'0000'0000,
+      0x000f'ffff'ffff'ffff,
+      0x0010'0000'0000'0000,
+      0x7fff'ffff'ffff'ffff,
+      0x8000'0000'0000'0000,
+      0xfff8'0000'0000'0000,
+      0xffff'ffff'8000'0000,
+      0xffff'ffff'ffff'f000,
+      0xffff'ffff'ffff'f7ff,
+      0xffff'ffff'ffff'f800,
+      0xffff'ffff'ffff'ffff,
+      0x0123'4567'89ab'cdef,
+      0xfedc'ba98'7654'3210,
+  };
+  uint64_t random = 0x1234'5678'9abc'def0;
+  for (size_t i = 0; i < kValues.size() + 256; ++i) {
+    random ^= random << 13;
+    random ^= random >> 7;
+    random ^= random << 17;
+    const uint64_t value = i < kValues.size() ? kValues[i] : random;
+    MachineCode code;
+    Assembler as(&code);
+    // Poison the destination first: shortened loads must define all 64 bits.
+    as.Li(Assembler::t0, ~value);
+    as.LiOptimized(Assembler::t0, value);
+    as.StD(Assembler::t0, Assembler::s8, offsetof(ThreadState, cpu) + offsetof(CPUState, x[0]));
+    as.Li(Assembler::t0, kEntryExitGeneratedCode);
+    as.Jirl(Assembler::zero, Assembler::t0, 0);
+    as.Finalize();
+    ScopedExecRegion exec(&code);
+    ThreadState state{};
+    SetResidence(state, kOutsideGeneratedCode);
+    berberis_RunGeneratedCode(&state, AsHostCode(exec.GetHostCodeAddr()));
+    EXPECT_EQ(state.cpu.x[0], value) << std::hex << value;
+  }
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteImmediateArithmeticMatchesInterpreterAtBoundaries) {
+  constexpr std::array<uint32_t, 5> kImmediates = {0, 1, 2047, 2048, 4095};
+  constexpr std::array<uint64_t, 6> kInputs = {
+      0, 1, 0x7fff'ffff, 0xffff'ffff, 0x7fff'ffff'ffff'ffff, UINT64_MAX};
+  for (uint32_t sf : {0u, 1u}) {
+    for (uint32_t sub : {0u, 1u}) {
+      for (uint32_t flags : {0u, 1u}) {
+        for (uint32_t shift : {0u, 1u}) {
+          for (uint32_t imm : kImmediates) {
+            for (uint64_t input : kInputs) {
+              for (bool use_sp : {false, true}) {
+                const uint32_t rn = use_sp ? 31 : 1;
+                const uint32_t rd = use_sp ? 31 : 0;
+                const std::array<uint32_t, 1> code = {0x1100'0000u | (sf << 31) | (sub << 30) |
+                                                      (flags << 29) | (shift << 22) | (imm << 10) |
+                                                      (rn << 5) | rd};
+                ThreadState interpreted{};
+                ThreadState translated{};
+                for (ThreadState* state : {&interpreted, &translated}) {
+                  state->cpu.x[0] = 0xfeed'face'dead'beef;
+                  state->cpu.x[1] = input;
+                  state->cpu.sp = input;
+                  state->cpu.flags = 0xa;
+                  SetInsnAddr(state->cpu, ToGuestAddr(code.data()));
+                }
+                InterpretInsn(&interpreted);
+                TranslateAndRun(code, &translated);
+                SCOPED_TRACE(testing::Message() << std::hex << code[0] << " input=" << input);
+                EXPECT_EQ(translated.cpu.x[0], interpreted.cpu.x[0]);
+                EXPECT_EQ(translated.cpu.sp, interpreted.cpu.sp);
+                EXPECT_EQ(translated.cpu.flags, interpreted.cpu.flags);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteSmallImmediateRegionsAvoidFullWidthConstants) {
+  InitHostEntries();
+  for (uint32_t insn : {0x9100'0400u, 0xd100'2000u, 0xd280'0400u}) {
+    const std::array<uint32_t, 1> guest_code = {insn};
+    MachineCode code;
+    LiteTranslateParams params;
+    params.end_pc = ToGuestAddr(guest_code.data() + guest_code.size());
+    params.allow_dispatch = false;
+    auto [success, stop_pc] = TryLiteTranslateRegion(ToGuestAddr(guest_code.data()), &code, params);
+    ASSERT_TRUE(success);
+    EXPECT_EQ(stop_pc, params.end_pc);
+    // At most a load, immediate ALU operation, write-through store and the
+    // unchanged six-instruction PC update and exit.
+    EXPECT_LE(code.install_size(), 9 * sizeof(uint32_t)) << std::hex << insn;
+  }
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteUnsignedMemoryOffsetsMatchInterpreterAtBoundaries) {
+  alignas(16) std::array<uint64_t, 8194> memory{};
+  for (size_t i = 0; i < memory.size(); ++i) {
+    memory[i] = 0x8123'4567'89ab'cdefULL ^ i;
+  }
+  // LDR W0, LDR X0 and LDR Q0. Cover both sides of ADDI.D's signed-12-bit
+  // limit and the largest ARM64 scaled unsigned immediate.
+  for (uint32_t opcode : {0xb940'0020u, 0xf940'0020u, 0x3dc0'0020u}) {
+    for (uint32_t imm : {0u, 127u, 128u, 255u, 256u, 511u, 512u, 4095u}) {
+      const std::array<uint32_t, 1> code = {opcode | (imm << 10)};
+      ThreadState interpreted{};
+      ThreadState translated{};
+      for (ThreadState* state : {&interpreted, &translated}) {
+        state->cpu.x[1] = ToGuestAddr(memory.data());
+        state->cpu.v[0] = MakeUint128(UINT64_MAX, UINT64_MAX);
+        SetInsnAddr(state->cpu, ToGuestAddr(code.data()));
+      }
+      InterpretInsn(&interpreted);
+      TranslateAndRun(code, &translated);
+      SCOPED_TRACE(testing::Message() << std::hex << code[0]);
+      EXPECT_EQ(translated.cpu.x[0], interpreted.cpu.x[0]);
+      EXPECT_EQ(translated.cpu.v[0], interpreted.cpu.v[0]);
+    }
+  }
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteWriteThroughRegisterMappingPreservesIntegerRegions) {
   // Keep x0-x2 hot enough to map.  Mapped writes must remain visible in
   // ThreadState rather than depending on a deferred region-exit flush.
@@ -535,9 +676,10 @@ TEST(LoongArch64RuntimeLibraryTest, LiteRegisterCacheExcludesDestinationOnlyRegi
   ASSERT_TRUE(cached_success);
   ASSERT_EQ(cached_stop_pc, params.end_pc);
 
-  // Cached source loads are replaced one-for-one by moves.  Only the two
-  // source-cache prologue loads may increase code size.
-  EXPECT_EQ(cached_code.install_size(), uncached_code.install_size() + 2 * sizeof(uint32_t));
+  // Direct cached operands remove both source loads in every ADD. Only the
+  // two source-cache prologue loads remain; destination-only x0 stays uncached.
+  EXPECT_EQ(cached_code.install_size() + 2 * kGuestCode.size() * sizeof(uint32_t),
+            uncached_code.install_size() + 2 * sizeof(uint32_t));
 
   ThreadState state{};
   state.cpu.x[1] = 17;
@@ -3990,6 +4132,674 @@ TEST(LoongArch64RuntimeLibraryTest, LiteLoadExclusiveWidthsAndTbiMatchInterprete
   }
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteAllBranchConditionsMatchInterpreter) {
+  for (uint32_t condition = 0; condition < 16; ++condition) {
+    for (uint32_t flags = 0; flags < 16; ++flags) {
+      const std::array<uint32_t, 1> code = {0x5400'0040u | condition};  // b.cond +8
+      ThreadState interpreted{};
+      ThreadState translated{};
+      interpreted.cpu.flags = translated.cpu.flags = flags;
+      SetInsnAddr(interpreted.cpu, ToGuestAddr(code.data()));
+      InterpretInsn(&interpreted);
+      TranslateAndRun(code, &translated);
+      SCOPED_TRACE(testing::Message() << "cond=" << condition << " flags=" << flags);
+      EXPECT_EQ(GetInsnAddr(translated.cpu), GetInsnAddr(interpreted.cpu));
+      EXPECT_EQ(translated.cpu.flags, interpreted.cpu.flags);
+    }
+  }
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteAllSelectConditionsMatchInterpreter) {
+  for (uint32_t sf : {0u, 1u}) {
+    for (uint32_t variant = 0; variant < 4; ++variant) {
+      for (uint32_t condition = 0; condition < 16; ++condition) {
+        for (uint32_t flags = 0; flags < 16; ++flags) {
+          // CSEL / CSINC / CSINV / CSNEG W/X0,W/X1,W/X2,cond.
+          const std::array<uint32_t, 1> code = {0x1a82'0020u | (sf << 31) | ((variant >> 1) << 30) |
+                                                ((variant & 1) << 10) | (condition << 12)};
+          ThreadState interpreted{};
+          ThreadState translated{};
+          for (ThreadState* state : {&interpreted, &translated}) {
+            state->cpu.x[1] = 0xfedc'ba98'7654'3210ULL;
+            state->cpu.x[2] = 0x8000'0000'ffff'ffffULL;
+            state->cpu.flags = flags;
+            SetInsnAddr(state->cpu, ToGuestAddr(code.data()));
+          }
+          InterpretInsn(&interpreted);
+          TranslateAndRun(code, &translated);
+          SCOPED_TRACE(testing::Message() << std::hex << code[0] << " flags=" << flags);
+          EXPECT_EQ(translated.cpu.x[0], interpreted.cpu.x[0]);
+          EXPECT_EQ(translated.cpu.flags, interpreted.cpu.flags);
+        }
+      }
+    }
+  }
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteShiftedOperandsPreserveWidthAndFlags) {
+  // ADD/ADDS/SUB/SUBS and all logical shifted-register variants.
+  constexpr std::array<uint32_t, 12> kOpcodes = {0x0b00'0000,
+                                                 0x2b00'0000,
+                                                 0x4b00'0000,
+                                                 0x6b00'0000,
+                                                 0x0a00'0000,
+                                                 0x2a00'0000,
+                                                 0x4a00'0000,
+                                                 0x6a00'0000,
+                                                 0x0a20'0000,
+                                                 0x2a20'0000,
+                                                 0x4a20'0000,
+                                                 0x6a20'0000};
+  constexpr std::array<uint64_t, 4> kValues = {
+      0, UINT64_MAX, 0x8000'0000'8000'0000ULL, 0x0123'4567'ffff'ffffULL};
+  for (uint32_t opcode : kOpcodes) {
+    for (uint32_t sf : {0u, 1u}) {
+      for (uint32_t shift = 0; shift < 4; ++shift) {
+        if (shift == 3 && (opcode & 0x0100'0000u)) {
+          continue;  // Arithmetic shifted-register forms do not allow ROR.
+        }
+        for (uint32_t amount : {0u, 1u, 31u, 63u}) {
+          if (sf == 0 && amount == 63) {
+            continue;
+          }
+          for (uint64_t value : kValues) {
+            const std::array<uint32_t, 1> code = {opcode | (sf << 31) | (shift << 22) | (2u << 16) |
+                                                  (amount << 10) | (1u << 5)};
+            ThreadState interpreted{};
+            ThreadState translated{};
+            for (ThreadState* state : {&interpreted, &translated}) {
+              state->cpu.x[1] = ~value;
+              state->cpu.x[2] = value;
+              state->cpu.flags = 0xa;
+              SetInsnAddr(state->cpu, ToGuestAddr(code.data()));
+            }
+            InterpretInsn(&interpreted);
+            TranslateAndRun(code, &translated);
+            SCOPED_TRACE(testing::Message() << std::hex << code[0] << " value=" << value);
+            EXPECT_EQ(translated.cpu.x[0], interpreted.cpu.x[0]);
+            EXPECT_EQ(translated.cpu.flags, interpreted.cpu.flags);
+          }
+        }
+      }
+    }
+  }
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteDirectCachedArithmeticSourcesPreserveAliasing) {
+  InitHostEntries();
+  for (bool mapped : {false, true}) {
+    for (uint32_t sub : {0u, 1u}) {
+      for (uint32_t shift : {0u, 1u, 2u}) {
+        for (uint32_t rn : {0u, 1u, 2u, 31u}) {
+          for (uint32_t rm : {0u, 1u, 2u, 31u}) {
+            for (uint32_t rd : {0u, 1u, 2u, 31u}) {
+              std::array<uint32_t, 8> code;
+              code.fill(0x8b00'0000u | (sub << 30) | (shift << 22) | (rm << 16) | (rn << 5) | rd);
+              GuestAddr start_pc = ToGuestAddr(code.data());
+              ThreadState interpreted{};
+              ThreadState translated{};
+              for (ThreadState* state : {&interpreted, &translated}) {
+                for (size_t i = 0; i < 31; ++i) {
+                  state->cpu.x[i] = 0xfedc'ba98'7654'3210ULL + i * 0x1111'1111ULL;
+                }
+                state->cpu.sp = 0x1234'5678;
+                state->cpu.flags = 0xb;
+                SetInsnAddr(state->cpu, start_pc);
+              }
+              for (size_t i = 0; i < code.size(); ++i) {
+                InterpretInsn(&interpreted);
+              }
+              MachineCode machine_code;
+              LiteTranslateParams params;
+              params.end_pc = start_pc + sizeof(code);
+              params.allow_dispatch = false;
+              params.enable_reg_mapping = mapped;
+              auto [success, stop_pc] = TryLiteTranslateRegion(start_pc, &machine_code, params);
+              ASSERT_TRUE(success);
+              ASSERT_EQ(stop_pc, params.end_pc);
+              ScopedExecRegion exec(&machine_code);
+              SetResidence(translated, kOutsideGeneratedCode);
+              berberis_RunGeneratedCode(&translated, AsHostCode(exec.GetHostCodeAddr()));
+              SCOPED_TRACE(testing::Message() << std::hex << code[0] << " mapped=" << mapped);
+              for (size_t i = 0; i < 31; ++i) {
+                EXPECT_EQ(translated.cpu.x[i], interpreted.cpu.x[i]) << "reg=" << i;
+              }
+              EXPECT_EQ(translated.cpu.sp, interpreted.cpu.sp);
+              EXPECT_EQ(translated.cpu.flags, interpreted.cpu.flags);
+              EXPECT_EQ(GetInsnAddr(translated.cpu), GetInsnAddr(interpreted.cpu));
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteCachedSpPreservesArithmeticAndZeroRegister) {
+  constexpr std::array<uint32_t, 10> kCode = {
+      0x9100'83ff,  // add sp,sp,#32
+      0x9100'23e0,  // add x0,sp,#8
+      0xd100'43ff,  // sub sp,sp,#16
+      0x1100'13ff,  // add wsp,wsp,#4 (discard high bits)
+      0x9100'03e1,  // mov x1,sp
+      0xb27c'003f,  // orr sp,x1,#0x10
+      0x8b3f'63ff,  // add sp,sp,xzr (extended register)
+      0xaa1f'03e2,  // mov x2,xzr
+      0x8b1f'03e3,  // add x3,xzr,xzr
+      0x9100'03e5,  // mov x5,sp
+  };
+  InitHostEntries();
+  for (bool mapped : {false, true}) {
+    for (uint64_t sp : {0ULL, 0xffff'fff0ULL, 0xab00'1234'ffff'fff0ULL}) {
+      // Every prefix also checks architectural state at a region exit.
+      for (size_t count = 1; count <= kCode.size(); ++count) {
+        GuestAddr start_pc = ToGuestAddr(kCode.data());
+        ThreadState interpreted{};
+        ThreadState translated{};
+        for (ThreadState* state : {&interpreted, &translated}) {
+          state->cpu.sp = sp;
+          state->cpu.flags = 0xb;
+          SetInsnAddr(state->cpu, start_pc);
+        }
+        for (size_t i = 0; i < count; ++i) {
+          InterpretInsn(&interpreted);
+        }
+        LiteTranslateParams params;
+        params.end_pc = start_pc + count * sizeof(uint32_t);
+        params.enable_reg_mapping = mapped;
+        params.allow_dispatch = false;
+        MachineCode code;
+        auto [success, stop_pc] = TryLiteTranslateRegion(start_pc, &code, params);
+        ASSERT_TRUE(success);
+        ASSERT_EQ(stop_pc, params.end_pc);
+        ScopedExecRegion exec(&code);
+        SetResidence(translated, kOutsideGeneratedCode);
+        berberis_RunGeneratedCode(&translated, AsHostCode(exec.GetHostCodeAddr()));
+        SCOPED_TRACE(testing::Message() << count << " mapped=" << mapped << " sp=" << sp);
+        for (size_t i = 0; i < 31; ++i) {
+          EXPECT_EQ(translated.cpu.x[i], interpreted.cpu.x[i]) << "reg=" << i;
+        }
+        EXPECT_EQ(translated.cpu.sp, interpreted.cpu.sp);
+        EXPECT_EQ(translated.cpu.flags, interpreted.cpu.flags);
+        EXPECT_EQ(GetInsnAddr(translated.cpu), GetInsnAddr(interpreted.cpu));
+      }
+    }
+  }
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteCachedSpPreservesTaggedMemoryWriteback) {
+  constexpr std::array<uint32_t, 10> kCode = {
+      0xa9bf'0be1,  // stp x1,x2,[sp,#-16]!
+      0xf940'03e0,  // ldr x0,[sp]
+      0xa8c1'13e3,  // ldp x3,x4,[sp],#16
+      0xf900'0bff,  // str xzr,[sp,#16]
+      0xf940'0bff,  // ldr xzr,[sp,#16]
+      0xf81f'0fe1,  // str x1,[sp,#-16]!
+      0xf841'07e4,  // ldr x4,[sp],#16
+      0x3c9f'0fe0,  // str q0,[sp,#-16]!
+      0x3cc1'07e1,  // ldr q1,[sp],#16
+      0x9100'03e5,  // mov x5,sp
+  };
+  InitHostEntries();
+  for (bool mapped : {false, true}) {
+    for (uint64_t tag : {0ULL, 0xab00'0000'0000'0000ULL}) {
+      for (size_t count = 1; count <= kCode.size(); ++count) {
+        alignas(16) std::array<uint64_t, 16> memory;
+        memory.fill(0xa5a5'a5a5'a5a5'a5a5ULL);
+        const auto initial_memory = memory;
+        GuestAddr start_pc = ToGuestAddr(kCode.data());
+        ThreadState interpreted{};
+        ThreadState translated{};
+        for (ThreadState* state : {&interpreted, &translated}) {
+          state->cpu.sp = ToGuestAddr(memory.data() + 8) | tag;
+          state->cpu.x[1] = 0x0123'4567'89ab'cdef;
+          state->cpu.x[2] = 0xfedc'ba98'7654'3210;
+          state->cpu.v[0] = static_cast<__uint128_t>(state->cpu.x[1]) << 64 | state->cpu.x[2];
+          state->cpu.flags = 0xb;
+          SetInsnAddr(state->cpu, start_pc);
+        }
+        for (size_t i = 0; i < count; ++i) {
+          InterpretInsn(&interpreted);
+        }
+        const auto expected_memory = memory;
+        memory = initial_memory;
+        LiteTranslateParams params;
+        params.end_pc = start_pc + count * sizeof(uint32_t);
+        params.enable_reg_mapping = mapped;
+        params.enable_guest_memory = true;
+        params.allow_dispatch = false;
+        MachineCode code;
+        auto [success, stop_pc] = TryLiteTranslateRegion(start_pc, &code, params);
+        ASSERT_TRUE(success);
+        ASSERT_EQ(stop_pc, params.end_pc);
+        ScopedExecRegion exec(&code);
+        EXPECT_FALSE(exec.recovery_map().empty());
+        SetResidence(translated, kOutsideGeneratedCode);
+        berberis_RunGeneratedCode(&translated, AsHostCode(exec.GetHostCodeAddr()));
+        SCOPED_TRACE(testing::Message() << count << " mapped=" << mapped << " tag=" << tag);
+        EXPECT_EQ(memory, expected_memory);
+        for (size_t i = 0; i < 31; ++i) {
+          EXPECT_EQ(translated.cpu.x[i], interpreted.cpu.x[i]) << "reg=" << i;
+        }
+        EXPECT_EQ(translated.cpu.v[0], interpreted.cpu.v[0]);
+        EXPECT_EQ(translated.cpu.v[1], interpreted.cpu.v[1]);
+        EXPECT_EQ(translated.cpu.sp, interpreted.cpu.sp);
+        EXPECT_EQ(translated.cpu.flags, interpreted.cpu.flags);
+        EXPECT_EQ(GetInsnAddr(translated.cpu), GetInsnAddr(interpreted.cpu));
+      }
+    }
+  }
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteCachedSpWritesThroughAtSignalPollAndReloadsAtEntry) {
+  constexpr std::array<uint32_t, 4> kCode = {
+      0xd100'43ff,  // sub sp,sp,#16
+      0xd100'0400,  // sub x0,x0,#1
+      0xb5ff'ffc0,  // cbnz x0,-8
+      0x9100'03e1,  // mov x1,sp
+  };
+  InitHostEntries();
+  GuestAddr start_pc = ToGuestAddr(kCode.data());
+  LiteTranslateParams params;
+  params.end_pc = start_pc + sizeof(kCode);
+  params.enable_reg_mapping = true;
+  params.allow_dispatch = false;
+  MachineCode code;
+  auto [success, stop_pc] = TryLiteTranslateRegion(start_pc, &code, params);
+  ASSERT_TRUE(success);
+  ASSERT_EQ(stop_pc, params.end_pc);
+  ScopedExecRegion exec(&code);
+  ThreadState state{};
+  for (bool pending : {true, false}) {
+    state.cpu.sp = pending ? 0x1000 : 0x2000;
+    state.cpu.x[0] = 3;
+    state.pending_signals_status.store(pending ? kPendingSignalsPresent : 0);
+    SetInsnAddr(state.cpu, start_pc);
+    SetResidence(state, kOutsideGeneratedCode);
+    berberis_RunGeneratedCode(&state, AsHostCode(exec.GetHostCodeAddr()));
+    EXPECT_EQ(state.cpu.sp, pending ? 0xff0u : 0x1fd0u);
+    EXPECT_EQ(state.cpu.x[0], pending ? 2u : 0u);
+    EXPECT_EQ(GetInsnAddr(state.cpu), pending ? start_pc : params.end_pc);
+    if (!pending) {
+      EXPECT_EQ(state.cpu.x[1], state.cpu.sp);
+    }
+  }
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteDirectCachedLogicalSourcesPreserveAliasing) {
+  InitHostEntries();
+  for (bool mapped : {false, true}) {
+    for (uint32_t sf : {0u, 1u}) {
+      for (uint32_t opc = 0; opc < 4; ++opc) {
+        for (uint32_t shift = 0; shift < 4; ++shift) {
+          for (uint32_t rn : {0u, 1u, 2u, 31u}) {
+            for (uint32_t rm : {0u, 1u, 2u, 31u}) {
+              for (uint32_t rd : {0u, 1u, 2u, 31u}) {
+                std::array<uint32_t, 8> code;
+                code.fill(0x0a00'0000u | (sf << 31) | (opc << 29) | (shift << 22) | (rm << 16) |
+                          (rn << 5) | rd);
+                GuestAddr start_pc = ToGuestAddr(code.data());
+                ThreadState interpreted{};
+                ThreadState translated{};
+                for (ThreadState* state : {&interpreted, &translated}) {
+                  for (size_t i = 0; i < 31; ++i) {
+                    state->cpu.x[i] = 0xfedc'ba98'7654'3210ULL + i * 0x1111'1111ULL;
+                  }
+                  state->cpu.sp = 0xab00'1234'5678'9000;
+                  state->cpu.flags = 0xb;
+                  SetInsnAddr(state->cpu, start_pc);
+                }
+                for (size_t i = 0; i < code.size(); ++i) {
+                  InterpretInsn(&interpreted);
+                }
+                LiteTranslateParams params;
+                params.end_pc = start_pc + sizeof(code);
+                params.enable_reg_mapping = mapped;
+                params.allow_dispatch = false;
+                MachineCode machine_code;
+                auto [success, stop_pc] = TryLiteTranslateRegion(start_pc, &machine_code, params);
+                ASSERT_TRUE(success);
+                ASSERT_EQ(stop_pc, params.end_pc);
+                ScopedExecRegion exec(&machine_code);
+                SetResidence(translated, kOutsideGeneratedCode);
+                berberis_RunGeneratedCode(&translated, AsHostCode(exec.GetHostCodeAddr()));
+                SCOPED_TRACE(testing::Message() << std::hex << code[0] << " mapped=" << mapped);
+                for (size_t i = 0; i < 31; ++i) {
+                  EXPECT_EQ(translated.cpu.x[i], interpreted.cpu.x[i]) << "reg=" << i;
+                }
+                EXPECT_EQ(translated.cpu.sp, interpreted.cpu.sp);
+                EXPECT_EQ(translated.cpu.flags, interpreted.cpu.flags);
+                EXPECT_EQ(GetInsnAddr(translated.cpu), GetInsnAddr(interpreted.cpu));
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+TEST(LoongArch64RuntimeLibraryTest, HostBitExtractionAndWordExtensionMatchIntegerReference) {
+  using Assembler = loongarch64::Assembler;
+  InitHostEntries();
+  for (uint32_t msb = 0; msb < 64; ++msb) {
+    for (uint32_t lsb = 0; lsb <= msb; ++lsb) {
+      MachineCode code;
+      Assembler as(&code);
+      as.LdD(Assembler::t0, Assembler::s8, offsetof(ThreadState, cpu) + offsetof(CPUState, x[0]));
+      as.BstrpickD(Assembler::t1, Assembler::t0, msb, lsb);
+      as.StD(Assembler::t1, Assembler::s8, offsetof(ThreadState, cpu) + offsetof(CPUState, x[1]));
+      as.AddiW(Assembler::t0, Assembler::t0, 0);
+      as.StD(Assembler::t0, Assembler::s8, offsetof(ThreadState, cpu) + offsetof(CPUState, x[2]));
+      as.Li(Assembler::t0, kEntryExitGeneratedCode);
+      as.Jirl(Assembler::zero, Assembler::t0, 0);
+      as.Finalize();
+      ScopedExecRegion exec(&code);
+      for (uint64_t value : {0ULL,
+                             ~0ULL,
+                             0x0123'4567'89ab'cdefULL,
+                             0xfedc'ba98'7654'3210ULL,
+                             0xab00'0000'8000'0000ULL,
+                             0x8000'0000'7fff'ffffULL}) {
+        ThreadState state{};
+        state.cpu.x[0] = value;
+        SetResidence(state, kOutsideGeneratedCode);
+        berberis_RunGeneratedCode(&state, AsHostCode(exec.GetHostCodeAddr()));
+        uint32_t width = msb - lsb + 1;
+        uint64_t mask = width == 64 ? UINT64_MAX : (uint64_t{1} << width) - 1;
+        EXPECT_EQ(state.cpu.x[1], (value >> lsb) & mask) << msb << ':' << lsb;
+        uint64_t word = value & UINT32_MAX;
+        EXPECT_EQ(state.cpu.x[2], (word & 0x8000'0000) ? word | 0xffff'ffff'0000'0000ULL : word);
+      }
+    }
+  }
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteDemandCacheSkipsWriteFirstLoadsAndHandlesReentry) {
+  constexpr std::array<uint32_t, 7> kCode = {
+      0xd280'0080,  // mov x0,#4
+      0xd280'0061,  // mov x1,#3
+      0x9100'0421,  // add x1,x1,#1
+      0xd100'0400,  // sub x0,x0,#1
+      0xb5ff'ffc0,  // cbnz x0,-8
+      0x8b01'0022,  // add x2,x1,x1
+      0x8b00'0003,  // add x3,x0,x0
+  };
+  InitHostEntries();
+  GuestAddr start_pc = ToGuestAddr(kCode.data());
+  LiteTranslateParams params;
+  params.end_pc = start_pc + sizeof(kCode);
+  params.allow_dispatch = false;
+  MachineCode code;
+  auto [success, stop_pc] = TryLiteTranslateRegion(start_pc, &code, params);
+  ASSERT_TRUE(success);
+  ASSERT_EQ(stop_pc, params.end_pc);
+  // Both cached values are written before any read. There must be no load
+  // from ThreadState into s0-s6 anywhere, including the loop target.
+  for (uint32_t offset = 0; offset < code.install_size(); offset += 4) {
+    uint32_t insn = *code.AddrAs<const uint32_t>(offset);
+    bool cache_load = (insn & 0xffc0'0000) == 0x28c0'0000 && ((insn >> 5) & 31) == 31 &&
+                      (insn & 31) >= 23 && (insn & 31) <= 29;
+    EXPECT_FALSE(cache_load) << offset;
+  }
+  ScopedExecRegion exec(&code);
+  ThreadState state{};
+  for (bool pending : {true, false}) {
+    state.cpu.x[0] = UINT64_MAX;
+    state.cpu.x[1] = 0xdead'beef;
+    state.pending_signals_status.store(pending ? kPendingSignalsPresent : 0);
+    SetInsnAddr(state.cpu, start_pc);
+    SetResidence(state, kOutsideGeneratedCode);
+    berberis_RunGeneratedCode(&state, AsHostCode(exec.GetHostCodeAddr()));
+    EXPECT_EQ(state.cpu.x[0], pending ? 3u : 0u);
+    EXPECT_EQ(state.cpu.x[1], pending ? 4u : 7u);
+    EXPECT_EQ(GetInsnAddr(state.cpu), pending ? start_pc + 8 : params.end_pc);
+    if (!pending) {
+      EXPECT_EQ(state.cpu.x[2], 14u);
+      EXPECT_EQ(state.cpu.x[3], 0u);
+    }
+  }
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteDemandCacheHandlesEarlyExitAndReadFirstBackedge) {
+  constexpr std::array<uint32_t, 5> kCode = {
+      0xb500'00b4,  // cbnz x20,end
+      0x9100'0421,  // add x1,x1,#1
+      0xd100'0400,  // sub x0,x0,#1
+      0xb5ff'ffc0,  // cbnz x0,-8
+      0x8b01'0022,  // add x2,x1,x1
+  };
+  InitHostEntries();
+  GuestAddr start_pc = ToGuestAddr(kCode.data());
+  LiteTranslateParams params;
+  params.end_pc = start_pc + sizeof(kCode);
+  params.allow_dispatch = false;
+  MachineCode code;
+  auto [success, stop_pc] = TryLiteTranslateRegion(start_pc, &code, params);
+  ASSERT_TRUE(success);
+  ASSERT_EQ(stop_pc, params.end_pc);
+  int32_t last_cache_load = -1;
+  for (uint32_t offset = 0; offset < code.install_size(); offset += 4) {
+    uint32_t insn = *code.AddrAs<const uint32_t>(offset);
+    if ((insn & 0xffc0'0000) == 0x28c0'0000 && ((insn >> 5) & 31) == 31 && (insn & 31) >= 23 &&
+        (insn & 31) <= 29) {
+      last_cache_load = offset;
+    }
+  }
+  ASSERT_GE(last_cache_load, 0);
+  size_t backedges = 0;
+  for (uint32_t offset = 0; offset < code.install_size(); offset += 4) {
+    uint32_t insn = *code.AddrAs<const uint32_t>(offset);
+    if ((insn & 0xfc00'0000) != 0x5000'0000) {
+      continue;
+    }
+    uint32_t imm26 = ((insn & 0x3ff) << 16) | ((insn >> 10) & 0xffff);
+    int64_t displacement = (static_cast<int64_t>(imm26 ^ (1u << 25)) - (1u << 25)) * 4;
+    if (displacement < 0) {
+      ++backedges;
+      EXPECT_GT(static_cast<int64_t>(offset) + displacement, last_cache_load);
+    }
+  }
+  EXPECT_GT(backedges, 0u);
+  ScopedExecRegion exec(&code);
+  for (bool taken : {true, false}) {
+    for (bool pending : {true, false}) {
+      ThreadState state{};
+      state.cpu.x[0] = 3;
+      state.cpu.x[1] = 100;
+      state.cpu.x[2] = 0x1234;
+      state.cpu.x[20] = taken;
+      state.pending_signals_status.store(pending ? kPendingSignalsPresent : 0);
+      SetInsnAddr(state.cpu, start_pc);
+      SetResidence(state, kOutsideGeneratedCode);
+      berberis_RunGeneratedCode(&state, AsHostCode(exec.GetHostCodeAddr()));
+      EXPECT_EQ(state.cpu.x[0], taken ? 3u : (pending ? 2u : 0u));
+      EXPECT_EQ(state.cpu.x[1], taken ? 100u : (pending ? 101u : 103u));
+      EXPECT_EQ(state.cpu.x[2], taken || pending ? 0x1234u : 206u);
+      EXPECT_EQ(GetInsnAddr(state.cpu), !taken && pending ? start_pc + 4 : params.end_pc);
+    }
+  }
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteDemandCacheHoistsAcrossNestedLoops) {
+  constexpr std::array<uint32_t, 9> kCode = {
+      0xd280'0040,  // mov x0,#2
+      0xd280'0061,  // outer: mov x1,#3
+      0xb500'00f4,  // inner: cbnz x20,end
+      0x9100'0442,  // add x2,x2,#1
+      0xd100'0421,  // sub x1,x1,#1
+      0xb5ff'ffa1,  // cbnz x1,inner
+      0xd100'0400,  // sub x0,x0,#1
+      0xb5ff'ff40,  // cbnz x0,outer
+      0x8b02'0043,  // add x3,x2,x2
+  };
+  InitHostEntries();
+  GuestAddr start_pc = ToGuestAddr(kCode.data());
+  LiteTranslateParams params;
+  params.end_pc = start_pc + sizeof(kCode);
+  params.allow_dispatch = false;
+  MachineCode code;
+  auto [success, stop_pc] = TryLiteTranslateRegion(start_pc, &code, params);
+  ASSERT_TRUE(success);
+  ASSERT_EQ(stop_pc, params.end_pc);
+  int32_t last_cache_load = -1;
+  size_t loads = 0;
+  for (uint32_t offset = 0; offset < code.install_size(); offset += 4) {
+    uint32_t insn = *code.AddrAs<const uint32_t>(offset);
+    if ((insn & 0xffc0'0000) == 0x28c0'0000 && ((insn >> 5) & 31) == 31 && (insn & 31) >= 23 &&
+        (insn & 31) <= 29) {
+      last_cache_load = offset;
+      ++loads;
+    }
+  }
+  ASSERT_EQ(loads, 1u);  // Only x2 needs its entry value; x0/x1 are write-first.
+  size_t backedges = 0;
+  for (uint32_t offset = 0; offset < code.install_size(); offset += 4) {
+    uint32_t insn = *code.AddrAs<const uint32_t>(offset);
+    if ((insn & 0xfc00'0000) != 0x5000'0000) {
+      continue;
+    }
+    uint32_t imm26 = ((insn & 0x3ff) << 16) | ((insn >> 10) & 0xffff);
+    int64_t displacement = (static_cast<int64_t>(imm26 ^ (1u << 25)) - (1u << 25)) * 4;
+    if (displacement < 0) {
+      ++backedges;
+      EXPECT_GT(static_cast<int64_t>(offset) + displacement, last_cache_load);
+    }
+  }
+  EXPECT_EQ(backedges, 2u);
+  ScopedExecRegion exec(&code);
+  for (bool pending : {false, true}) {
+    for (bool taken : {false, true}) {
+      ThreadState state{};
+      state.cpu.x[2] = 10;
+      state.cpu.x[20] = taken;
+      state.pending_signals_status.store(pending ? kPendingSignalsPresent : 0);
+      SetInsnAddr(state.cpu, start_pc);
+      SetResidence(state, kOutsideGeneratedCode);
+      berberis_RunGeneratedCode(&state, AsHostCode(exec.GetHostCodeAddr()));
+      EXPECT_EQ(state.cpu.x[2], taken ? 10u : (pending ? 11u : 16u));
+      EXPECT_EQ(state.cpu.x[0], taken || pending ? 2u : 0u);
+      EXPECT_EQ(GetInsnAddr(state.cpu), !taken && pending ? start_pc + 8 : params.end_pc);
+      if (!taken && !pending) {
+        EXPECT_EQ(state.cpu.x[3], 32u);
+      }
+    }
+  }
+}
+
+volatile sig_atomic_t g_demand_fault_seen;
+uintptr_t g_demand_fault_pc;
+uintptr_t g_demand_recovery_pc;
+
+void RecoverDemandCacheTestFault(int signo, siginfo_t*, void* context) {
+  auto* uc = static_cast<ucontext_t*>(context);
+  if (uc->uc_mcontext.sc_pc != g_demand_fault_pc) {
+    _exit(128 + signo);
+  }
+  g_demand_fault_seen = 1;
+  uc->uc_mcontext.sc_pc = g_demand_recovery_pc;
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteDemandCachePreservesStateAtMemoryFault) {
+  constexpr std::array<uint32_t, 5> kCode = {
+      0xd100'43ff,  // sub sp,sp,#16
+      0xf841'07e1,  // ldr x1,[sp],#16: faults before writeback
+      0x9100'03e2,  // mov x2,sp
+      0x9100'03e2,  // mov x2,sp
+      0x8b01'0023,  // add x3,x1,x1
+  };
+  InitHostEntries();
+  GuestAddr start_pc = ToGuestAddr(kCode.data());
+  LiteTranslateParams params;
+  params.end_pc = start_pc + sizeof(kCode);
+  params.allow_dispatch = false;
+  MachineCode code;
+  auto [success, stop_pc] = TryLiteTranslateRegion(start_pc, &code, params);
+  ASSERT_TRUE(success);
+  ASSERT_EQ(stop_pc, params.end_pc);
+  ScopedExecRegion exec(&code);
+  ASSERT_EQ(exec.recovery_map().size(), 1u);
+  auto [fault, recovery] = *exec.recovery_map().begin();
+  g_demand_fault_pc = fault;
+  g_demand_recovery_pc = recovery;
+  g_demand_fault_seen = 0;
+  void* guard = mmap(nullptr, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  ASSERT_NE(guard, MAP_FAILED);
+  ThreadState state{};
+  const GuestAddr tagged_guard = ToGuestAddr(guard) | 0xab00'0000'0000'0000ULL;
+  state.cpu.sp = tagged_guard + 16;
+  state.cpu.x[1] = 0x1234;
+  state.cpu.x[2] = 0x5678;
+  SetInsnAddr(state.cpu, start_pc);
+  SetResidence(state, kOutsideGeneratedCode);
+  struct sigaction action{}, previous{};
+  action.sa_sigaction = RecoverDemandCacheTestFault;
+  action.sa_flags = SA_SIGINFO;
+  sigemptyset(&action.sa_mask);
+  ASSERT_EQ(sigaction(SIGSEGV, &action, &previous), 0);
+  berberis_RunGeneratedCode(&state, AsHostCode(exec.GetHostCodeAddr()));
+  int restore_result = sigaction(SIGSEGV, &previous, nullptr);
+  int unmap_result = munmap(guard, 4096);
+  EXPECT_EQ(restore_result, 0);
+  EXPECT_EQ(unmap_result, 0);
+  EXPECT_EQ(g_demand_fault_seen, 1);
+  EXPECT_EQ(state.cpu.sp, tagged_guard);
+  EXPECT_EQ(state.cpu.x[1], 0x1234u);
+  EXPECT_EQ(state.cpu.x[2], 0x5678u);
+  EXPECT_EQ(GetInsnAddr(state.cpu), start_pc + 4);
+  EXPECT_EQ(GetResidence(state), kOutsideGeneratedCode);
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteDirectCachedWordArithmeticSourcesPreserveAliasing) {
+  InitHostEntries();
+  for (bool mapped : {false, true}) {
+    for (uint32_t sub : {0u, 1u}) {
+      for (uint32_t shift : {0u, 1u, 2u}) {
+        for (uint32_t rn : {0u, 1u, 2u, 31u}) {
+          for (uint32_t rm : {0u, 1u, 2u, 31u}) {
+            for (uint32_t rd : {0u, 1u, 2u, 31u}) {
+              std::array<uint32_t, 8> code;
+              code.fill(0x0b00'0000u | (sub << 30) | (shift << 22) | (rm << 16) | (rn << 5) | rd);
+              GuestAddr start_pc = ToGuestAddr(code.data());
+              ThreadState interpreted{};
+              ThreadState translated{};
+              for (ThreadState* state : {&interpreted, &translated}) {
+                for (size_t i = 0; i < 31; ++i) {
+                  state->cpu.x[i] = 0xfedc'ba98'7654'3210ULL + i * 0x1111'1111ULL;
+                }
+                state->cpu.sp = 0x1234'5678;
+                state->cpu.flags = 0xb;
+                SetInsnAddr(state->cpu, start_pc);
+              }
+              for (size_t i = 0; i < code.size(); ++i) {
+                InterpretInsn(&interpreted);
+              }
+              MachineCode machine_code;
+              LiteTranslateParams params;
+              params.end_pc = start_pc + sizeof(code);
+              params.allow_dispatch = false;
+              params.enable_reg_mapping = mapped;
+              auto [success, stop_pc] = TryLiteTranslateRegion(start_pc, &machine_code, params);
+              ASSERT_TRUE(success);
+              ASSERT_EQ(stop_pc, params.end_pc);
+              ScopedExecRegion exec(&machine_code);
+              SetResidence(translated, kOutsideGeneratedCode);
+              berberis_RunGeneratedCode(&translated, AsHostCode(exec.GetHostCodeAddr()));
+              SCOPED_TRACE(testing::Message() << std::hex << code[0] << " mapped=" << mapped);
+              for (size_t i = 0; i < 31; ++i) {
+                EXPECT_EQ(translated.cpu.x[i], interpreted.cpu.x[i]) << "reg=" << i;
+              }
+              EXPECT_EQ(translated.cpu.sp, interpreted.cpu.sp);
+              EXPECT_EQ(translated.cpu.flags, interpreted.cpu.flags);
+              EXPECT_EQ(GetInsnAddr(translated.cpu), GetInsnAddr(interpreted.cpu));
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteTranslatesCmpAndConditionalBranch) {
   // cmp x0, #5; b.eq +8
   constexpr std::array<uint32_t, 4> kEqCode = {0xf100'141f, 0x5400'0040, 0xd280'0021, 0xd280'0041};
@@ -4253,6 +5063,312 @@ TEST(LoongArch64RuntimeLibraryTest, LiteMovSFromElementMatchesInterpreter) {
     const uint32_t rd = insn & 31;
     SCOPED_TRACE(testing::Message() << "insn=" << std::hex << insn);
     EXPECT_EQ(translated.cpu.v[rd], interpreted.cpu.v[rd]);
+  }
+}
+
+// All new SIMD paths normalize the full destination before StoreV. Exercise
+// mapped and unmapped execution with the same reference and guest code.
+template <size_t N>
+void RunSimdFallbackCode(const std::array<uint32_t, N>& guest, ThreadState* state, bool mapping) {
+  InitHostEntries();
+  LiteTranslateParams params;
+  GuestAddr start = ToGuestAddr(guest.data());
+  params.end_pc = start + sizeof(guest);
+  params.allow_dispatch = false;
+  params.enable_reg_mapping = mapping;
+  MachineCode code;
+  auto [success, stop] = TryLiteTranslateRegion(start, &code, params);
+  ASSERT_TRUE(success);
+  ASSERT_EQ(stop, params.end_pc);
+  ScopedExecRegion exec(&code);
+  SetInsnAddr(state->cpu, start);
+  SetResidence(*state, kOutsideGeneratedCode);
+  berberis_RunGeneratedCode(state, AsHostCode(exec.GetHostCodeAddr()));
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteVectorShift32AllImmediatesAndAliases) {
+  constexpr std::array<uint32_t, 6> kInputs = {
+      0, 1, 0x8000'0000, 0xffff'ffff, 0x8123'4567, 0x5555'aaaa};
+  for (bool right : {false, true}) {
+    for (uint32_t q : {0u, 1u}) {
+      for (uint32_t shift = right ? 1 : 0; shift <= (right ? 32u : 31u); ++shift) {
+        for (uint32_t rd : {0u, 1u, 31u}) {
+          uint32_t immediate = right ? 64 - shift : 32 + shift;
+          const std::array<uint32_t, 1> guest = {(right ? 0x2f00'0400u : 0x0f00'5400u) | (q << 30) |
+                                                 (immediate << 16) | (1u << 5) | rd};
+          for (uint32_t input : kInputs) {
+            ThreadState initial{};
+            initial.cpu.v[1] = MakeUint32x4(input, ~input, 0x7f80'0001, 0xffff'ffff);
+            initial.cpu.flags = 0xb;
+            uint32_t lanes[4];
+            memcpy(lanes, &initial.cpu.v[1], sizeof(lanes));
+            __uint128_t expected = 0;
+            for (uint32_t i = 0; i < (q ? 4u : 2u); ++i) {
+              uint32_t value = right ? (shift == 32 ? 0 : lanes[i] >> shift) : lanes[i] << shift;
+              expected |= static_cast<__uint128_t>(value) << (32 * i);
+            }
+            ThreadState interpreted{};
+            interpreted.cpu = initial.cpu;
+            SetInsnAddr(interpreted.cpu, ToGuestAddr(guest.data()));
+            InterpretInsn(&interpreted);
+            EXPECT_EQ(interpreted.cpu.v[rd], expected);
+            for (bool mapping : {false, true}) {
+              ThreadState state{};
+              state.cpu = initial.cpu;
+              RunSimdFallbackCode(guest, &state, mapping);
+              SCOPED_TRACE(testing::Message() << std::hex << guest[0] << " input=" << input);
+              for (uint32_t reg = 0; reg < 32; ++reg) {
+                EXPECT_EQ(state.cpu.v[reg], interpreted.cpu.v[reg]) << reg;
+              }
+              EXPECT_EQ(state.cpu.flags, initial.cpu.flags);
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteCmtst32BitMasksAndAliases) {
+  for (uint32_t q : {0u, 1u}) {
+    for (uint32_t rd : {0u, 1u, 2u, 31u}) {
+      for (uint32_t rm : {1u, 2u}) {
+        const std::array<uint32_t, 1> guest = {0x0ea0'8c20u | (q << 30) | (rm << 16) | rd};
+        for (uint32_t a : {0u, 1u, 0xffff'ffffu, 0x8000'0000u, 0x5555'aaaau}) {
+          ThreadState initial{};
+          initial.cpu.v[1] = MakeUint32x4(a, ~a, 0x8000'0000, 1);
+          initial.cpu.v[2] = MakeUint32x4(~a, a, 0x8000'0000, 0);
+          __uint128_t expected = 0;
+          for (uint32_t lane = 0; lane < (q ? 4u : 2u); ++lane) {
+            uint32_t n = initial.cpu.v[1] >> (32 * lane);
+            uint32_t m = initial.cpu.v[rm] >> (32 * lane);
+            expected |= static_cast<__uint128_t>((n & m) ? UINT32_MAX : 0) << (32 * lane);
+          }
+          ThreadState interpreted{};
+          interpreted.cpu = initial.cpu;
+          SetInsnAddr(interpreted.cpu, ToGuestAddr(guest.data()));
+          InterpretInsn(&interpreted);
+          EXPECT_EQ(interpreted.cpu.v[rd], expected);
+          for (bool mapping : {false, true}) {
+            ThreadState state{};
+            state.cpu = initial.cpu;
+            RunSimdFallbackCode(guest, &state, mapping);
+            for (uint32_t reg = 0; reg < 32; ++reg) {
+              EXPECT_EQ(state.cpu.v[reg], interpreted.cpu.v[reg]) << reg;
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteFmax4SZeroNanInfinityAndAliases) {
+  constexpr std::array<uint32_t, 14> kBits = {0,
+                                              0x8000'0000,
+                                              1,
+                                              0x8000'0001,
+                                              0x0080'0000,
+                                              0x8080'0000,
+                                              0x3f80'0000,
+                                              0xbf80'0000,
+                                              0x7f80'0000,
+                                              0xff80'0000,
+                                              0x7fc1'2345,
+                                              0xffc1'2345,
+                                              0x7f80'0001,
+                                              0xff80'0001};
+  for (uint32_t rd : {0u, 1u, 2u, 31u}) {
+    for (uint32_t a : kBits) {
+      for (uint32_t b : kBits) {
+        const std::array<uint32_t, 1> guest = {0x4e22'f420u | rd};
+        ThreadState initial{};
+        initial.cpu.v[1] = MakeUint32x4(a, b, a, b);
+        initial.cpu.v[2] = MakeUint32x4(b, a, a, b);
+        ThreadState interpreted{};
+        interpreted.cpu = initial.cpu;
+        SetInsnAddr(interpreted.cpu, ToGuestAddr(guest.data()));
+        InterpretInsn(&interpreted);
+        // Independently require default NaN and operand-order-independent +0.
+        uint32_t expected_low;
+        if ((a & 0x7fff'ffff) > 0x7f80'0000 || (b & 0x7fff'ffff) > 0x7f80'0000) {
+          expected_low = 0x7fc0'0000;
+        } else if ((a & 0x7fff'ffff) == 0 && (b & 0x7fff'ffff) == 0) {
+          expected_low = a & b;
+        } else {
+          float fa, fb;
+          memcpy(&fa, &a, 4);
+          memcpy(&fb, &b, 4);
+          expected_low = fa > fb ? a : b;
+        }
+        EXPECT_EQ(static_cast<uint32_t>(interpreted.cpu.v[rd]), expected_low);
+        for (bool mapping : {false, true}) {
+          ThreadState state{};
+          state.cpu = initial.cpu;
+          RunSimdFallbackCode(guest, &state, mapping);
+          SCOPED_TRACE(testing::Message() << std::hex << a << "," << b << " rd=" << rd);
+          for (uint32_t reg = 0; reg < 32; ++reg) {
+            EXPECT_EQ(state.cpu.v[reg], interpreted.cpu.v[reg]) << reg;
+          }
+        }
+      }
+    }
+  }
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteSimdFallbackDestinationsStayCoherentInCache) {
+  // v0 and v1 are both read and written repeatedly, including a 64-bit
+  // result subsequently consumed as a 128-bit value. This detects stale
+  // upper lanes in cache even when the ThreadState write looks correct.
+  constexpr std::array<uint32_t, 9> guest = {
+      0x4e22'f420,  // fmax v0.4s,v1.4s,v2.4s
+      0x0f3f'5400,  // shl v0.2s,v0.2s,#31
+      0x6e22'1c03,  // eor v3.16b,v0.16b,v2.16b (observe full v0)
+      0x4f21'5400,  // shl v0.4s,v0.4s,#1
+      0x0ea1'8c00,  // cmtst v0.2s,v0.2s,v1.2s
+      0x6e22'1c04,  // eor v4.16b,v0.16b,v2.16b (observe full v0)
+      0x6f20'0401,  // ushr v1.4s,v0.4s,#32
+      0x4e21'f400,  // fmax v0.4s,v0.4s,v1.4s
+      0x4ea0'8c01,  // cmtst v1.4s,v0.4s,v0.4s
+  };
+  for (uint32_t seed : {0u, 0x7f80'0001u, 0x8000'0000u, 0xffff'ffffu}) {
+    ThreadState initial{};
+    initial.cpu.v[0] = MakeUint32x4(1, 2, 3, 4);
+    initial.cpu.v[1] = MakeUint32x4(seed, 0x3f80'0000, 0x8000'0000, 0x7f80'0000);
+    initial.cpu.v[2] = MakeUint32x4(0, 0xbf80'0000, 0, 0x7fc1'2345);
+    ThreadState interpreted{};
+    interpreted.cpu = initial.cpu;
+    SetInsnAddr(interpreted.cpu, ToGuestAddr(guest.data()));
+    for (size_t i = 0; i < guest.size(); ++i) InterpretInsn(&interpreted);
+    for (bool mapping : {false, true}) {
+      ThreadState state{};
+      state.cpu = initial.cpu;
+      RunSimdFallbackCode(guest, &state, mapping);
+      for (uint32_t reg = 0; reg < 32; ++reg) {
+        EXPECT_EQ(state.cpu.v[reg], interpreted.cpu.v[reg]) << reg;
+      }
+    }
+  }
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteSimdFallbackRejectsUnauditedForms) {
+  // Neighboring 8H, 2D, scalar and FP16 encodings must still exit precisely.
+  for (uint32_t insn : {0x4f1f'5420u,
+                        0x4f7f'5420u,
+                        0x5f7f'5420u,
+                        0x6f1f'0420u,
+                        0x6f7f'0420u,
+                        0x4e62'f420u,
+                        0x0e22'f420u,
+                        0x4e42'f420u,
+                        0x4e62'8c20u}) {
+    const std::array<uint32_t, 1> guest = {insn};
+    for (bool mapping : {false, true}) {
+      LiteTranslateParams params;
+      GuestAddr start = ToGuestAddr(guest.data());
+      params.end_pc = start + sizeof(guest);
+      params.enable_reg_mapping = mapping;
+      MachineCode code;
+      auto [success, stop] = TryLiteTranslateRegion(start, &code, params);
+      EXPECT_FALSE(success) << std::hex << insn;
+      EXPECT_EQ(stop, start);
+    }
+  }
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteBicAndBsl8AliasesAndCachedWrites) {
+  for (uint32_t base : {0x0e60'1c00u, 0x4e60'1c00u, 0x2e60'1c00u}) {
+    for (uint32_t rd : {0u, 1u, 2u, 31u}) {
+      for (uint32_t rn : {0u, 1u, 2u, 31u}) {
+        for (uint32_t rm : {0u, 1u, 2u, 31u}) {
+          uint32_t insn = base | (rm << 16) | (rn << 5) | rd;
+          // Repetition enables read/write caching, including BSL's old Vd.
+          const std::array<uint32_t, 4> guest = {insn, insn, insn, insn};
+          for (bool mapping : {false, true}) {
+            ThreadState state{};
+            ThreadState interpreted{};
+            __uint128_t expected[32];
+            for (uint32_t reg = 0; reg < 32; ++reg) {
+              expected[reg] = MakeUint32x4(0x0123'4567u * (reg + 1),
+                                           0x89ab'cdefu ^ reg,
+                                           0xfedc'ba98u - reg,
+                                           0x7654'3210u + reg);
+              state.cpu.v[reg] = interpreted.cpu.v[reg] = expected[reg];
+            }
+            for (size_t i = 0; i < guest.size(); ++i) {
+              __uint128_t value = base == 0x2e60'1c00u ? (expected[rd] & expected[rn]) |
+                                                             (~expected[rd] & expected[rm])
+                                                       : expected[rn] & ~expected[rm];
+              expected[rd] = (base & (1u << 30)) ? value : static_cast<uint64_t>(value);
+            }
+            SetInsnAddr(interpreted.cpu, ToGuestAddr(guest.data()));
+            for (size_t i = 0; i < guest.size(); ++i) InterpretInsn(&interpreted);
+            RunSimdFallbackCode(guest, &state, mapping);
+            SCOPED_TRACE(testing::Message() << std::hex << insn << " mapping=" << mapping);
+            for (uint32_t reg = 0; reg < 32; ++reg) {
+              EXPECT_EQ(state.cpu.v[reg], expected[reg]) << reg;
+              EXPECT_EQ(interpreted.cpu.v[reg], expected[reg]) << reg;
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteUmovSAllLanesAndZeroRegister) {
+  for (uint32_t rn : {0u, 1u, 31u}) {
+    for (uint32_t lane = 0; lane < 4; ++lane) {
+      for (uint32_t rd : {0u, 1u, 30u, 31u}) {
+        const uint32_t insn = 0x0e04'3c00u | (lane << 19) | (rn << 5) | rd;
+        const std::array<uint32_t, 4> guest = {insn, insn, insn, insn};
+        for (bool mapping : {false, true}) {
+          ThreadState state{};
+          ThreadState interpreted{};
+          for (uint32_t reg = 0; reg < 31; ++reg) state.cpu.x[reg] = UINT64_MAX;
+          state.cpu.sp = 0x1234'5678'90ab'cdef;
+          state.cpu.v[rn] = MakeUint32x4(0, 0x8000'0000, 0xffff'ffff, 0x1234'5678);
+          interpreted.cpu = state.cpu;
+          uint64_t expected = static_cast<uint32_t>(state.cpu.v[rn] >> (lane * 32));
+          SetInsnAddr(interpreted.cpu, ToGuestAddr(guest.data()));
+          for (size_t i = 0; i < guest.size(); ++i) InterpretInsn(&interpreted);
+          RunSimdFallbackCode(guest, &state, mapping);
+          if (rd != 31) EXPECT_EQ(state.cpu.x[rd], expected);
+          EXPECT_EQ(state.cpu.sp, interpreted.cpu.sp);
+          for (uint32_t reg = 0; reg < 31; ++reg)
+            EXPECT_EQ(state.cpu.x[reg], interpreted.cpu.x[reg]);
+          for (uint32_t reg = 0; reg < 32; ++reg)
+            EXPECT_EQ(state.cpu.v[reg], interpreted.cpu.v[reg]);
+        }
+      }
+    }
+  }
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteBsl8CacheUpperLanesReachUmovAndVectorReader) {
+  constexpr std::array<uint32_t, 7> guest = {
+      0x2e62'1c20,  // bsl v0.8b,v1.8b,v2.8b
+      0x0e14'3c03,  // umov w3,v0.s[2] (must read zero from cache)
+      0x4e62'1c04,  // bic v4.16b,v0.16b,v2.16b
+      0x2e62'1c20,  // bsl v0.8b,v1.8b,v2.8b
+      0x0e1c'3c05,  // umov w5,v0.s[3]
+      0x4e60'1c06,  // bic v6.16b,v0.16b,v0.16b
+      0x0e04'3c07,  // umov w7,v0.s[0]
+  };
+  for (bool mapping : {false, true}) {
+    ThreadState state{};
+    ThreadState interpreted{};
+    state.cpu.v[0] = MakeUint128(0xaaaa'5555'aaaa'5555, UINT64_MAX);
+    state.cpu.v[1] = MakeUint128(0x1234'5678'9abc'def0, UINT64_MAX);
+    state.cpu.v[2] = MakeUint128(0xfedc'ba98'7654'3210, UINT64_MAX);
+    interpreted.cpu = state.cpu;
+    SetInsnAddr(interpreted.cpu, ToGuestAddr(guest.data()));
+    for (size_t i = 0; i < guest.size(); ++i) InterpretInsn(&interpreted);
+    RunSimdFallbackCode(guest, &state, mapping);
+    EXPECT_EQ(state.cpu.x[3], 0u);
+    EXPECT_EQ(state.cpu.x[5], 0u);
+    for (uint32_t reg = 0; reg < 31; ++reg) EXPECT_EQ(state.cpu.x[reg], interpreted.cpu.x[reg]);
+    for (uint32_t reg = 0; reg < 32; ++reg) EXPECT_EQ(state.cpu.v[reg], interpreted.cpu.v[reg]);
   }
 }
 

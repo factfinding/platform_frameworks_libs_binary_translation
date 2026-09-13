@@ -41,8 +41,40 @@ using CachedXRegisterMap = std::array<int8_t, 32>;
 using CachedVRegisterMap = std::array<int8_t, 32>;
 
 struct XRegisterUsage {
-  std::array<uint16_t, 31> reads{};
-  std::array<uint16_t, 31> writes{};
+  // Index 31 denotes SP only; XZR/WZR accesses never enter usage accounting.
+  std::array<uint16_t, 32> reads{};
+  std::array<uint16_t, 32> writes{};
+  std::array<GuestAddr, 32> initial_load_pc{};
+  std::array<bool, 32> needs_initial_load{};
+  std::vector<std::pair<GuestAddr, GuestAddr>> backedges;
+
+  void RecordRead(uint32_t reg, GuestAddr pc) {
+    if (reads[reg] == 0 && writes[reg] == 0) {
+      initial_load_pc[reg] = pc;
+      needs_initial_load[reg] = true;
+    }
+    ++reads[reg];
+  }
+  void RecordWrite(uint32_t reg) { ++writes[reg]; }
+
+  void HoistLoopInitialLoads() {
+    // A backward edge can cross several straight-line blocks. Move their
+    // initial loads before the loop target so no iteration reloads the cache.
+    // Iterate to a fixed point for nested or overlapping loops.
+    bool changed;
+    do {
+      changed = false;
+      for (auto [source, target] : backedges) {
+        for (uint32_t reg = 0; reg < needs_initial_load.size(); ++reg) {
+          if (needs_initial_load[reg] && initial_load_pc[reg] > target &&
+              initial_load_pc[reg] <= source) {
+            initial_load_pc[reg] = target;
+            changed = true;
+          }
+        }
+      }
+    } while (changed);
+  }
 };
 
 constexpr int32_t kSpOffset = offsetof(ThreadState, cpu) + offsetof(CPUState, sp);
@@ -62,9 +94,9 @@ constexpr int64_t SignExtend(uint64_t value, uint32_t width) {
 CachedXRegisterMap SelectCachedXRegisters(const XRegisterUsage& usage) {
   CachedXRegisterMap result{};
   result.fill(-1);
-  std::array<bool, 31> selected{};
+  std::array<bool, 32> selected{};
   for (int8_t slot = 0; slot < 7; ++slot) {
-    uint32_t best_reg = 31;
+    uint32_t best_reg = usage.reads.size();
     uint32_t best_score = 0;
     for (uint32_t reg = 0; reg < usage.reads.size(); ++reg) {
       // A cached read replaces a ThreadState load.  A cached write remains
@@ -76,7 +108,7 @@ CachedXRegisterMap SelectCachedXRegisters(const XRegisterUsage& usage) {
         best_score = score;
       }
     }
-    if (best_reg == 31) {
+    if (best_reg == usage.reads.size()) {
       break;
     }
     result[best_reg] = slot;
@@ -97,6 +129,36 @@ CachedVRegisterMap SelectCachedVRegisters(GuestAddr start_pc, GuestAddr end_pc) 
 
   for (GuestAddr pc = start_pc; pc < end_pc; pc += sizeof(uint32_t)) {
     uint32_t insn = *ToHostAddr<const uint32_t>(pc);
+
+    // These lowerings commit a complete, normalized vector through StoreV,
+    // including zeroing the upper half of Q=0 results before updating cache.
+    // Shift immediates have only Vn as a source; their immh:immb is not Rm.
+    if ((insn & 0xbfe0'fc00u) == 0x0f20'5400u ||
+        (insn & 0xbfe0'fc00u) == 0x2f20'0400u) {  // SHL/USHR Vd.2S/4S
+      mark_written(insn, true);
+      mark_read(insn >> 5);
+      continue;
+    }
+    if ((insn & 0xffe0'fc00u) == 0x4e20'f400u ||
+        (insn & 0xbfe0'fc00u) == 0x0ea0'8c00u) {  // FMAX 4S / CMTST 2S/4S
+      mark_written(insn, true);
+      mark_read(insn >> 5);
+      mark_read(insn >> 16);
+      continue;
+    }
+
+    if ((insn & 0xbfe0'fc00u) == 0x0e60'1c00u ||
+        (insn & 0xffe0'fc00u) == 0x2e60'1c00u) {  // BIC 8B/16B / BSL 8B
+      mark_written(insn, true);
+      if ((insn & (1u << 29)) != 0) mark_read(insn);  // BSL reads its mask.
+      mark_read(insn >> 5);
+      mark_read(insn >> 16);
+      continue;
+    }
+    if ((insn & 0xffe7'fc00u) == 0x0e04'3c00u) {  // UMOV Wd,Vn.S[lane]
+      mark_read(insn >> 5);
+      continue;
+    }
 
     // These hot 128-bit floating-point operations commit their destination
     // through StoreV(), which writes ThreadState first and then refreshes a
@@ -358,20 +420,38 @@ class LiteTranslator {
                           CachedVRegisterMap cached_v_registers,
                           bool enable_guest_memory,
                           bool allow_dispatch,
-                          XRegisterUsage* x_register_usage = nullptr)
+                          XRegisterUsage* x_register_usage = nullptr,
+                          const XRegisterUsage* initial_load_plan = nullptr)
       : as_(machine_code),
         start_pc_(start_pc),
         enable_guest_memory_(enable_guest_memory),
         allow_dispatch_(allow_dispatch),
         cached_x_registers_(cached_x_registers),
         cached_v_registers_(cached_v_registers),
-        x_register_usage_(x_register_usage) {
-    for (uint32_t guest_reg = 0; guest_reg < cached_x_registers_.size(); ++guest_reg) {
-      int slot = cached_x_registers_[guest_reg];
-      if (slot >= 0) {
-        as_.LdD(kCachedXHostRegisters[slot], Assembler::s8, XOffset(guest_reg));
+        x_register_usage_(x_register_usage),
+        block_start_pc_(start_pc) {
+    // Mixed integer/SIMD regions are sensitive to their established entry
+    // sequence on LA64: removing even a write-first GPR preload regressed the
+    // mixed workload. Retain eager GPR loads when SIMD caching is active;
+    // use demand initialization for integer-only cache mappings.
+    const bool demand_x_loads = std::none_of(cached_v_registers_.begin(),
+                                             cached_v_registers_.end(),
+                                             [](int8_t slot) { return slot >= 0; });
+    if (initial_load_plan != nullptr) {
+      for (uint32_t reg = 0; reg < cached_x_registers_.size(); ++reg) {
+        if (cached_x_registers_[reg] < 0) {
+          continue;
+        }
+        if (!demand_x_loads) {
+          pending_x_loads_.push_back({start_pc, reg});
+        } else if (initial_load_plan->needs_initial_load[reg]) {
+          pending_x_loads_.push_back({initial_load_plan->initial_load_pc[reg], reg});
+        }
       }
+      std::sort(pending_x_loads_.begin(), pending_x_loads_.end());
     }
+    // Keep entry GPR loads ahead of SIMD loads to hide load-to-use latency.
+    EmitInitialXLoads(start_pc);
     for (uint32_t guest_reg = 0; guest_reg < cached_v_registers_.size(); ++guest_reg) {
       int slot = cached_v_registers_[guest_reg];
       if (slot >= 0) {
@@ -592,6 +672,15 @@ class LiteTranslator {
     if ((insn & 0xffc0'9c00u) == 0x4e00'0000u) {
       return TranslateTbl16B(insn);
     }
+    if ((insn & 0xbfe0'fc00u) == 0x0e60'1c00u) {
+      return TranslateBicVector(insn);
+    }
+    if ((insn & 0xffe0'fc00u) == 0x2e60'1c00u) {
+      return TranslateBsl8B(insn);
+    }
+    if ((insn & 0xffe7'fc00u) == 0x0e04'3c00u) {
+      return TranslateUmovS(insn);
+    }
     if ((insn & 0xbfe0'fc00u) == 0x0e20'1c00u) {
       return TranslateVectorLogical(insn, 0);
     }
@@ -608,6 +697,17 @@ class LiteTranslator {
     // the first lowering to the full-width form observed in Unity.
     if ((insn & 0xffe0'fc00u) == 0x6e60'1c00u) {
       return TranslateBsl16B(insn);
+    }
+    // Concrete interpreter entries from the Unity loading profile.  Keep
+    // the first lowering to audited 32-bit lanes and full-width FMAX.
+    if ((insn & 0xbfe0'fc00u) == 0x0f20'5400u || (insn & 0xbfe0'fc00u) == 0x2f20'0400u) {
+      return TranslateVectorShift32(insn);
+    }
+    if ((insn & 0xbfe0'fc00u) == 0x0ea0'8c00u) {
+      return TranslateCmtst32(insn);
+    }
+    if ((insn & 0xffe0'fc00u) == 0x4e20'f400u) {
+      return TranslateFmax4S(insn);
     }
     if ((insn & 0xffe0'fc00u) == 0x4ea0'8400u) {
       return TranslateVectorAddSub4S(insn, false);  // ADD
@@ -983,6 +1083,14 @@ class LiteTranslator {
   }
 
   void BeginInstruction(GuestAddr pc) {
+    if (pc == next_block_pc_) {
+      block_start_pc_ = pc;
+    }
+    // Initial loads dominate every use in a straight-line block. Labels bind
+    // after them, and loop-crossed loads have been hoisted before the target.
+    // Forward edges still leave the region; internal forward linking would
+    // require a new dominance analysis before relaxing this invariant.
+    EmitInitialXLoads(pc);
     Assembler::Label* label = as_.MakeLabel();
     local_code_labels_.push_back({pc, label});
     as_.Bind(label);
@@ -1079,6 +1187,7 @@ class LiteTranslator {
   }
 
   void Finalize() {
+    CHECK_EQ(next_x_load_, pending_x_loads_.size());
     // Memory faults are exceptional.  Keep their recovery exits after the
     // normal region body so successful loads and stores neither branch over
     // cold code nor pull it into the hot I-cache footprint.
@@ -1126,6 +1235,15 @@ class LiteTranslator {
 
  private:
   enum class AtomicMemoryOp { kCas, kSwp, kLdadd };
+
+  void EmitInitialXLoads(GuestAddr pc) {
+    while (next_x_load_ < pending_x_loads_.size() && pending_x_loads_[next_x_load_].first == pc) {
+      uint32_t reg = pending_x_loads_[next_x_load_++].second;
+      as_.LdD(kCachedXHostRegisters[cached_x_registers_[reg]],
+              Assembler::s8,
+              reg == 31 ? kSpOffset : XOffset(reg));
+    }
+  }
 
   struct PendingStaticExit {
     GuestAddr target;
@@ -1175,6 +1293,9 @@ class LiteTranslator {
         }
       }
       if (target_label != nullptr) {
+        if (x_register_usage_ != nullptr) {
+          x_register_usage_->backedges.emplace_back(current_pc, target);
+        }
         for (const PendingLocalBackedge& edge : pending_local_backedges_) {
           if (edge.target_pc == target) {
             return edge.stub_label;
@@ -1189,6 +1310,7 @@ class LiteTranslator {
   }
 
   Assembler::Label* GetBranchTargetLabel(GuestAddr target, GuestAddr current_pc) {
+    next_block_pc_ = current_pc + sizeof(uint32_t);
     if (Assembler::Label* local = GetLocalBackedgeLabel(target, current_pc)) {
       return local;
     }
@@ -1256,26 +1378,34 @@ class LiteTranslator {
     }
   }
 
-  void LoadXOrZero(uint32_t reg, Register dst) {
+  // The returned register is a read-only operand. Cached registers must only
+  // be updated through StoreXOrDiscard/StoreXOrSp so ThreadState stays current.
+  Register ReadXOrZero(uint32_t reg, Register scratch) {
     if (reg == 31) {
-      as_.Move(dst, Assembler::zero);
-    } else {
-      if (x_register_usage_ != nullptr) {
-        ++x_register_usage_->reads[reg];
-      }
-      int slot = FindCachedXRegister(reg);
-      if (slot < 0) {
-        as_.LdD(dst, Assembler::s8, XOffset(reg));
-      } else if (dst != kCachedXHostRegisters[slot]) {
-        as_.Move(dst, kCachedXHostRegisters[slot]);
-      }
+      return Assembler::zero;
+    }
+    if (x_register_usage_ != nullptr) {
+      x_register_usage_->RecordRead(reg, block_start_pc_);
+    }
+    int slot = FindCachedXRegister(reg);
+    if (slot >= 0) {
+      return kCachedXHostRegisters[slot];
+    }
+    as_.LdD(scratch, Assembler::s8, XOffset(reg));
+    return scratch;
+  }
+
+  void LoadXOrZero(uint32_t reg, Register dst) {
+    Register src = ReadXOrZero(reg, dst);
+    if (src != dst) {
+      as_.Move(dst, src);
     }
   }
 
   void StoreXOrDiscard(uint32_t reg, Register src) {
     if (reg != 31) {
       if (x_register_usage_ != nullptr) {
-        ++x_register_usage_->writes[reg];
+        x_register_usage_->RecordWrite(reg);
       }
       // Keep ThreadState authoritative at every instruction boundary.  Signal
       // delivery and memory-fault recovery may leave generated code without
@@ -1288,52 +1418,52 @@ class LiteTranslator {
     }
   }
 
-  void LoadXOrSp(uint32_t reg, Register dst) {
-    if (reg != 31 && x_register_usage_ != nullptr) {
-      ++x_register_usage_->reads[reg];
+  Register ReadXOrSp(uint32_t reg, Register scratch) {
+    if (x_register_usage_ != nullptr) {
+      x_register_usage_->RecordRead(reg, block_start_pc_);
     }
-    int slot = reg == 31 ? -1 : FindCachedXRegister(reg);
-    if (slot < 0) {
-      as_.LdD(dst, Assembler::s8, reg == 31 ? kSpOffset : XOffset(reg));
-    } else if (dst != kCachedXHostRegisters[slot]) {
-      as_.Move(dst, kCachedXHostRegisters[slot]);
+    int slot = FindCachedXRegister(reg);
+    if (slot >= 0) {
+      return kCachedXHostRegisters[slot];
+    }
+    as_.LdD(scratch, Assembler::s8, reg == 31 ? kSpOffset : XOffset(reg));
+    return scratch;
+  }
+
+  void LoadXOrSp(uint32_t reg, Register dst) {
+    Register src = ReadXOrSp(reg, dst);
+    if (dst != src) {
+      as_.Move(dst, src);
     }
   }
 
+  void LoadXOrSpWithOffset(uint32_t reg, Register dst, int64_t offset, Register scratch) {
+    // Form the address in a temporary without modifying its cached base.
+    AddImmediate(dst, ReadXOrSp(reg, dst), offset, scratch);
+  }
+
   void StoreXOrSp(uint32_t reg, Register src) {
-    if (reg == 31) {
-      as_.StD(src, Assembler::s8, kSpOffset);
-      return;
-    }
     if (x_register_usage_ != nullptr) {
-      ++x_register_usage_->writes[reg];
+      x_register_usage_->RecordWrite(reg);
     }
-    as_.StD(src, Assembler::s8, XOffset(reg));
+    // SP has the same write-through contract as ordinary cached GPRs.
+    as_.StD(src, Assembler::s8, reg == 31 ? kSpOffset : XOffset(reg));
     int slot = FindCachedXRegister(reg);
     if (slot >= 0 && src != kCachedXHostRegisters[slot]) {
       as_.Move(kCachedXHostRegisters[slot], src);
     }
   }
 
-  void ZeroExtend32(Register reg) {
-    as_.SlliD(reg, reg, 32);
-    as_.SrliD(reg, reg, 32);
-  }
+  void ZeroExtend32(Register reg) { as_.BstrpickD(reg, reg, 31, 0); }
 
-  void SignExtend32(Register reg) {
-    as_.SlliD(reg, reg, 32);
-    as_.SraiD(reg, reg, 32);
-  }
+  void SignExtend32(Register reg) { as_.AddiW(reg, reg, 0); }
 
   // Android enables top-byte-ignore for userspace pointers.  Guest pointers
   // may therefore carry an allocation tag in bits 63:56, while the host
   // address used by generated memory instructions must not.  Keep the tagged
   // value in guest registers (including writeback results) and strip it only
   // from the temporary effective address used for the actual access.
-  void ApplyTbi(Register reg) {
-    as_.SlliD(reg, reg, 8);
-    as_.SrliD(reg, reg, 8);
-  }
+  void ApplyTbi(Register reg) { as_.BstrpickD(reg, reg, 55, 0); }
 
   bool ShiftOperand(Register reg,
                     uint32_t shift_kind,
@@ -1350,6 +1480,10 @@ class LiteTranslator {
         ZeroExtend32(reg);
       }
     }
+    // Keep the width normalization above, including for a zero shift.
+    if (amount == 0) {
+      return true;
+    }
     switch (shift_kind) {
       case 0:
         as_.SlliD(reg, reg, amount);
@@ -1361,11 +1495,25 @@ class LiteTranslator {
         as_.SraiD(reg, reg, amount);
         break;
       case 3:
-        as_.Li(Assembler::t2, amount);
+        as_.LiOptimized(Assembler::t2, amount);
         is_64_bit ? as_.RotrD(reg, reg, Assembler::t2) : as_.RotrW(reg, reg, Assembler::t2);
         break;
     }
     return true;
+  }
+
+  void AddImmediate(Register dst, Register src, int64_t offset, Register scratch) {
+    if (offset == 0) {
+      if (dst != src) {
+        as_.Move(dst, src);
+      }
+    } else if (offset >= -2048 && offset <= 2047) {
+      as_.AddiD(dst, src, offset);
+    } else {
+      CHECK(scratch != src);
+      as_.LiOptimized(scratch, static_cast<uint64_t>(offset));
+      as_.AddD(dst, src, scratch);
+    }
   }
 
   bool TranslateMoveWide(uint32_t insn) {
@@ -1383,16 +1531,16 @@ class LiteTranslator {
     if (opc == 3) {  // MOVK
       LoadXOrZero(rd, Assembler::t0);
       uint64_t keep_mask = ~(uint64_t{0xffff} << shift) & width_mask;
-      as_.Li(Assembler::t1, keep_mask);
+      as_.LiOptimized(Assembler::t1, keep_mask);
       as_.And(Assembler::t0, Assembler::t0, Assembler::t1);
-      as_.Li(Assembler::t1, imm << shift);
+      as_.LiOptimized(Assembler::t1, imm << shift);
       as_.Or(Assembler::t0, Assembler::t0, Assembler::t1);
     } else {
       uint64_t value = imm << shift;
       if (opc == 0) {  // MOVN
         value = ~value;
       }
-      as_.Li(Assembler::t0, value & width_mask);
+      as_.LiOptimized(Assembler::t0, value & width_mask);
     }
     if (!is_64_bit) {
       ZeroExtend32(Assembler::t0);
@@ -1413,11 +1561,19 @@ class LiteTranslator {
     if (set_flags) {
       as_.Move(Assembler::t4, Assembler::t0);
     }
-    as_.Li(Assembler::t1, imm);
-    if (is_sub) {
-      as_.SubD(Assembler::t0, Assembler::t0, Assembler::t1);
+    const int64_t delta = is_sub ? -static_cast<int64_t>(imm) : static_cast<int64_t>(imm);
+    if (set_flags) {
+      // The flags calculation still needs the original, positive RHS.
+      as_.LiOptimized(Assembler::t1, imm);
+      if (delta >= -2048 && delta <= 2047) {
+        as_.AddiD(Assembler::t0, Assembler::t0, delta);
+      } else if (is_sub) {
+        as_.SubD(Assembler::t0, Assembler::t0, Assembler::t1);
+      } else {
+        as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
+      }
     } else {
-      as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
+      AddImmediate(Assembler::t0, Assembler::t0, delta, Assembler::t1);
     }
     if (!is_64_bit) {
       ZeroExtend32(Assembler::t0);
@@ -1476,7 +1632,7 @@ class LiteTranslator {
 
     // V = sign(~(lhs ^ rhs) & (lhs ^ result)) for addition.
     as_.Xor(Assembler::t5, lhs, rhs);
-    as_.Li(Assembler::t7, UINT64_MAX);
+    as_.LiOptimized(Assembler::t7, UINT64_MAX);
     as_.Xor(Assembler::t5, Assembler::t5, Assembler::t7);
     as_.Xor(Assembler::t6, lhs, result);
     as_.And(Assembler::t5, Assembler::t5, Assembler::t6);
@@ -1508,6 +1664,20 @@ class LiteTranslator {
     uint32_t amount = (insn >> 10) & 0x3f;
     uint32_t rn = (insn >> 5) & 31;
     uint32_t rd = insn & 31;
+    if (!set_flags && shift_kind < 3 && amount == 0) {
+      Register lhs = ReadXOrZero(rn, Assembler::t0);
+      Register rhs = ReadXOrZero(rm, Assembler::t1);
+      if (is_sub) {
+        as_.SubD(Assembler::t0, lhs, rhs);
+      } else {
+        as_.AddD(Assembler::t0, lhs, rhs);
+      }
+      if (!is_64_bit) {
+        ZeroExtend32(Assembler::t0);
+      }
+      StoreXOrDiscard(rd, Assembler::t0);
+      return true;
+    }
     LoadXOrZero(rn, Assembler::t0);
     LoadXOrZero(rm, Assembler::t1);
     if (!ShiftOperand(Assembler::t1, shift_kind, amount, is_64_bit)) {
@@ -1517,6 +1687,11 @@ class LiteTranslator {
       as_.Move(Assembler::t4, Assembler::t0);
       if (!is_64_bit) {
         ZeroExtend32(Assembler::t4);
+        // LSL may spill above bit 31, and ASR leaves a sign-extended value.
+        // In particular, SUBS carry must compare 32-bit unsigned operands.
+        if (shift_kind == 2 || (shift_kind == 0 && amount != 0)) {
+          ZeroExtend32(Assembler::t1);
+        }
       }
     }
     if (is_sub) {
@@ -1605,13 +1780,36 @@ class LiteTranslator {
     uint32_t amount = (insn >> 10) & 0x3f;
     uint32_t rn = (insn >> 5) & 31;
     uint32_t rd = insn & 31;
+    // Zero-shift logical operations consume read-only cached sources. W
+    // results only require normalization after the operation. Keep inversion
+    // and flag updates on the existing scratch-register path.
+    if (amount == 0 && !invert && opc != 3) {
+      Register lhs = ReadXOrZero(rn, Assembler::t0);
+      Register rhs = ReadXOrZero(rm, Assembler::t1);
+      switch (opc) {
+        case 0:
+          as_.And(Assembler::t0, lhs, rhs);
+          break;
+        case 1:
+          as_.Or(Assembler::t0, lhs, rhs);
+          break;
+        case 2:
+          as_.Xor(Assembler::t0, lhs, rhs);
+          break;
+      }
+      if (!is_64_bit) {
+        ZeroExtend32(Assembler::t0);
+      }
+      StoreXOrDiscard(rd, Assembler::t0);
+      return true;
+    }
     LoadXOrZero(rn, Assembler::t0);
     LoadXOrZero(rm, Assembler::t1);
     if (!ShiftOperand(Assembler::t1, shift_kind, amount, is_64_bit, true)) {
       return false;
     }
     if (invert) {
-      as_.Li(Assembler::t2, UINT64_MAX);
+      as_.LiOptimized(Assembler::t2, UINT64_MAX);
       as_.Xor(Assembler::t1, Assembler::t1, Assembler::t2);
     }
     switch (opc) {
@@ -1651,7 +1849,7 @@ class LiteTranslator {
     }
 
     LoadXOrZero(rn, Assembler::t0);
-    as_.Li(Assembler::t1, immediate);
+    as_.LiOptimized(Assembler::t1, immediate);
     switch (opc) {
       case 0:
       case 3:
@@ -1710,17 +1908,17 @@ class LiteTranslator {
       LoadXOrZero(rd, Assembler::t0);
       LoadXOrZero(rn, Assembler::t1);
       if (immr > imms) {
-        as_.Li(Assembler::t2, field_mask);
+        as_.LiOptimized(Assembler::t2, field_mask);
         as_.And(Assembler::t1, Assembler::t1, Assembler::t2);
         as_.SlliD(Assembler::t1, Assembler::t1, destination_lsb);
       } else {
         if (immr != 0) {
           as_.SrliD(Assembler::t1, Assembler::t1, immr);
         }
-        as_.Li(Assembler::t2, field_mask);
+        as_.LiOptimized(Assembler::t2, field_mask);
         as_.And(Assembler::t1, Assembler::t1, Assembler::t2);
       }
-      as_.Li(Assembler::t2, ~destination_mask);
+      as_.LiOptimized(Assembler::t2, ~destination_mask);
       as_.And(Assembler::t0, Assembler::t0, Assembler::t2);
       as_.Or(Assembler::t0, Assembler::t0, Assembler::t1);
       if (!is_64_bit) {
@@ -1739,7 +1937,7 @@ class LiteTranslator {
       uint32_t destination_lsb = data_size - immr;
       uint64_t mask = field_width == 64 ? UINT64_MAX : (uint64_t{1} << field_width) - 1;
       LoadXOrZero(rn, Assembler::t0);
-      as_.Li(Assembler::t1, mask);
+      as_.LiOptimized(Assembler::t1, mask);
       as_.And(Assembler::t0, Assembler::t0, Assembler::t1);
       if (opc == 0) {
         as_.SlliD(Assembler::t0, Assembler::t0, 64 - field_width);
@@ -1767,7 +1965,7 @@ class LiteTranslator {
       as_.SraiD(Assembler::t0, Assembler::t0, 64 - field_width);
     } else {  // UBFM / UBFX / UXT[BH]
       uint64_t mask = field_width == 64 ? UINT64_MAX : (uint64_t{1} << field_width) - 1;
-      as_.Li(Assembler::t1, mask);
+      as_.LiOptimized(Assembler::t1, mask);
       as_.And(Assembler::t0, Assembler::t0, Assembler::t1);
     }
     if (!is_64_bit) {
@@ -1791,7 +1989,7 @@ class LiteTranslator {
 
     LoadXOrZero(rm, Assembler::t0);
     if (rn == rm && lsb != 0) {
-      as_.Li(Assembler::t1, lsb);
+      as_.LiOptimized(Assembler::t1, lsb);
       if (is_64_bit) {
         as_.RotrD(Assembler::t0, Assembler::t0, Assembler::t1);
       } else {
@@ -1880,9 +2078,9 @@ class LiteTranslator {
         }
         as_.Beqz(Assembler::t1, *divisor_zero);
         if (is_64_bit) {
-          as_.Li(Assembler::t2, uint64_t{1} << 63);
+          as_.LiOptimized(Assembler::t2, uint64_t{1} << 63);
           as_.Bne(Assembler::t0, Assembler::t2, *do_divide);
-          as_.Li(Assembler::t2, UINT64_MAX);
+          as_.LiOptimized(Assembler::t2, UINT64_MAX);
           as_.Beq(Assembler::t1, Assembler::t2, *done);
           as_.Bind(do_divide);
         }
@@ -2069,7 +2267,7 @@ class LiteTranslator {
     } else {
       value = pc + immediate;
     }
-    as_.Li(Assembler::t0, value);
+    as_.LiOptimized(Assembler::t0, value);
     StoreXOrDiscard(rd, Assembler::t0);
     return true;
   }
@@ -2088,10 +2286,8 @@ class LiteTranslator {
       uint32_t imm12 = (insn >> 10) & 0xfff;
       uint32_t rn = (insn >> 5) & 31;
       uint32_t rt = insn & 31;
-      LoadXOrSp(rn, Assembler::t0);
       uint32_t scale = is_simd16 ? 1 : (is_simd32 ? 2 : (is_simd64 ? 3 : 4));
-      as_.Li(Assembler::t1, static_cast<uint64_t>(imm12) << scale);
-      as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
+      LoadXOrSpWithOffset(rn, Assembler::t0, static_cast<uint64_t>(imm12) << scale, Assembler::t1);
       ApplyTbi(Assembler::t0);
       if (is_simd16) {
         EmitSimd16LoadStore(opc == 0, rt, pc);
@@ -2117,9 +2313,7 @@ class LiteTranslator {
       return false;
     }
 
-    LoadXOrSp(rn, Assembler::t0);
-    as_.Li(Assembler::t1, static_cast<uint64_t>(imm12) << size);
-    as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
+    LoadXOrSpWithOffset(rn, Assembler::t0, static_cast<uint64_t>(imm12) << size, Assembler::t1);
     ApplyTbi(Assembler::t0);
     EmitLoadStore(size, opc, rt, pc);
     return true;
@@ -2138,8 +2332,7 @@ class LiteTranslator {
     LoadXOrSp(rn, Assembler::t0);
     as_.Move(Assembler::t1, Assembler::t0);
     if (mode != 1) {
-      as_.Li(Assembler::t2, offset);
-      as_.AddD(Assembler::t1, Assembler::t1, Assembler::t2);
+      AddImmediate(Assembler::t1, Assembler::t1, offset, Assembler::t2);
     }
 
     const bool is_ldg = opc == 1 && mode == 0;
@@ -2152,7 +2345,7 @@ class LiteTranslator {
       // replaces Rt[59:56], preserving every other bit of Rt.
       if (rt != 31) {
         LoadXOrZero(rt, Assembler::t2);
-        as_.Li(Assembler::t3, ~UINT64_C(0x0f00'0000'0000'0000));
+        as_.LiOptimized(Assembler::t3, ~UINT64_C(0x0f00'0000'0000'0000));
         as_.And(Assembler::t2, Assembler::t2, Assembler::t3);
         StoreXOrDiscard(rt, Assembler::t2);
       }
@@ -2165,7 +2358,7 @@ class LiteTranslator {
       // recovery entry to every store. Architectural writeback happens only
       // after all stores succeed.
       const uint64_t alignment_mask = is_stz2g ? ~UINT64_C(0x1f) : ~UINT64_C(0x0f);
-      as_.Li(Assembler::t2, alignment_mask);
+      as_.LiOptimized(Assembler::t2, alignment_mask);
       as_.And(Assembler::t1, Assembler::t1, Assembler::t2);
       ApplyTbi(Assembler::t1);
 
@@ -2177,8 +2370,7 @@ class LiteTranslator {
         as_.StD(Assembler::zero, Assembler::t1, byte_offset);
       }
       if (writeback) {
-        as_.Li(Assembler::t2, offset);
-        as_.AddD(Assembler::t0, Assembler::t0, Assembler::t2);
+        AddImmediate(Assembler::t0, Assembler::t0, offset, Assembler::t2);
         StoreXOrSp(rn, Assembler::t0);
       }
       as_.B(*done);
@@ -2189,8 +2381,7 @@ class LiteTranslator {
     // MTE backing. Their pre/post-index forms still update the base register.
 
     if (writeback) {
-      as_.Li(Assembler::t2, offset);
-      as_.AddD(Assembler::t0, Assembler::t0, Assembler::t2);
+      AddImmediate(Assembler::t0, Assembler::t0, offset, Assembler::t2);
       StoreXOrSp(rn, Assembler::t0);
     }
     return true;
@@ -2212,11 +2403,7 @@ class LiteTranslator {
         return false;
       }
 
-      LoadXOrSp(rn, Assembler::t0);
-      if (mode == 0 || mode == 3) {
-        as_.Li(Assembler::t1, offset);
-        as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
-      }
+      LoadXOrSpWithOffset(rn, Assembler::t0, mode != 0 && mode != 3 ? 0 : offset, Assembler::t1);
       ApplyTbi(Assembler::t0);
       if (is_simd32) {
         EmitSimd32LoadStore(opc == 0, rt, pc);
@@ -2226,9 +2413,7 @@ class LiteTranslator {
         EmitSimd128LoadStore(opc == 2, rt, pc);
       }
       if (writeback) {
-        LoadXOrSp(rn, Assembler::t0);
-        as_.Li(Assembler::t1, offset);
-        as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
+        LoadXOrSpWithOffset(rn, Assembler::t0, offset, Assembler::t1);
         StoreXOrSp(rn, Assembler::t0);
       }
       return true;
@@ -2248,17 +2433,11 @@ class LiteTranslator {
       return false;
     }
 
-    LoadXOrSp(rn, Assembler::t0);
-    if (mode == 0 || mode == 3) {
-      as_.Li(Assembler::t1, offset);
-      as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
-    }
+    LoadXOrSpWithOffset(rn, Assembler::t0, mode != 0 && mode != 3 ? 0 : offset, Assembler::t1);
     ApplyTbi(Assembler::t0);
     EmitLoadStore(size, opc, rt, pc);
     if (writeback) {
-      LoadXOrSp(rn, Assembler::t0);
-      as_.Li(Assembler::t1, offset);
-      as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
+      LoadXOrSpWithOffset(rn, Assembler::t0, offset, Assembler::t1);
       StoreXOrSp(rn, Assembler::t0);
     }
     return true;
@@ -2350,11 +2529,7 @@ class LiteTranslator {
     uint32_t size = opc == 2 ? 3 : 2;
     int64_t offset = imm7 * (int64_t{1} << size);
 
-    LoadXOrSp(rn, Assembler::t0);
-    if (mode != 1) {
-      as_.Li(Assembler::t1, offset);
-      as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
-    }
+    LoadXOrSpWithOffset(rn, Assembler::t0, mode == 1 ? 0 : offset, Assembler::t1);
     ApplyTbi(Assembler::t0);
     Assembler::Label* recovery = AddRecoveryExit(pc);
     Assembler::Label* done = as_.MakeLabel();
@@ -2388,9 +2563,7 @@ class LiteTranslator {
     as_.B(*done);
     as_.Bind(done);
     if (mode == 1 || mode == 3) {
-      LoadXOrSp(rn, Assembler::t0);
-      as_.Li(Assembler::t1, offset);
-      as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
+      LoadXOrSpWithOffset(rn, Assembler::t0, offset, Assembler::t1);
       StoreXOrSp(rn, Assembler::t0);
     }
     return true;
@@ -2499,7 +2672,7 @@ class LiteTranslator {
       ApplyTbi(Assembler::t0);
       as_.LdD(Assembler::t1, Assembler::s8, kReservationValueOffset);
       LoadXOrZero(rt, Assembler::t2);
-      as_.Li(Assembler::t7, size == 0 ? 0xffu : 0xffffu);
+      as_.LiOptimized(Assembler::t7, size == 0 ? 0xffu : 0xffffu);
       as_.And(Assembler::t1, Assembler::t1, Assembler::t7);
       as_.And(Assembler::t2, Assembler::t2, Assembler::t7);
       as_.Move(Assembler::t4, Assembler::t1);
@@ -2765,12 +2938,12 @@ class LiteTranslator {
       // naturally containing word, then extract and merge only the selected
       // field.  Architecturally valid LSE atomics are naturally aligned, so a
       // halfword never crosses that containing word.
-      as_.Li(Assembler::t7, size == 0 ? 0xffu : 0xffffu);
+      as_.LiOptimized(Assembler::t7, size == 0 ? 0xffu : 0xffffu);
       as_.And(Assembler::t1, Assembler::t1, Assembler::t7);
-      as_.Li(Assembler::t3, 3);
+      as_.LiOptimized(Assembler::t3, 3);
       as_.And(Assembler::t8, Assembler::t0, Assembler::t3);
       as_.SlliD(Assembler::t8, Assembler::t8, 3);
-      as_.Li(Assembler::t3, UINT64_MAX - 3);
+      as_.LiOptimized(Assembler::t3, UINT64_MAX - 3);
       as_.And(Assembler::t0, Assembler::t0, Assembler::t3);
 
       as_.Bind(retry);
@@ -2795,7 +2968,7 @@ class LiteTranslator {
 
       as_.SllW(Assembler::t6, Assembler::t6, Assembler::t8);
       as_.SllW(Assembler::t3, Assembler::t7, Assembler::t8);
-      as_.Li(Assembler::t2, UINT64_MAX);
+      as_.LiOptimized(Assembler::t2, UINT64_MAX);
       as_.Xor(Assembler::t3, Assembler::t3, Assembler::t2);
       as_.And(Assembler::t3, Assembler::t4, Assembler::t3);
       as_.Or(Assembler::t3, Assembler::t3, Assembler::t6);
@@ -2872,8 +3045,7 @@ class LiteTranslator {
 
     LoadXOrSp(rn, Assembler::t0);
     if (mode != 1) {
-      as_.Li(Assembler::t1, offset);
-      as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
+      AddImmediate(Assembler::t0, Assembler::t0, offset, Assembler::t1);
     }
     ApplyTbi(Assembler::t0);
     Assembler::Label* recovery = AddRecoveryExit(pc);
@@ -2947,8 +3119,7 @@ class LiteTranslator {
     as_.Bind(done);
     if (mode == 1 || mode == 3) {
       LoadXOrSp(rn, Assembler::t0);
-      as_.Li(Assembler::t1, offset);
-      as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
+      AddImmediate(Assembler::t0, Assembler::t0, offset, Assembler::t1);
       StoreXOrSp(rn, Assembler::t0);
     }
     return true;
@@ -3477,6 +3648,90 @@ class LiteTranslator {
     return true;
   }
 
+  void StoreVectorResult(uint32_t insn, SimdRegister value) {
+    if ((insn & (1u << 30)) == 0) {
+      // Normalize before StoreV so both ThreadState and a cached destination
+      // contain the architectural Q=0 value at the next instruction boundary.
+      as_.VxorV(Assembler::vr3, Assembler::vr3, Assembler::vr3);
+      as_.VpickevD(value, Assembler::vr3, value);
+    }
+    StoreV(insn & 31, value);
+  }
+
+  bool TranslateBicVector(uint32_t insn) {
+    LoadV((insn >> 5) & 31, Assembler::vr1);
+    LoadV((insn >> 16) & 31, Assembler::vr2);
+    as_.VnorV(Assembler::vr2, Assembler::vr2, Assembler::vr2);
+    as_.VandV(Assembler::vr0, Assembler::vr1, Assembler::vr2);
+    StoreVectorResult(insn, Assembler::vr0);
+    return true;
+  }
+
+  bool TranslateBsl8B(uint32_t insn) {
+    LoadV(insn & 31, Assembler::vr0);
+    LoadV((insn >> 5) & 31, Assembler::vr1);
+    LoadV((insn >> 16) & 31, Assembler::vr2);
+    as_.VbitselV(Assembler::vr0, Assembler::vr2, Assembler::vr1, Assembler::vr0);
+    StoreVectorResult(insn, Assembler::vr0);
+    return true;
+  }
+
+  bool TranslateUmovS(uint32_t insn) {
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t lane = (insn >> 19) & 3;
+    const int slot = FindCachedVRegister(rn);
+    if (slot < 0) {
+      as_.LdWU(Assembler::t0, Assembler::s8, VOffset(rn) + lane * sizeof(uint32_t));
+    } else {
+      as_.Vshuf4iW(Assembler::vr0, kCachedVHostRegisters[slot], lane);
+      as_.Movfr2grS(Assembler::t0, Assembler::vr0);
+      ZeroExtend32(Assembler::t0);
+    }
+    StoreXOrDiscard(insn & 31, Assembler::t0);
+    return true;
+  }
+
+  bool TranslateVectorShift32(uint32_t insn) {
+    const bool right = (insn & (1u << 29)) != 0;
+    const uint32_t immediate = (insn >> 16) & 31;
+    LoadV((insn >> 5) & 31, Assembler::vr1);
+    if (!right) {
+      as_.VslliW(Assembler::vr0, Assembler::vr1, immediate);
+    } else if (immediate == 0) {
+      // ARM permits USHR #32.  LSX immediates stop at 31; never wrap it to 0.
+      as_.VxorV(Assembler::vr0, Assembler::vr0, Assembler::vr0);
+    } else {
+      as_.VsrliW(Assembler::vr0, Assembler::vr1, 32 - immediate);
+    }
+    StoreVectorResult(insn, Assembler::vr0);
+    return true;
+  }
+
+  bool TranslateCmtst32(uint32_t insn) {
+    LoadV((insn >> 5) & 31, Assembler::vr1);
+    LoadV((insn >> 16) & 31, Assembler::vr2);
+    as_.VandV(Assembler::vr0, Assembler::vr1, Assembler::vr2);
+    as_.VxorV(Assembler::vr3, Assembler::vr3, Assembler::vr3);
+    as_.VseqW(Assembler::vr0, Assembler::vr0, Assembler::vr3);
+    as_.VnorV(Assembler::vr0, Assembler::vr0, Assembler::vr0);
+    StoreVectorResult(insn, Assembler::vr0);
+    return true;
+  }
+
+  bool TranslateFmax4S(uint32_t insn) {
+    LoadV((insn >> 5) & 31, Assembler::vr1);
+    LoadV((insn >> 16) & 31, Assembler::vr2);
+    as_.VfmaxS(Assembler::vr0, Assembler::vr1, Assembler::vr2);
+    // Like the existing FMIN lowering, compensate LSX max-number behavior:
+    // the interpreter produces a default NaN if either source is NaN.
+    as_.VfcmpCunS(Assembler::vr3, Assembler::vr1, Assembler::vr2);
+    as_.LiOptimized(Assembler::t0, 0x7fc0'0000u);
+    as_.Vreplgr2vrW(Assembler::vr2, Assembler::t0);
+    as_.VbitselV(Assembler::vr0, Assembler::vr0, Assembler::vr2, Assembler::vr3);
+    StoreV(insn & 31, Assembler::vr0);
+    return true;
+  }
+
   bool TranslateVectorNeg32(uint32_t insn) {
     const bool is_128_bit = (insn & 0x4000'0000u) != 0;
     const uint32_t rn = (insn >> 5) & 31;
@@ -3588,10 +3843,10 @@ class LiteTranslator {
     is_double ? as_.VfcmpCunD(Assembler::vr3, Assembler::vr1, Assembler::vr2)
               : as_.VfcmpCunS(Assembler::vr3, Assembler::vr1, Assembler::vr2);
     if (is_double) {
-      as_.Li(Assembler::t0, 0x7ff8'0000'0000'0000ULL);
+      as_.LiOptimized(Assembler::t0, 0x7ff8'0000'0000'0000ULL);
       as_.Vreplgr2vrD(Assembler::vr2, Assembler::t0);
     } else {
-      as_.Li(Assembler::t0, 0x7fc0'0000u);
+      as_.LiOptimized(Assembler::t0, 0x7fc0'0000u);
       as_.Vreplgr2vrW(Assembler::vr2, Assembler::t0);
     }
     as_.VbitselV(Assembler::vr0, Assembler::vr0, Assembler::vr2, Assembler::vr3);
@@ -3631,7 +3886,7 @@ class LiteTranslator {
     LoadV(rm, Assembler::vr2);
     as_.FsubS(Assembler::vr0, Assembler::vr1, Assembler::vr2);
     as_.Movfr2grS(Assembler::t0, Assembler::vr0);
-    as_.Li(Assembler::t1, 0x7fff'ffffu);
+    as_.LiOptimized(Assembler::t1, 0x7fff'ffffu);
     as_.And(Assembler::t0, Assembler::t0, Assembler::t1);
     as_.StW(Assembler::t0, Assembler::s8, VOffset(rd));
     as_.StW(Assembler::zero, Assembler::s8, VOffset(rd) + 4);
@@ -3766,13 +4021,13 @@ class LiteTranslator {
       as_.LdD(Assembler::t0, Assembler::s8, VOffset(rn));
       as_.SrliD(Assembler::t1, Assembler::t0, 63);
       as_.Beqz(Assembler::t1, *convert);
-      as_.Li(Assembler::t1, 1);
+      as_.LiOptimized(Assembler::t1, 1);
       as_.And(Assembler::t1, Assembler::t0, Assembler::t1);
       as_.SrliD(Assembler::t0, Assembler::t0, 1);
       as_.Or(Assembler::t0, Assembler::t0, Assembler::t1);
       as_.Movgr2frD(Assembler::vr0, Assembler::t0);
       as_.FfintDL(Assembler::vr0, Assembler::vr0);
-      as_.Li(Assembler::t1, 0x4000'0000'0000'0000ULL);
+      as_.LiOptimized(Assembler::t1, 0x4000'0000'0000'0000ULL);
       as_.Movgr2frD(Assembler::vr1, Assembler::t1);
       as_.FmulD(Assembler::vr0, Assembler::vr0, Assembler::vr1);
       as_.B(*done);
@@ -3846,19 +4101,19 @@ class LiteTranslator {
       // integer and multiply by two.  At this magnitude the discarded odd
       // bit is below both the binary32 and binary64 precision, so this has the
       // same correctly rounded result as a direct uint64 conversion.
-      as_.Li(Assembler::t1, 1);
+      as_.LiOptimized(Assembler::t1, 1);
       as_.And(Assembler::t1, Assembler::t0, Assembler::t1);
       as_.SrliD(Assembler::t0, Assembler::t0, 1);
       as_.Or(Assembler::t0, Assembler::t0, Assembler::t1);
       as_.Movgr2frD(Assembler::vr0, Assembler::t0);
       if (destination_double) {
         as_.FfintDL(Assembler::vr0, Assembler::vr0);
-        as_.Li(Assembler::t1, 0x4000'0000'0000'0000ULL);  // 2.0
+        as_.LiOptimized(Assembler::t1, 0x4000'0000'0000'0000ULL);  // 2.0
         as_.Movgr2frD(Assembler::vr1, Assembler::t1);
         as_.FmulD(Assembler::vr0, Assembler::vr0, Assembler::vr1);
       } else {
         as_.FfintSL(Assembler::vr0, Assembler::vr0);
-        as_.Li(Assembler::t1, 0x4000'0000u);  // 2.0f
+        as_.LiOptimized(Assembler::t1, 0x4000'0000u);  // 2.0f
         as_.Movgr2frW(Assembler::vr1, Assembler::t1);
         as_.FmulS(Assembler::vr0, Assembler::vr0, Assembler::vr1);
       }
@@ -3894,13 +4149,13 @@ class LiteTranslator {
     // LoongArch converts signed integers to FP.  For a uint64 with bit 63
     // set, convert ceil(x / 2) and double it, preserving the correctly rounded
     // uint64-to-double result used by the unscaled UCVTF lowering.
-    as_.Li(Assembler::t1, 1);
+    as_.LiOptimized(Assembler::t1, 1);
     as_.And(Assembler::t1, Assembler::t0, Assembler::t1);
     as_.SrliD(Assembler::t0, Assembler::t0, 1);
     as_.Or(Assembler::t0, Assembler::t0, Assembler::t1);
     as_.Movgr2frD(Assembler::vr0, Assembler::t0);
     as_.FfintDL(Assembler::vr0, Assembler::vr0);
-    as_.Li(Assembler::t1, 0x4000'0000'0000'0000ULL);  // 2.0
+    as_.LiOptimized(Assembler::t1, 0x4000'0000'0000'0000ULL);  // 2.0
     as_.Movgr2frD(Assembler::vr1, Assembler::t1);
     as_.FmulD(Assembler::vr0, Assembler::vr0, Assembler::vr1);
     as_.B(*converted);
@@ -3913,7 +4168,7 @@ class LiteTranslator {
     // Apply the fixed-point scale after conversion.  Multiplication by 2^-64
     // only changes the exponent for this input range and introduces no extra
     // rounding beyond UCVTF's integer conversion.
-    as_.Li(Assembler::t1, 0x3bf0'0000'0000'0000ULL);  // 2^-64
+    as_.LiOptimized(Assembler::t1, 0x3bf0'0000'0000'0000ULL);  // 2^-64
     as_.Movgr2frD(Assembler::vr1, Assembler::t1);
     as_.FmulD(Assembler::vr0, Assembler::vr0, Assembler::vr1);
     as_.Vst(Assembler::vr0, Assembler::s8, VOffset(rd));
@@ -3998,7 +4253,7 @@ class LiteTranslator {
     uint32_t rn = (insn >> 5) & 31;
     uint32_t rd = insn & 31;
     LoadV(rn, Assembler::vr1);
-    as_.Li(Assembler::t0, 0x7fff'ffffu);
+    as_.LiOptimized(Assembler::t0, 0x7fff'ffffu);
     as_.Vreplgr2vrW(Assembler::vr2, Assembler::t0);
     as_.VandV(Assembler::vr0, Assembler::vr1, Assembler::vr2);
     StoreV(rd, Assembler::vr0);
@@ -4012,7 +4267,7 @@ class LiteTranslator {
     LoadV(rn, Assembler::vr1);
     // FNEG is a pure sign-bit operation.  XOR preserves NaN payloads and
     // signed-zero behavior without raising host floating-point exceptions.
-    as_.Li(Assembler::t0, 0x8000'0000u);
+    as_.LiOptimized(Assembler::t0, 0x8000'0000u);
     as_.Vreplgr2vrW(Assembler::vr2, Assembler::t0);
     as_.VxorV(Assembler::vr0, Assembler::vr1, Assembler::vr2);
     StoreV(rd, Assembler::vr0);
@@ -4044,7 +4299,7 @@ class LiteTranslator {
     const uint32_t rd = insn & 31;
     if (is_double) {
       as_.LdD(Assembler::t0, Assembler::s8, VOffset(rn));
-      as_.Li(Assembler::t1, negate ? 0x8000'0000'0000'0000ULL : 0x7fff'ffff'ffff'ffffULL);
+      as_.LiOptimized(Assembler::t1, negate ? 0x8000'0000'0000'0000ULL : 0x7fff'ffff'ffff'ffffULL);
       if (negate) {
         as_.Xor(Assembler::t0, Assembler::t0, Assembler::t1);
       } else {
@@ -4053,7 +4308,7 @@ class LiteTranslator {
       as_.StD(Assembler::t0, Assembler::s8, VOffset(rd));
     } else {
       as_.LdWU(Assembler::t0, Assembler::s8, VOffset(rn));
-      as_.Li(Assembler::t1, negate ? 0x8000'0000u : 0x7fff'ffffu);
+      as_.LiOptimized(Assembler::t1, negate ? 0x8000'0000u : 0x7fff'ffffu);
       if (negate) {
         as_.Xor(Assembler::t0, Assembler::t0, Assembler::t1);
       } else {
@@ -4144,7 +4399,7 @@ class LiteTranslator {
     // using a full-precision reciprocal.  Match that contract rather than
     // using LoongArch VFRECIP.S, whose implementation-defined estimate bits
     // differ from the interpreter and from ARM hardware.
-    as_.Li(Assembler::t0, 0x3f80'0000u);
+    as_.LiOptimized(Assembler::t0, 0x3f80'0000u);
     as_.Vreplgr2vrW(Assembler::vr2, Assembler::t0);
     as_.VfdivS(Assembler::vr0, Assembler::vr2, Assembler::vr1);
     StoreV(rd, Assembler::vr0);
@@ -4165,7 +4420,7 @@ class LiteTranslator {
 
   bool TranslateMovi16BOne(uint32_t insn) {
     uint32_t rd = insn & 31;
-    as_.Li(Assembler::t0, 1);
+    as_.LiOptimized(Assembler::t0, 1);
     as_.Vreplgr2vrB(Assembler::vr0, Assembler::t0);
     StoreV(rd, Assembler::vr0);
     return true;
@@ -4190,9 +4445,9 @@ class LiteTranslator {
 
   bool TranslateMoviConstant(uint32_t insn, uint64_t low, uint64_t high) {
     const uint32_t rd = insn & 31;
-    as_.Li(Assembler::t0, low);
+    as_.LiOptimized(Assembler::t0, low);
     as_.StD(Assembler::t0, Assembler::s8, VOffset(rd));
-    as_.Li(Assembler::t0, high);
+    as_.LiOptimized(Assembler::t0, high);
     as_.StD(Assembler::t0, Assembler::s8, VOffset(rd) + 8);
     return true;
   }
@@ -4209,7 +4464,7 @@ class LiteTranslator {
       // equivalent for ordinary values but differs for signed zero and NaN
       // sign propagation.  Flip Vn's sign bit explicitly, then use VFMADD to
       // preserve ARM's fused operation and exceptional-value behavior.
-      as_.Li(Assembler::t0, 0x8000'0000u);
+      as_.LiOptimized(Assembler::t0, 0x8000'0000u);
       as_.Vreplgr2vrW(Assembler::vr3, Assembler::t0);
       as_.VxorV(Assembler::vr1, Assembler::vr1, Assembler::vr3);
     }
@@ -4253,15 +4508,15 @@ class LiteTranslator {
       if (is_double) {
         as_.LdD(Assembler::t0, Assembler::s8, VOffset(rn));
         as_.LdD(Assembler::t1, Assembler::s8, VOffset(rm));
-        as_.Li(Assembler::t4, 0x7fff'ffff'ffff'ffffULL);
+        as_.LiOptimized(Assembler::t4, 0x7fff'ffff'ffff'ffffULL);
         as_.And(Assembler::t2, Assembler::t0, Assembler::t4);
-        as_.Li(Assembler::t3, 0x7ff0'0000'0000'0000ULL);
+        as_.LiOptimized(Assembler::t3, 0x7ff0'0000'0000'0000ULL);
       } else {
         as_.LdWU(Assembler::t0, Assembler::s8, VOffset(rn));
         as_.LdWU(Assembler::t1, Assembler::s8, VOffset(rm));
-        as_.Li(Assembler::t4, 0x7fff'ffffu);
+        as_.LiOptimized(Assembler::t4, 0x7fff'ffffu);
         as_.And(Assembler::t2, Assembler::t0, Assembler::t4);
-        as_.Li(Assembler::t3, 0x7f80'0000u);
+        as_.LiOptimized(Assembler::t3, 0x7f80'0000u);
       }
       as_.Bltu(Assembler::t3, Assembler::t2, *lhs_nan);
       as_.And(Assembler::t2, Assembler::t1, Assembler::t4);
@@ -4447,11 +4702,11 @@ class LiteTranslator {
     as_.LdWU(Assembler::t0, Assembler::s8, VOffset(rn));
     as_.SrliD(Assembler::t1, Assembler::t0, 31);
     as_.Bnez(Assembler::t1, *nan_or_negative);
-    as_.Li(Assembler::t1, 0x4f80'0000u);  // 2^32
+    as_.LiOptimized(Assembler::t1, 0x4f80'0000u);  // 2^32
     as_.Bltu(Assembler::t0, Assembler::t1, *fast_path);
-    as_.Li(Assembler::t1, 0x7f80'0000u);  // +infinity
+    as_.LiOptimized(Assembler::t1, 0x7f80'0000u);  // +infinity
     as_.Bltu(Assembler::t1, Assembler::t0, *nan_or_negative);
-    as_.Li(Assembler::t0, UINT32_MAX);
+    as_.LiOptimized(Assembler::t0, UINT32_MAX);
     as_.B(*done);
 
     as_.Bind(nan_or_negative);
@@ -4494,16 +4749,16 @@ class LiteTranslator {
     as_.Movcf2gr(Assembler::t0);
     as_.Bnez(Assembler::t0, *less);
 
-    as_.Li(Assembler::t0, CPUState::kFlagCarry);
+    as_.LiOptimized(Assembler::t0, CPUState::kFlagCarry);
     as_.B(*done);
     as_.Bind(less);
-    as_.Li(Assembler::t0, CPUState::kFlagNegative);
+    as_.LiOptimized(Assembler::t0, CPUState::kFlagNegative);
     as_.B(*done);
     as_.Bind(equal);
-    as_.Li(Assembler::t0, CPUState::kFlagZero | CPUState::kFlagCarry);
+    as_.LiOptimized(Assembler::t0, CPUState::kFlagZero | CPUState::kFlagCarry);
     as_.B(*done);
     as_.Bind(unordered);
-    as_.Li(Assembler::t0, CPUState::kFlagCarry | CPUState::kFlagOverflow);
+    as_.LiOptimized(Assembler::t0, CPUState::kFlagCarry | CPUState::kFlagOverflow);
     as_.Bind(done);
     as_.StW(Assembler::t0, Assembler::s8, kFlagsOffset);
     return true;
@@ -4515,7 +4770,7 @@ class LiteTranslator {
     const uint32_t b6 = (imm8 >> 6) & 1;
     const uint32_t bits =
         ((imm8 & 0x80) << 24) | ((b6 ^ 1) << 30) | (b6 ? 0x3e00'0000u : 0) | ((imm8 & 0x3f) << 19);
-    as_.Li(Assembler::t0, bits);
+    as_.LiOptimized(Assembler::t0, bits);
     as_.StW(Assembler::t0, Assembler::s8, VOffset(rd));
     as_.StW(Assembler::zero, Assembler::s8, VOffset(rd) + 4);
     as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
@@ -4535,20 +4790,20 @@ class LiteTranslator {
     // guarantees, so classify the IEEE-754 bits before using it for the common
     // finite range (-2^31, 2^31).
     as_.LdWU(Assembler::t0, Assembler::s8, VOffset(rn));
-    as_.Li(Assembler::t1, 0x7fff'ffffu);
+    as_.LiOptimized(Assembler::t1, 0x7fff'ffffu);
     as_.And(Assembler::t2, Assembler::t0, Assembler::t1);
-    as_.Li(Assembler::t1, 0x4f00'0000u);
+    as_.LiOptimized(Assembler::t1, 0x4f00'0000u);
     as_.Bltu(Assembler::t2, Assembler::t1, *fast_path);
 
-    as_.Li(Assembler::t1, 0x7f80'0000u);
+    as_.LiOptimized(Assembler::t1, 0x7f80'0000u);
     as_.Bltu(Assembler::t1, Assembler::t2, *nan);
     as_.SrliD(Assembler::t1, Assembler::t0, 31);
     as_.Bnez(Assembler::t1, *negative_overflow);
-    as_.Li(Assembler::t0, 0x7fff'ffffu);
+    as_.LiOptimized(Assembler::t0, 0x7fff'ffffu);
     as_.B(*done);
 
     as_.Bind(negative_overflow);
-    as_.Li(Assembler::t0, 0x8000'0000u);
+    as_.LiOptimized(Assembler::t0, 0x8000'0000u);
     as_.B(*done);
 
     as_.Bind(nan);
@@ -4869,7 +5124,7 @@ class LiteTranslator {
     bool link = (insn >> 31) != 0;
     int64_t displacement = SignExtend(insn & 0x03ff'ffff, 26) * 4;
     if (link) {
-      as_.Li(Assembler::t0, pc + 4);
+      as_.LiOptimized(Assembler::t0, pc + 4);
       StoreXOrDiscard(30, Assembler::t0);
     }
     GuestAddr target = pc + displacement;
@@ -4926,51 +5181,56 @@ class LiteTranslator {
   }
 
   void EmitCondition(uint32_t condition) {
+    // ARM treats both AL and NV as unconditional here.
+    if (condition >= 0xe) {
+      as_.AddiD(Assembler::t2, Assembler::zero, 1);
+      return;
+    }
     as_.LdWU(Assembler::t1, Assembler::s8, kFlagsOffset);
-
-    // Normalize N/Z/C/V into individual zero-or-one registers.
-    as_.SrliD(Assembler::t2, Assembler::t1, 3);  // N
-    as_.SrliD(Assembler::t3, Assembler::t1, 2);  // Z
-    as_.SrliD(Assembler::t4, Assembler::t1, 1);  // C
-    as_.Li(Assembler::t5, 1);
-    as_.And(Assembler::t2, Assembler::t2, Assembler::t5);
-    as_.And(Assembler::t3, Assembler::t3, Assembler::t5);
-    as_.And(Assembler::t4, Assembler::t4, Assembler::t5);
-    as_.And(Assembler::t1, Assembler::t1, Assembler::t5);  // V
-
+    // Only extract the bits used by this condition. The result in t2 is
+    // normalized to zero or one; architectural flags remain untouched.
     switch (condition >> 1) {
       case 0:  // EQ/NE: Z
-        as_.Move(Assembler::t2, Assembler::t3);
+        as_.SrliD(Assembler::t2, Assembler::t1, 2);
         break;
       case 1:  // CS/CC: C
-        as_.Move(Assembler::t2, Assembler::t4);
+        as_.SrliD(Assembler::t2, Assembler::t1, 1);
         break;
       case 2:  // MI/PL: N
+        as_.SrliD(Assembler::t2, Assembler::t1, 3);
         break;
       case 3:  // VS/VC: V
-        as_.Move(Assembler::t2, Assembler::t1);
-        break;
+        as_.Andi(Assembler::t2, Assembler::t1, 1);
+        if ((condition & 1) != 0) {
+          as_.Xori(Assembler::t2, Assembler::t2, 1);
+        }
+        return;
       case 4:  // HI/LS: C && !Z
-        as_.Xor(Assembler::t3, Assembler::t3, Assembler::t5);
-        as_.And(Assembler::t2, Assembler::t4, Assembler::t3);
-        break;
-      case 5:  // GE/LT: N == V
-        as_.Xor(Assembler::t2, Assembler::t2, Assembler::t1);
-        as_.Xor(Assembler::t2, Assembler::t2, Assembler::t5);
-        break;
-      case 6:  // GT/LE: !Z && N == V
-        as_.Xor(Assembler::t2, Assembler::t2, Assembler::t1);
-        as_.Xor(Assembler::t2, Assembler::t2, Assembler::t5);
-        as_.Xor(Assembler::t3, Assembler::t3, Assembler::t5);
+        as_.SrliD(Assembler::t2, Assembler::t1, 1);
+        as_.SrliD(Assembler::t3, Assembler::t1, 2);
+        as_.Xori(Assembler::t3, Assembler::t3, 1);
         as_.And(Assembler::t2, Assembler::t2, Assembler::t3);
         break;
-      case 7:  // AL/NV
-        as_.Move(Assembler::t2, Assembler::t5);
+      case 5:  // GE/LT: N == V / N != V
+        as_.SrliD(Assembler::t2, Assembler::t1, 3);
+        as_.Xor(Assembler::t2, Assembler::t2, Assembler::t1);
+        if ((condition & 1) == 0) {
+          as_.Xori(Assembler::t2, Assembler::t2, 1);
+        }
+        as_.Andi(Assembler::t2, Assembler::t2, 1);
+        return;
+      case 6:  // GT/LE: !Z && N == V
+        as_.SrliD(Assembler::t2, Assembler::t1, 3);
+        as_.Xor(Assembler::t2, Assembler::t2, Assembler::t1);
+        as_.Xori(Assembler::t2, Assembler::t2, 1);
+        as_.SrliD(Assembler::t3, Assembler::t1, 2);
+        as_.Xori(Assembler::t3, Assembler::t3, 1);
+        as_.And(Assembler::t2, Assembler::t2, Assembler::t3);
         break;
     }
-    // Odd conditions are the inverse, except NV which ARM treats as always.
-    if ((condition & 1) != 0 && condition != 0xf) {
-      as_.Xor(Assembler::t2, Assembler::t2, Assembler::t5);
+    as_.Andi(Assembler::t2, Assembler::t2, 1);
+    if ((condition & 1) != 0) {
+      as_.Xori(Assembler::t2, Assembler::t2, 1);
     }
   }
 
@@ -4990,7 +5250,7 @@ class LiteTranslator {
 
     LoadXOrZero(rn, Assembler::t0);
     if (is_immediate) {
-      as_.Li(Assembler::t1, rm_or_imm);
+      as_.LiOptimized(Assembler::t1, rm_or_imm);
     } else {
       LoadXOrZero(rm_or_imm, Assembler::t1);
     }
@@ -5015,7 +5275,7 @@ class LiteTranslator {
     as_.B(*done);
 
     as_.Bind(use_immediate_flags);
-    as_.Li(Assembler::t0, nzcv);
+    as_.LiOptimized(Assembler::t0, nzcv);
     as_.StW(Assembler::t0, Assembler::s8, kFlagsOffset);
     as_.Bind(done);
     return true;
@@ -5041,7 +5301,7 @@ class LiteTranslator {
     if (invert_or_negate && increment_or_negate) {  // CSNEG
       as_.SubD(Assembler::t0, Assembler::zero, Assembler::t0);
     } else if (invert_or_negate) {  // CSINV
-      as_.Li(Assembler::t1, UINT64_MAX);
+      as_.LiOptimized(Assembler::t1, UINT64_MAX);
       as_.Xor(Assembler::t0, Assembler::t0, Assembler::t1);
     } else if (increment_or_negate) {  // CSINC
       as_.AddiD(Assembler::t0, Assembler::t0, 1);
@@ -5063,7 +5323,7 @@ class LiteTranslator {
       if (delta >= -2048 && delta <= 2047) {
         as_.AddiD(Assembler::t0, Assembler::s7, static_cast<int32_t>(delta));
       } else {
-        as_.Li(Assembler::t0, pc + 4);
+        as_.LiOptimized(Assembler::t0, pc + 4);
       }
       StoreXOrDiscard(30, Assembler::t0);
     }
@@ -5077,6 +5337,10 @@ class LiteTranslator {
   CachedXRegisterMap cached_x_registers_;
   CachedVRegisterMap cached_v_registers_;
   XRegisterUsage* x_register_usage_;
+  GuestAddr block_start_pc_;
+  GuestAddr next_block_pc_ = 0;
+  std::vector<std::pair<GuestAddr, uint32_t>> pending_x_loads_;
+  size_t next_x_load_ = 0;
   std::vector<LocalCodeLabel> local_code_labels_;
   std::vector<PendingRecoveryExit> pending_recovery_exits_;
   std::vector<PendingLocalBackedge> pending_local_backedges_;
@@ -5098,12 +5362,12 @@ std::tuple<bool, GuestAddr> TryLiteTranslateRegion(GuestAddr start_pc,
   cached_x_registers.fill(-1);
   CachedVRegisterMap cached_v_registers{};
   cached_v_registers.fill(-1);
+  XRegisterUsage usage;
   if (params.enable_reg_mapping) {
     // Reuse the real decoder to obtain exact GPR reads and writes.  This avoids
     // mistaking immediate/opcode fields for registers and automatically keeps
     // the analysis in sync as new instruction lowerings are added.
     MachineCode analysis_code;
-    XRegisterUsage usage;
     CachedXRegisterMap no_cached_x_registers{};
     no_cached_x_registers.fill(-1);
     CachedVRegisterMap no_cached_v_registers{};
@@ -5124,6 +5388,7 @@ std::tuple<bool, GuestAddr> TryLiteTranslateRegion(GuestAddr start_pc,
       }
       analysis_pc += sizeof(insn);
     }
+    usage.HoistLoopInitialLoads();
     cached_x_registers = SelectCachedXRegisters(usage);
     cached_v_registers = SelectCachedVRegisters(start_pc, analysis_pc);
   }
@@ -5132,7 +5397,9 @@ std::tuple<bool, GuestAddr> TryLiteTranslateRegion(GuestAddr start_pc,
                             cached_x_registers,
                             cached_v_registers,
                             params.enable_guest_memory,
-                            params.allow_dispatch);
+                            params.allow_dispatch,
+                            nullptr,
+                            params.enable_reg_mapping ? &usage : nullptr);
   if (params.enable_self_profiling) {
     translator.EmitSelfProfiling(params);
   }
