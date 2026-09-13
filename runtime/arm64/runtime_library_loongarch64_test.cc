@@ -2557,6 +2557,36 @@ TEST(LoongArch64RuntimeLibraryTest, LiteHotFallbackScalarFpFormsMatchInterpreter
   }
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteUcvtfDFromXFixed64MatchesInterpreter) {
+  constexpr uint32_t kUcvtfD0X21Fixed64 = 0x9e43'02a0;
+  constexpr std::array<uint64_t, 7> kInputs = {
+      0,
+      1,
+      uint64_t{1} << 52,
+      (uint64_t{1} << 63) - 1,
+      uint64_t{1} << 63,
+      (uint64_t{1} << 63) + 1,
+      UINT64_MAX,
+  };
+
+  for (uint64_t input : kInputs) {
+    const std::array<uint32_t, 1> code = {kUcvtfD0X21Fixed64};
+    ThreadState interpreted{};
+    ThreadState translated{};
+    interpreted.cpu.x[21] = input;
+    translated.cpu.x[21] = input;
+    interpreted.cpu.v[0] = MakeUint128(UINT64_MAX, UINT64_MAX);
+    translated.cpu.v[0] = interpreted.cpu.v[0];
+    SetInsnAddr(interpreted.cpu, ToGuestAddr(code.data()));
+
+    InterpretInsn(&interpreted);
+    TranslateAndRun(code, &translated);
+
+    SCOPED_TRACE(testing::Message() << "input=" << std::hex << input);
+    EXPECT_EQ(translated.cpu.v[0], interpreted.cpu.v[0]);
+  }
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteLogicalRotateOperandsMatchInterpreter) {
   constexpr std::array<uint32_t, 4> kGuestCode = {
       0x4ac1'08a5,  // eor w5, w5, w1, ror #2 (observed Unity opcode)

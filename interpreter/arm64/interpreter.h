@@ -3457,7 +3457,11 @@ class Interpreter {
   void FpFixedPointConversion(const Decoder::FpFixedPointArgs& args) {
     CHECK(!exception_raised_);
     using Op = Decoder::FpFixedPointOp;
-    double scale = static_cast<double>(1ULL << args.fbits);
+    // fbits may be 64 for the X-register fixed-point forms.  Shifting a
+    // uint64_t by 64 is undefined and used to turn UCVTF Dd, Xn, #64 into an
+    // unscaled conversion on LoongArch64.  ldexp constructs the power of two
+    // exactly across the complete architectural range.
+    double scale = std::ldexp(1.0, args.fbits);
 
     switch (args.op) {
       case Op::kScvtf: {

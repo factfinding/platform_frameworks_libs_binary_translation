@@ -185,6 +185,14 @@ CachedVRegisterMap SelectCachedVRegisters(GuestAddr start_pc, GuestAddr end_pc) 
       mark_written(insn);
       continue;
     }
+    // UCVTF Dd, Xn, #64 has a GPR source and a full-width scalar-FP
+    // destination.  It is encoded in the fixed-point family rather than the
+    // unscaled FpIntConversion family above, so keep the conservative SIMD
+    // scanner from treating opcode bits as a vector source.
+    if ((insn & 0xffff'fc00u) == 0x9e43'0000u) {
+      mark_written(insn);
+      continue;
+    }
     // DUP from a general register and modified-immediate constants have no
     // vector source.  UMOV is the opposite: it reads a vector but writes a
     // general register.  Handle them before the conservative SIMD rule.
@@ -833,6 +841,12 @@ class LiteTranslator {
     }
     if ((insn & 0x7fbf'fc00u) == 0x1e23'0000u) {
       return TranslateUcvtfScalarGeneral(insn);
+    }
+    // UCVTF Dd, Xn, #64 is heavily used by Chromium's random-number and
+    // normalization paths.  Without this fixed-point form a single loop can
+    // execute millions of interpreter fallbacks and trip Android's ANR timer.
+    if ((insn & 0xffff'fc00u) == 0x9e43'0000u) {
+      return TranslateUcvtfDFromXFixed64(insn);
     }
     if ((insn & 0xbf20'fc00u) == 0x2e20'dc00u) {
       return TranslateVectorFpBinary(insn, 0);  // FMUL
@@ -3864,6 +3878,46 @@ class LiteTranslator {
       as_.StW(Assembler::zero, Assembler::s8, VOffset(rd) + 4);
       as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
     }
+    return true;
+  }
+
+  bool TranslateUcvtfDFromXFixed64(uint32_t insn) {
+    const uint32_t rn = (insn >> 5) & 31;
+    const uint32_t rd = insn & 31;
+    Assembler::Label* direct = as_.MakeLabel();
+    Assembler::Label* converted = as_.MakeLabel();
+
+    LoadXOrZero(rn, Assembler::t0);
+    as_.SrliD(Assembler::t1, Assembler::t0, 63);
+    as_.Beqz(Assembler::t1, *direct);
+
+    // LoongArch converts signed integers to FP.  For a uint64 with bit 63
+    // set, convert ceil(x / 2) and double it, preserving the correctly rounded
+    // uint64-to-double result used by the unscaled UCVTF lowering.
+    as_.Li(Assembler::t1, 1);
+    as_.And(Assembler::t1, Assembler::t0, Assembler::t1);
+    as_.SrliD(Assembler::t0, Assembler::t0, 1);
+    as_.Or(Assembler::t0, Assembler::t0, Assembler::t1);
+    as_.Movgr2frD(Assembler::vr0, Assembler::t0);
+    as_.FfintDL(Assembler::vr0, Assembler::vr0);
+    as_.Li(Assembler::t1, 0x4000'0000'0000'0000ULL);  // 2.0
+    as_.Movgr2frD(Assembler::vr1, Assembler::t1);
+    as_.FmulD(Assembler::vr0, Assembler::vr0, Assembler::vr1);
+    as_.B(*converted);
+
+    as_.Bind(direct);
+    as_.Movgr2frD(Assembler::vr0, Assembler::t0);
+    as_.FfintDL(Assembler::vr0, Assembler::vr0);
+    as_.Bind(converted);
+
+    // Apply the fixed-point scale after conversion.  Multiplication by 2^-64
+    // only changes the exponent for this input range and introduces no extra
+    // rounding beyond UCVTF's integer conversion.
+    as_.Li(Assembler::t1, 0x3bf0'0000'0000'0000ULL);  // 2^-64
+    as_.Movgr2frD(Assembler::vr1, Assembler::t1);
+    as_.FmulD(Assembler::vr0, Assembler::vr0, Assembler::vr1);
+    as_.Vst(Assembler::vr0, Assembler::s8, VOffset(rd));
+    as_.StD(Assembler::zero, Assembler::s8, VOffset(rd) + 8);
     return true;
   }
 
