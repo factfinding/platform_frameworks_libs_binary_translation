@@ -35,6 +35,30 @@ TranslationCache* TranslationCache::GetInstance() {
   return g_translation_cache;
 }
 
+void TranslationCache::PrepareForFork() {
+  mutex_.lock();
+}
+
+void TranslationCache::FinishFork(bool is_child) {
+  if (is_child) {
+    // The threads producing these entries no longer exist. This also covers
+    // wrapping and invalidation-in-progress, which are not in translating_.
+    // Keep finished translations and wrappers: generated code may reference
+    // their entry objects and counters. The maps use lock-free ForeverPool
+    // deallocation, so removing unfinished entries needs no allocator lock.
+    translating_.clear();
+    for (auto it = guest_entries_.begin(); it != guest_entries_.end();) {
+      auto current = it++;
+      auto& entry = current->second;
+      if (entry.kind == GuestCodeEntry::Kind::kUnderProcessing) {
+        entry.host_code->store(kEntryNotTranslated);
+        guest_entries_.erase(current);
+      }
+    }
+  }
+  mutex_.unlock();
+}
+
 GuestCodeEntry* TranslationCache::AddAndLockForTranslation(GuestAddr pc,
                                                            uint32_t counter_threshold) {
   // Make sure host code is updated under the mutex, so that it's in sync with

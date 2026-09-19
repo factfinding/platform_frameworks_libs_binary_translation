@@ -45,6 +45,9 @@
 #include "berberis/runtime_primitives/host_code.h"
 #include "berberis/runtime_primitives/known_guest_function_wrapper.h"
 #include "berberis/runtime_primitives/runtime_library.h"
+#if defined(__loongarch__) && defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+#include "berberis/runtime_primitives/native_art_hooks.h"
+#endif
 
 #include "guest_jni_trampolines.h"
 
@@ -105,21 +108,33 @@ void ConvertDalvikShortyToWrapperSignature(char* dst,
 }
 
 void RunGuestJNIFunction(GuestAddr pc, GuestArgumentBuffer* buf) {
+#if defined(__loongarch__) && defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+  PrepareNativeArtHooks();
+#endif
   auto [host_jni_env] = HostArgumentsValues<void(JNIEnv*)>(buf);
   {
     auto&& [guest_jni_env] = GuestArgumentsReferences<void(JNIEnv*)>(buf);
     guest_jni_env = ToGuestJNIEnv(host_jni_env);
   }
   RunGuestCall(pc, buf);
+#if defined(__loongarch__) && defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+  SyncNativeArtHooks();
+#endif
 }
 
 void RunGuestJNIOnLoad(GuestAddr pc, GuestArgumentBuffer* buf) {
+#if defined(__loongarch__) && defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+  PrepareNativeArtHooks();
+#endif
   auto [host_java_vm, reserved] = HostArgumentsValues<decltype(JNI_OnLoad)>(buf);
   {
     auto&& [guest_java_vm, reserved] = GuestArgumentsReferences<decltype(JNI_OnLoad)>(buf);
     guest_java_vm = ToGuestJavaVM(host_java_vm);
   }
   RunGuestCall(pc, buf);
+#if defined(__loongarch__) && defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+  SyncNativeArtHooks();
+#endif
 }
 
 }  // namespace

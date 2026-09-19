@@ -18,6 +18,11 @@ include frameworks/libs/binary_translation/berberis_config.mk
 
 PRODUCT_PACKAGES += $(BERBERIS_PRODUCT_PACKAGES_ARM64_TO_X86_64)
 
+# The native LoongArch64 variant is disabled, so selecting librs_jni through
+# handheld_system.mk does not install its independently named guest variant.
+# ARM64 applications load this JNI library lazily through the native bridge.
+PRODUCT_PACKAGES += librs_jni.native_bridge
+
 # Override the disabled default from runtime_libart.mk.
 PRODUCT_SYSTEM_PROPERTIES += \
     ro.dalvik.vm.native.bridge=libberberis_arm64.so \
@@ -30,7 +35,8 @@ PRODUCT_SYSTEM_PROPERTIES += \
 PRODUCT_SOONG_NAMESPACES += frameworks/libs/native_bridge_support/android_api/libc
 
 PRODUCT_ARTIFACT_PATH_REQUIREMENT_ALLOWED_LIST += \
-    $(BERBERIS_DISTRIBUTION_ARTIFACTS_ARM64)
+    $(BERBERIS_DISTRIBUTION_ARTIFACTS_ARM64) \
+    system/lib64/arm64/librs_jni.so
 
 BUILD_BERBERIS := true
 BUILD_BERBERIS_ARM64_TO_LOONGARCH64 := true

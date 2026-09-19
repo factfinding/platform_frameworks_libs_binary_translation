@@ -164,8 +164,8 @@ CachedVRegisterMap SelectCachedVRegisters(GuestAddr start_pc, GuestAddr end_pc) 
     // through StoreV(), which writes ThreadState first and then refreshes a
     // mapped LSX register.  Unlike partial/lane writes they are therefore
     // safe to cache even when Vd is also a destination.
-    if ((insn & 0xffa0'fc00u) == 0x4e20'cc00u ||
-        (insn & 0xffa0'fc00u) == 0x4ea0'cc00u) {  // FMLA/FMLS Vd.4S
+    if ((insn & 0xffe0'fc00u) == 0x4e20'cc00u ||
+        (insn & 0xffe0'fc00u) == 0x4ea0'cc00u) {  // FMLA/FMLS Vd.4S
       mark_written(insn, true);
       mark_read(insn);
       mark_read(insn >> 5);
@@ -669,7 +669,9 @@ class LiteTranslator {
     // TBL Vd.16B, {Vn.16B ... V(n+len).16B}, Vm.16B.  HEVC's NEON
     // deblocking filters use the four-register form in their innermost byte
     // permutation loop.  TBX and the 8-byte form remain in the interpreter.
-    if ((insn & 0xffc0'9c00u) == 0x4e00'0000u) {
+    // Bit 21 distinguishes TBL from widening/narrowing arithmetic such as
+    // ADDHN2. It is not part of Rm or the table length.
+    if ((insn & 0xffe0'9c00u) == 0x4e00'0000u) {
       return TranslateTbl16B(insn);
     }
     if ((insn & 0xbfe0'fc00u) == 0x0e60'1c00u) {
@@ -848,8 +850,9 @@ class LiteTranslator {
     if ((insn & 0xffff'ffe0u) == 0x0f07'f600u) {
       return TranslateMoviConstant(insn, 0xbf80'0000'bf80'0000ULL, 0);
     }
-    // Bit 23 distinguishes FMLA (0) from FMLS (1).
-    if ((insn & 0xffa0'fc00u) == 0x4e20'cc00u || (insn & 0xffa0'fc00u) == 0x4ea0'cc00u) {
+    // Bit 23 distinguishes FMLA (0) from FMLS (1). Bit 22 must be zero:
+    // this lowering only handles 4S, while 2D uses the interpreter.
+    if ((insn & 0xffe0'fc00u) == 0x4e20'cc00u || (insn & 0xffe0'fc00u) == 0x4ea0'cc00u) {
       return TranslateFmlaFmls4S(insn);
     }
     // Scalar FP arithmetic is pervasive in Unity startup code.  Use scalar
@@ -1557,23 +1560,27 @@ class LiteTranslator {
     uint32_t rn = (insn >> 5) & 31;
     uint32_t rd = insn & 31;
     uint64_t imm = static_cast<uint64_t>((insn >> 10) & 0xfff) << (shift * 12);
-    LoadXOrSp(rn, Assembler::t0);
-    if (set_flags) {
-      as_.Move(Assembler::t4, Assembler::t0);
-    }
     const int64_t delta = is_sub ? -static_cast<int64_t>(imm) : static_cast<int64_t>(imm);
-    if (set_flags) {
-      // The flags calculation still needs the original, positive RHS.
-      as_.LiOptimized(Assembler::t1, imm);
-      if (delta >= -2048 && delta <= 2047) {
-        as_.AddiD(Assembler::t0, Assembler::t0, delta);
-      } else if (is_sub) {
-        as_.SubD(Assembler::t0, Assembler::t0, Assembler::t1);
-      } else {
-        as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
-      }
+    if (rn == 31 && !set_flags) {
+      // Consume cached SP without copying it, but keep the result in a
+      // temporary until StoreXOrSp has committed architectural state.
+      AddImmediate(Assembler::t0, ReadXOrSp(rn, Assembler::t0), delta, Assembler::t1);
     } else {
-      AddImmediate(Assembler::t0, Assembler::t0, delta, Assembler::t1);
+      LoadXOrSp(rn, Assembler::t0);
+      if (set_flags) {
+        as_.Move(Assembler::t4, Assembler::t0);
+        // The flags calculation still needs the original, positive RHS.
+        as_.LiOptimized(Assembler::t1, imm);
+        if (delta >= -2048 && delta <= 2047) {
+          as_.AddiD(Assembler::t0, Assembler::t0, delta);
+        } else if (is_sub) {
+          as_.SubD(Assembler::t0, Assembler::t0, Assembler::t1);
+        } else {
+          as_.AddD(Assembler::t0, Assembler::t0, Assembler::t1);
+        }
+      } else {
+        AddImmediate(Assembler::t0, Assembler::t0, delta, Assembler::t1);
+      }
     }
     if (!is_64_bit) {
       ZeroExtend32(Assembler::t0);
@@ -2363,7 +2370,6 @@ class LiteTranslator {
       ApplyTbi(Assembler::t1);
 
       Assembler::Label* recovery = AddRecoveryExit(pc);
-      Assembler::Label* done = as_.MakeLabel();
       const uint32_t byte_count = is_stz2g ? 32 : 16;
       for (uint32_t byte_offset = 0; byte_offset < byte_count; byte_offset += 8) {
         as_.SetRecoveryPoint(recovery);
@@ -2373,8 +2379,6 @@ class LiteTranslator {
         AddImmediate(Assembler::t0, Assembler::t0, offset, Assembler::t2);
         StoreXOrSp(rn, Assembler::t0);
       }
-      as_.B(*done);
-      as_.Bind(done);
       return true;
     }
     // STG/ST2G/STGM/STZGM are tag-only operations and become NOPs without
@@ -2532,7 +2536,6 @@ class LiteTranslator {
     LoadXOrSpWithOffset(rn, Assembler::t0, mode == 1 ? 0 : offset, Assembler::t1);
     ApplyTbi(Assembler::t0);
     Assembler::Label* recovery = AddRecoveryExit(pc);
-    Assembler::Label* done = as_.MakeLabel();
     if (load) {
       as_.SetRecoveryPoint(recovery);
       if (size == 3) {
@@ -2560,8 +2563,6 @@ class LiteTranslator {
         as_.StW(Assembler::t2, Assembler::t0, 4);
       }
     }
-    as_.B(*done);
-    as_.Bind(done);
     if (mode == 1 || mode == 3) {
       LoadXOrSpWithOffset(rn, Assembler::t0, offset, Assembler::t1);
       StoreXOrSp(rn, Assembler::t0);
@@ -2580,7 +2581,6 @@ class LiteTranslator {
     ApplyTbi(Assembler::t0);
 
     Assembler::Label* recovery = AddRecoveryExit(pc);
-    Assembler::Label* done = as_.MakeLabel();
     as_.SetRecoveryPoint(recovery);
     switch (size) {
       case 0:
@@ -2606,8 +2606,6 @@ class LiteTranslator {
             Assembler::s8,
             offsetof(ThreadState, cpu) + offsetof(CPUState, reservation_value));
     StoreXOrDiscard(rt, Assembler::t1);
-    as_.B(*done);
-    as_.Bind(done);
     return true;
   }
 
@@ -2621,7 +2619,6 @@ class LiteTranslator {
     LoadXOrZero(rt, Assembler::t1);
 
     Assembler::Label* recovery = AddRecoveryExit(pc);
-    Assembler::Label* done = as_.MakeLabel();
     as_.SetRecoveryPoint(recovery);
     switch (size) {
       case 0:
@@ -2641,8 +2638,6 @@ class LiteTranslator {
     // the platform's established atomic lowering (for example Go's loong64
     // runtime).  It is lighter than a full DBAR 0 in this very hot path.
     as_.Dbar(0x12);
-    as_.B(*done);
-    as_.Bind(done);
     return true;
   }
 
@@ -2697,7 +2692,6 @@ class LiteTranslator {
       as_.Bind(success);
       as_.StD(Assembler::zero, Assembler::s8, kReservationAddressOffset);
       StoreXOrDiscard(rs, Assembler::zero);
-      as_.B(*done);
       as_.Bind(done);
       return true;
     }
@@ -2753,7 +2747,6 @@ class LiteTranslator {
     }
     as_.StD(Assembler::zero, Assembler::s8, kReservationAddressOffset);
     StoreXOrDiscard(rs, Assembler::zero);
-    as_.B(*done);
     as_.Bind(done);
     return true;
   }
@@ -2776,7 +2769,6 @@ class LiteTranslator {
     as_.Move(Assembler::t3, Assembler::t0);
     ApplyTbi(Assembler::t0);
     Assembler::Label* recovery = AddRecoveryExit(pc);
-    Assembler::Label* done = as_.MakeLabel();
     as_.SetRecoveryPoint(recovery);
     as_.LlD(Assembler::t1, Assembler::t0);
     if (size == 2) {
@@ -2801,8 +2793,6 @@ class LiteTranslator {
     }
     StoreXOrDiscard(rt, Assembler::t1);
     StoreXOrDiscard(rt2, Assembler::t2);
-    as_.B(*done);
-    as_.Bind(done);
     return true;
   }
 
@@ -2881,7 +2871,6 @@ class LiteTranslator {
     }
     as_.StD(Assembler::zero, Assembler::s8, kReservationAddressOffset);
     StoreXOrDiscard(rs, Assembler::zero);
-    as_.B(*done);
     as_.Bind(done);
     return true;
   }
@@ -2915,7 +2904,6 @@ class LiteTranslator {
     // libc++ synchronization.  B/H still require a containing-word LL/SC.
     if (size >= 2 && operation != AtomicMemoryOp::kCas) {
       Assembler::Label* recovery = AddRecoveryExit(pc);
-      Assembler::Label* done = as_.MakeLabel();
       as_.SetRecoveryPoint(recovery);
       if (operation == AtomicMemoryOp::kSwp) {
         size == 2 ? as_.AmswapDbW(Assembler::t5, Assembler::t1, Assembler::t0)
@@ -2928,8 +2916,6 @@ class LiteTranslator {
         ZeroExtend32(Assembler::t5);
       }
       StoreXOrDiscard(rt, Assembler::t5);
-      as_.B(*done);
-      as_.Bind(done);
       return true;
     }
 
@@ -3024,7 +3010,6 @@ class LiteTranslator {
       as_.Dbar(0x14);
     }
     StoreXOrDiscard(operation == AtomicMemoryOp::kCas ? rs : rt, Assembler::t5);
-    as_.B(*done);
     as_.Bind(done);
     return true;
   }
@@ -3049,7 +3034,6 @@ class LiteTranslator {
     }
     ApplyTbi(Assembler::t0);
     Assembler::Label* recovery = AddRecoveryExit(pc);
-    Assembler::Label* done = as_.MakeLabel();
     if (load) {
       if (element_size == 16) {
         as_.SetRecoveryPoint(recovery);
@@ -3115,8 +3099,6 @@ class LiteTranslator {
         as_.StW(Assembler::t2, Assembler::t0, 4);
       }
     }
-    as_.B(*done);
-    as_.Bind(done);
     if (mode == 1 || mode == 3) {
       LoadXOrSp(rn, Assembler::t0);
       AddImmediate(Assembler::t0, Assembler::t0, offset, Assembler::t1);
@@ -3405,26 +3387,42 @@ class LiteTranslator {
     const uint32_t imm4 = (insn >> 11) & 15;
     const uint32_t rn = (insn >> 5) & 31;
     const uint32_t rd = insn & 31;
-    uint32_t element_size;
-    uint32_t dst_index;
-    uint32_t src_index;
-    if (imm5 & 4) {
-      element_size = 4;
-      dst_index = imm5 >> 3;
-      src_index = imm4 >> 2;
+    // The lowest set bit selects the element width; higher bits are the
+    // destination lane. Testing bit 2/3 alone also matches byte/halfword
+    // lanes, overwriting adjacent elements (for example MOV V0.B[2], V6.B[3]).
+    uint32_t size;
+    if (imm5 & 1) {
+      size = 0;
+    } else if (imm5 & 2) {
+      size = 1;
+    } else if (imm5 & 4) {
+      size = 2;
     } else if (imm5 & 8) {
-      element_size = 8;
-      dst_index = imm5 >> 4;
-      src_index = imm4 >> 3;
+      size = 3;
     } else {
       return false;
     }
-    if (element_size == 4) {
-      as_.LdWU(Assembler::t0, Assembler::s8, VOffset(rn) + src_index * 4);
-      as_.StW(Assembler::t0, Assembler::s8, VOffset(rd) + dst_index * 4);
-    } else {
-      as_.LdD(Assembler::t0, Assembler::s8, VOffset(rn) + src_index * 8);
-      as_.StD(Assembler::t0, Assembler::s8, VOffset(rd) + dst_index * 8);
+    const uint32_t dst_offset = (imm5 >> (size + 1)) << size;
+    const uint32_t src_offset = (imm4 >> size) << size;
+    // Read before writing for aliases. Partial destinations are excluded
+    // from the SIMD cache, so preserve all other bytes in ThreadState.
+    switch (size) {
+      case 0:
+        as_.LdBU(Assembler::t0, Assembler::s8, VOffset(rn) + src_offset);
+        as_.StB(Assembler::t0, Assembler::s8, VOffset(rd) + dst_offset);
+        break;
+      case 1:
+        as_.LdHU(Assembler::t0, Assembler::s8, VOffset(rn) + src_offset);
+        as_.StH(Assembler::t0, Assembler::s8, VOffset(rd) + dst_offset);
+        break;
+      case 2:
+        as_.LdWU(Assembler::t0, Assembler::s8, VOffset(rn) + src_offset);
+        as_.StW(Assembler::t0, Assembler::s8, VOffset(rd) + dst_offset);
+        break;
+      case 3:
+        as_.LdD(Assembler::t0, Assembler::s8, VOffset(rn) + src_offset);
+        as_.StD(Assembler::t0, Assembler::s8, VOffset(rd) + dst_offset);
+        break;
     }
     return true;
   }
@@ -4545,7 +4543,16 @@ class LiteTranslator {
       }
 
       as_.Bind(fallback);
-      ExitGeneratedCode(pc);
+      if (allow_dispatch_) {
+        // Re-dispatching this PC would enter the same cached region without
+        // executing the instruction. Enter the interpreter directly so that
+        // the NaN path makes progress before returning to translated code.
+        SetGuestPc(pc);
+        as_.Li(Assembler::t0, kEntryInterpret);
+        as_.Jirl(Assembler::zero, Assembler::t0, 0);
+      } else {
+        ExitGeneratedCode(pc);
+      }
 
       as_.Bind(calculate);
       LoadV(rn, Assembler::vr1);
@@ -4981,7 +4988,6 @@ class LiteTranslator {
 
   void EmitSimd16LoadStore(bool is_store, uint32_t rt, GuestAddr pc) {
     Assembler::Label* recovery = AddRecoveryExit(pc);
-    Assembler::Label* done = as_.MakeLabel();
     if (!is_store) {
       as_.SetRecoveryPoint(recovery);
       as_.LdHU(Assembler::t1, Assembler::t0, 0);
@@ -4994,13 +5000,10 @@ class LiteTranslator {
       as_.SetRecoveryPoint(recovery);
       as_.StH(Assembler::t1, Assembler::t0, 0);
     }
-    as_.B(*done);
-    as_.Bind(done);
   }
 
   void EmitSimd32LoadStore(bool is_store, uint32_t rt, GuestAddr pc) {
     Assembler::Label* recovery = AddRecoveryExit(pc);
-    Assembler::Label* done = as_.MakeLabel();
     if (!is_store) {
       as_.SetRecoveryPoint(recovery);
       as_.LdWU(Assembler::t1, Assembler::t0, 0);
@@ -5012,13 +5015,10 @@ class LiteTranslator {
       as_.SetRecoveryPoint(recovery);
       as_.StW(Assembler::t1, Assembler::t0, 0);
     }
-    as_.B(*done);
-    as_.Bind(done);
   }
 
   void EmitSimd64LoadStore(bool is_store, uint32_t rt, GuestAddr pc) {
     Assembler::Label* recovery = AddRecoveryExit(pc);
-    Assembler::Label* done = as_.MakeLabel();
     if (!is_store) {
       as_.SetRecoveryPoint(recovery);
       as_.LdD(Assembler::t1, Assembler::t0, 0);
@@ -5029,13 +5029,10 @@ class LiteTranslator {
       as_.SetRecoveryPoint(recovery);
       as_.StD(Assembler::t1, Assembler::t0, 0);
     }
-    as_.B(*done);
-    as_.Bind(done);
   }
 
   void EmitSimd128LoadStore(bool is_store, uint32_t rt, GuestAddr pc) {
     Assembler::Label* recovery = AddRecoveryExit(pc);
-    Assembler::Label* done = as_.MakeLabel();
     if (!is_store) {
       as_.SetRecoveryPoint(recovery);
       as_.LdD(Assembler::t1, Assembler::t0, 0);
@@ -5051,13 +5048,10 @@ class LiteTranslator {
       as_.SetRecoveryPoint(recovery);
       as_.StD(Assembler::t2, Assembler::t0, 8);
     }
-    as_.B(*done);
-    as_.Bind(done);
   }
 
   void EmitLoadStore(uint32_t size, uint32_t opc, uint32_t rt, GuestAddr pc) {
     Assembler::Label* recovery = AddRecoveryExit(pc);
-    Assembler::Label* done = as_.MakeLabel();
     if (opc != 0) {
       as_.SetRecoveryPoint(recovery);
       if (opc >= 2) {
@@ -5116,8 +5110,6 @@ class LiteTranslator {
           break;
       }
     }
-    as_.B(*done);
-    as_.Bind(done);
   }
 
   void TranslateBranchImmediate(uint32_t insn, GuestAddr pc) {

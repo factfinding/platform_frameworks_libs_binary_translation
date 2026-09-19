@@ -30,6 +30,7 @@
 #include "berberis/guest_state/guest_state_opaque.h"
 #include "berberis/runtime/execute_guest.h"
 #include "berberis/runtime_primitives/runtime_library.h"
+#include "berberis/runtime_primitives/translation_cache.h"
 
 #include "guest_signal_action.h"
 #include "guest_thread_manager_impl.h"
@@ -40,7 +41,20 @@ namespace berberis {
 namespace {
 
 long CloneSyscall(long flags, long child_stack, long parent_tid, long new_tls, long child_tid) {
-#if defined(__x86_64__)  // sys_clone's last two arguments are flipped on x86-64.
+#if defined(__BIONIC__)
+  // Bionic supports a null entry function for fork-style clone. Besides using
+  // the host syscall argument order, it invalidates the cached host pid/tid.
+  // A raw syscall leaves the child using its parent's pthread identity, even
+  // after ResetCurrentGuestThreadAfterFork calls gettid().
+  return clone(nullptr,
+               reinterpret_cast<void*>(child_stack),
+               flags,
+               nullptr,
+               reinterpret_cast<int*>(parent_tid),
+               reinterpret_cast<void*>(new_tls),
+               reinterpret_cast<int*>(child_tid));
+#elif defined(__x86_64__) || defined(__loongarch__)
+  // These hosts put child_tid before tls, unlike the ARM64 guest ABI.
   return syscall(__NR_clone, flags, child_stack, parent_tid, child_tid, new_tls);
 #else
   return syscall(__NR_clone, flags, child_stack, parent_tid, new_tls, child_tid);
@@ -125,12 +139,20 @@ pid_t CloneGuestThread(GuestThread* thread,
                        GuestAddr child_tid) {
   ThreadState& thread_state = *thread->state();
   if (!(flags & CLONE_VM)) {
+    ScopedSignalBlocker signal_blocker;
+    TranslationCache* cache = TranslationCache::GetInstance();
+    // fork's pthread_atfork handlers are not run by this syscall path. Freeze
+    // the cache before copying it, then discard transactions whose producer
+    // threads did not survive in the child. Do not change the parent's cache.
+    cache->PrepareForFork();
     // Memory is *not* shared with the child.
     // Run the child on the same host stack as the parent. Thus, can use host local variables.
     // The child gets a copy of guest thread object.
     // ATTENTION: Do not set new tls for the host - tls might be incompatible.
     // TODO(b/280551726): Consider forcing new host tls to 0.
     long pid = CloneSyscall(flags & ~CLONE_SETTLS, 0, parent_tid, 0, child_tid);
+    int saved_errno = errno;
+    cache->FinishFork(pid == 0);
     if (pid == 0) {
       // Child, reset thread table.
       ResetCurrentGuestThreadAfterFork(thread);
@@ -142,6 +164,7 @@ pid_t CloneGuestThread(GuestThread* thread,
         SetTlsAddr(thread_state, new_tls);
       }
     }
+    errno = saved_errno;
     return pid;
   }
 

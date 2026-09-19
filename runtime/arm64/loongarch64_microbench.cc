@@ -32,6 +32,7 @@
 #include "berberis/interpreter/arm64/interpreter.h"
 #include "berberis/lite_translator/lite_translate_region.h"
 #include "berberis/runtime_primitives/runtime_library.h"
+#include "berberis/runtime_primitives/translation_cache.h"
 #include "berberis/test_utils/scoped_exec_region.h"
 
 namespace berberis {
@@ -82,6 +83,19 @@ std::vector<uint32_t> MakeMixed() {
 }
 
 std::vector<uint32_t> MakeBenchmark(std::string_view name) {
+  if (name == "sp_region_chain" || name == "sp_region_chain_unmapped") {
+    constexpr std::array<uint32_t, 4> kPattern = {
+        0x9100'83e0,  // add x0,sp,#32
+        0x9100'43ff,  // add sp,sp,#16
+        0xd100'43ff,  // sub sp,sp,#16
+        0x1400'0001,  // b next_region (terminates this four-instruction region)
+    };
+    std::vector<uint32_t> code;
+    for (size_t i = 0; i < 64; ++i) {
+      code.push_back(kPattern[i % kPattern.size()]);
+    }
+    return code;
+  }
   if (name == "simd_bic") return MakeRepeated(0x4e62'1c20u);
   if (name == "simd_bsl8") return MakeRepeated(0x2e62'1c20u);
   if (name == "simd_umovs") return MakeRepeated(0x0e0c'3c20u);
@@ -215,7 +229,9 @@ void InitializeState(ThreadState* state, GuestAddr start_pc) {
   SetResidence(*state, kOutsideGeneratedCode);
 }
 
-int RunBenchmark(std::string_view name, uint64_t iterations, bool interpreter) {
+// Fix the native timing-loop placement across separately linked backend builds.
+// Otherwise unrelated ELF layout changes can alter sub-nanosecond controls.
+[[gnu::aligned(64)]] int RunBenchmark(std::string_view name, uint64_t iterations, bool interpreter) {
   if (interpreter && name != "simd_shl32" && name != "simd_ushr32" && name != "simd_cmtst32" &&
       name != "simd_fmax4s" && name != "simd_bic" && name != "simd_bsl8" && name != "simd_umovs") {
     std::fprintf(stderr, "--interpreter requires a straight-line SIMD fallback benchmark\n");
@@ -229,16 +245,66 @@ int RunBenchmark(std::string_view name, uint64_t iterations, bool interpreter) {
 
   InitHostEntries();
   GuestAddr start_pc = ToGuestAddr(guest_code.data());
+  const bool region_chain = name == "sp_region_chain" || name == "sp_region_chain_unmapped";
   LiteTranslateParams params;
   params.end_pc = start_pc + guest_code.size() * sizeof(uint32_t);
   params.allow_dispatch = false;
-  params.enable_reg_mapping = true;
+  params.enable_reg_mapping = name != "sp_region_chain_unmapped";
   params.enable_guest_memory = true;
 
   MachineCode machine_code;
+  std::vector<std::unique_ptr<ScopedExecRegion>> chain_regions;
+  // Destroy cache entries before the executable mappings, including on an
+  // incomplete translation. Single-region scenarios own no cache entries.
+  struct ChainCacheCleanup {
+    GuestAddr start_pc;
+    GuestAddr end_pc;
+    bool enabled;
+    ~ChainCacheCleanup() {
+      if (enabled) {
+        TranslationCache::GetInstance()->InvalidateGuestRange(start_pc, end_pc);
+      }
+    }
+  } chain_cleanup{start_pc, params.end_pc, region_chain};
+  uint32_t host_bytes = 0;
   uint64_t translate_start = MonotonicNanos();
-  auto [success, stop_pc] = interpreter ? std::tuple{true, params.end_pc}
-                                        : TryLiteTranslateRegion(start_pc, &machine_code, params);
+  bool success = true;
+  GuestAddr stop_pc = params.end_pc;
+  if (region_chain) {
+    // Install the same sixteen regions for both implementations. Only the
+    // final region returns to C++; every earlier branch uses the real cache
+    // dispatch path. SP is balanced and never dereferenced in this scenario.
+    TranslationCache* cache = TranslationCache::GetInstance();
+    for (size_t offset = 0; offset < guest_code.size(); offset += 4) {
+      GuestAddr pc = start_pc + offset * sizeof(uint32_t);
+      MachineCode region_code;
+      auto region_params = params;
+      region_params.end_pc = pc + 4 * sizeof(uint32_t);
+      region_params.allow_dispatch = offset + 4 < guest_code.size();
+      std::tie(success, stop_pc) = TryLiteTranslateRegion(pc, &region_code, region_params);
+      if (!success || stop_pc != region_params.end_pc) {
+        break;
+      }
+      host_bytes += region_code.install_size();
+      chain_regions.push_back(std::make_unique<ScopedExecRegion>(&region_code));
+      if (offset != 0) {
+        GuestCodeEntry* entry = cache->AddAndLockForTranslation(pc, 0);
+        if (entry == nullptr) {
+          std::fprintf(stderr, "benchmark translation-cache entry already occupied\n");
+          return 3;
+        }
+        cache->SetTranslatedAndUnlock(
+            pc,
+            entry,
+            4 * sizeof(uint32_t),
+            GuestCodeEntry::Kind::kLiteTranslated,
+            {chain_regions.back()->GetHostCodeAddr(), region_code.install_size()});
+      }
+    }
+  } else if (!interpreter) {
+    std::tie(success, stop_pc) = TryLiteTranslateRegion(start_pc, &machine_code, params);
+    host_bytes = machine_code.install_size();
+  }
   uint64_t translate_ns = MonotonicNanos() - translate_start;
   if (!success || stop_pc != params.end_pc) {
     std::fprintf(stderr,
@@ -250,7 +316,7 @@ int RunBenchmark(std::string_view name, uint64_t iterations, bool interpreter) {
   }
 
   std::unique_ptr<ScopedExecRegion> exec;
-  if (!interpreter) exec = std::make_unique<ScopedExecRegion>(&machine_code);
+  if (!interpreter && !region_chain) exec = std::make_unique<ScopedExecRegion>(&machine_code);
   ThreadState state{};
   InitializeState(&state, start_pc);
   std::array<uint64_t, 16> memory{};
@@ -258,6 +324,11 @@ int RunBenchmark(std::string_view name, uint64_t iterations, bool interpreter) {
   memory[8] = 0x1111'1111'1111'1111ULL;
   state.cpu.x[10] = ToGuestAddr(memory.data());
   state.cpu.sp = ToGuestAddr(memory.data() + (name == "stack_writeback" ? 8 : 0));
+  if (region_chain) {
+    // A fixed, non-dereferenced value makes the SP-derived checksum identical
+    // across separate processes with different ASLR layouts.
+    state.cpu.sp = 0x20'0000;
+  }
   auto run_once = [&]() {
     SetInsnAddr(state.cpu, start_pc);
     SetResidence(state, kOutsideGeneratedCode);
@@ -267,7 +338,8 @@ int RunBenchmark(std::string_view name, uint64_t iterations, bool interpreter) {
       InterpretBatch(
           &state, guest_code.size(), nullptr, InterpreterCacheLookupMode::kNonSequentialOnly);
     } else {
-      berberis_RunGeneratedCode(&state, AsHostCode(exec->GetHostCodeAddr()));
+      auto* entry = region_chain ? chain_regions.front().get() : exec.get();
+      berberis_RunGeneratedCode(&state, AsHostCode(entry->GetHostCodeAddr()));
     }
   };
   for (uint64_t i = 0; i < kWarmupIterations; ++i) {
@@ -279,6 +351,11 @@ int RunBenchmark(std::string_view name, uint64_t iterations, bool interpreter) {
     run_once();
   }
   uint64_t elapsed_ns = MonotonicNanos() - start_ns;
+  if (region_chain && (GetInsnAddr(state.cpu) != params.end_pc || state.cpu.sp != 0x20'0000 ||
+                       state.cpu.x[0] != 0x20'0020)) {
+    std::fprintf(stderr, "SP chain did not complete with the expected PC and register state\n");
+    return 4;
+  }
   const size_t executed_insns = name == "cache_early_exit" ? 1 : guest_code.size();
   uint64_t guest_insns = iterations * executed_insns;
   uint64_t checksum = state.cpu.x[0] ^ static_cast<uint64_t>(state.cpu.v[0]) ^
@@ -293,8 +370,8 @@ int RunBenchmark(std::string_view name, uint64_t iterations, bool interpreter) {
               name.data(),
               iterations,
               executed_insns,
-              machine_code.install_size(),
-              static_cast<double>(machine_code.install_size()) / guest_code.size(),
+              host_bytes,
+              static_cast<double>(host_bytes) / guest_code.size(),
               translate_ns,
               elapsed_ns,
               static_cast<double>(elapsed_ns) / guest_insns,
@@ -343,7 +420,9 @@ int main(int argc, char** argv) {
                                               "simd_fmax4s",
                                               "simd_bic",
                                               "simd_bsl8",
-                                              "simd_umovs"};
+                                              "simd_umovs",
+                                              "sp_region_chain",
+                                              "sp_region_chain_unmapped"};
   if (benchmark != "all") {
     return berberis::RunBenchmark(benchmark, iterations, interpreter);
   }

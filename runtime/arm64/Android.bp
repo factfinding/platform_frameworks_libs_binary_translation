@@ -27,6 +27,7 @@ cc_library_static {
     arch: {
         loongarch64: {
             srcs: [
+                "native_art_hooks.cc",
                 "translator_loongarch64.cc",
             ],
             header_libs: [
@@ -102,13 +103,20 @@ cc_test {
             enabled: true,
         },
     },
-    srcs: ["runtime_library_loongarch64_test.cc"],
+    srcs: [
+        "guest_fork_loongarch64_test.cc",
+        "linker_executable_segments_test.cc",
+        "native_art_hooks_test.cc",
+        "runtime_library_loongarch64_test.cc",
+    ],
     header_libs: [
         "berberis_test_utils_headers",
         "libberberis_assembler_headers",
         "libberberis_code_gen_lib_headers",
         "libberberis_guest_abi_arm64_headers",
+        "libberberis_guest_os_primitives_headers",
         "libberberis_guest_state_arm64_headers",
+        "libberberis_runtime_headers",
         "libberberis_runtime_primitives_headers",
     ],
     static_libs: [

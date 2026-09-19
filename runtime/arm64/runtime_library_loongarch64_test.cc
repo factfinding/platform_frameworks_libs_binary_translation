@@ -517,6 +517,92 @@ TEST(LoongArch64RuntimeLibraryTest, LiteImmediateArithmeticMatchesInterpreterAtB
   }
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteSpImmediateSourcesMatchInterpreterAtBoundaries) {
+  constexpr std::array<uint32_t, 5> kImmediates = {0, 1, 2047, 2048, 4095};
+  constexpr std::array<uint64_t, 7> kInputs = {
+      0,
+      1,
+      0x7fff'ffff,
+      0xffff'ffff,
+      0x7fff'ffff'ffff'ffff,
+      UINT64_MAX,
+      0xab00'1234'ffff'fff0,
+  };
+  InitHostEntries();
+  for (bool mapped : {false, true}) {
+    for (uint32_t sf : {0u, 1u}) {
+      for (uint32_t sub : {0u, 1u}) {
+        for (uint32_t shift : {0u, 1u}) {
+          for (uint32_t imm : kImmediates) {
+            for (uint32_t rd : {0u, 7u, 31u}) {
+              const uint32_t insn = 0x1100'0000u | (sf << 31) | (sub << 30) | (shift << 22) |
+                                    (imm << 10) | (31u << 5) | rd;
+              const std::array<uint32_t, 6> guest = {
+                  insn,
+                  0xaa00'0009u | (rd << 16) | (rd << 5),  // orr x9,xD,xD (31 is XZR)
+                  0x9100'03ea,                            // mov x10,sp
+                  insn,                                   // consume the updated SP
+                  0xaa00'000bu | (rd << 16) | (rd << 5),  // orr x11,xD,xD
+                  0x9100'03ec,                            // mov x12,sp
+              };
+              const GuestAddr start = ToGuestAddr(guest.data());
+              MachineCode code;
+              LiteTranslateParams params;
+              params.end_pc = start + sizeof(guest);
+              params.enable_reg_mapping = mapped;
+              params.allow_dispatch = false;
+              auto [success, stop] = TryLiteTranslateRegion(start, &code, params);
+              ASSERT_TRUE(success);
+              ASSERT_EQ(stop, params.end_pc);
+              ScopedExecRegion exec(&code);
+              for (uint64_t input : kInputs) {
+                SCOPED_TRACE(testing::Message() << "mapped=" << mapped << " insn=" << std::hex
+                                                << insn << " input=" << input);
+                ThreadState interpreted{};
+                ThreadState translated{};
+                for (ThreadState* state : {&interpreted, &translated}) {
+                  for (size_t reg = 0; reg < 31; ++reg) {
+                    state->cpu.x[reg] = 0xfedc'ba98'7654'3210ULL + reg;
+                  }
+                  state->cpu.sp = input;
+                  state->cpu.flags = 0xb;
+                  SetInsnAddr(state->cpu, start);
+                }
+                for (size_t i = 0; i < guest.size(); ++i) {
+                  InterpretInsn(&interpreted);
+                }
+                SetResidence(translated, kOutsideGeneratedCode);
+                berberis_RunGeneratedCode(&translated, AsHostCode(exec.GetHostCodeAddr()));
+                for (size_t reg = 0; reg < 31; ++reg) {
+                  EXPECT_EQ(translated.cpu.x[reg], interpreted.cpu.x[reg]) << "reg=" << reg;
+                }
+                EXPECT_EQ(translated.cpu.sp, interpreted.cpu.sp);
+                EXPECT_EQ(translated.cpu.flags, interpreted.cpu.flags);
+                EXPECT_EQ(GetInsnAddr(translated.cpu), GetInsnAddr(interpreted.cpu));
+
+                // Independent modulo arithmetic also checks the destination
+                // alias and that W results never truncate an unchanged SP.
+                const uint64_t rhs = uint64_t{imm} << (shift * 12);
+                const uint64_t mask = sf ? UINT64_MAX : UINT32_MAX;
+                const uint64_t first = (sub ? input - rhs : input + rhs) & mask;
+                const uint64_t second_input = rd == 31 ? first : input;
+                const uint64_t second = (sub ? second_input - rhs : second_input + rhs) & mask;
+                EXPECT_EQ(translated.cpu.sp, rd == 31 ? second : input);
+                EXPECT_EQ(translated.cpu.x[9], rd == 31 ? 0u : first);
+                EXPECT_EQ(translated.cpu.x[10], rd == 31 ? first : input);
+                EXPECT_EQ(translated.cpu.x[11], rd == 31 ? 0u : second);
+                EXPECT_EQ(translated.cpu.x[12], rd == 31 ? second : input);
+                EXPECT_EQ(translated.cpu.flags, 0xbu);
+                EXPECT_EQ(GetInsnAddr(translated.cpu), params.end_pc);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteSmallImmediateRegionsAvoidFullWidthConstants) {
   InitHostEntries();
   for (uint32_t insn : {0x9100'0400u, 0xd100'2000u, 0xd280'0400u}) {
@@ -2478,31 +2564,57 @@ TEST(LoongArch64RuntimeLibraryTest, LiteExtUsesSourceCache) {
 }
 
 TEST(LoongArch64RuntimeLibraryTest, LiteTbl16BMatchesInterpreterWithAliasedIndex) {
-  // FFmpeg HEVC hot path: tbl v19.16b, {v8.16b-v11.16b}, v19.16b.
-  // Vd == Vm is intentional and verifies that translation consumes every
-  // index before committing the destination.
-  constexpr std::array<uint32_t, 1> kGuestCode = {0x4e13'6113};
+  // FFmpeg HEVC uses tbl v19.16b,{v8.16b-v11.16b},v19.16b. Cover every
+  // table length while preserving the aliased destination/index operand.
   constexpr std::array<uint8_t, 16> kIndices = {
       0, 15, 16, 31, 32, 47, 48, 63, 64, 255, 7, 23, 39, 55, 1, 62};
-
-  ThreadState interpreted{};
-  ThreadState translated{};
-  for (uint32_t reg = 8; reg <= 11; ++reg) {
-    uint8_t bytes[16];
-    for (uint32_t lane = 0; lane < 16; ++lane) {
-      bytes[lane] = static_cast<uint8_t>((reg - 8) * 16 + lane + 0x40);
+  for (uint32_t length = 1; length <= 4; ++length) {
+    const std::array<uint32_t, 1> guest_code = {0x4e13'0113u | ((length - 1) << 13)};
+    ThreadState interpreted{};
+    ThreadState translated{};
+    for (uint32_t reg = 8; reg <= 11; ++reg) {
+      uint8_t bytes[16];
+      for (uint32_t lane = 0; lane < 16; ++lane) {
+        bytes[lane] = static_cast<uint8_t>((reg - 8) * 16 + lane + 0x40);
+      }
+      memcpy(&interpreted.cpu.v[reg], bytes, sizeof(bytes));
     }
-    memcpy(&interpreted.cpu.v[reg], bytes, sizeof(bytes));
-    memcpy(&translated.cpu.v[reg], bytes, sizeof(bytes));
+    memcpy(&interpreted.cpu.v[19], kIndices.data(), kIndices.size());
+    translated.cpu = interpreted.cpu;
+    SetInsnAddr(interpreted.cpu, ToGuestAddr(guest_code.data()));
+    InterpretInsn(&interpreted);
+    TranslateAndRun(guest_code, &translated);
+    uint8_t expected[16];
+    for (uint32_t lane = 0; lane < 16; ++lane) {
+      expected[lane] = kIndices[lane] < length * 16 ? 0x40 + kIndices[lane] : 0;
+    }
+    __uint128_t expected_vector;
+    memcpy(&expected_vector, expected, sizeof(expected_vector));
+    EXPECT_EQ(translated.cpu.v[19], expected_vector) << "length=" << length;
+    EXPECT_EQ(translated.cpu.v[19], interpreted.cpu.v[19]);
   }
-  memcpy(&interpreted.cpu.v[19], kIndices.data(), kIndices.size());
-  memcpy(&translated.cpu.v[19], kIndices.data(), kIndices.size());
-  SetInsnAddr(interpreted.cpu, ToGuestAddr(kGuestCode.data()));
+}
 
-  InterpretInsn(&interpreted);
-  TranslateAndRun(kGuestCode, &translated);
-
-  EXPECT_EQ(translated.cpu.v[19], interpreted.cpu.v[19]);
+TEST(LoongArch64RuntimeLibraryTest, LiteTblRejectsWideningAndNarrowingArithmetic) {
+  // The four TBL lengths share all fixed bits except bit 21 with SADDL2,
+  // SSUBL2, ADDHN2 and SUBHN2. The old mask translated ADDHN2 0x4e2440a6
+  // as a table lookup, corrupting AV1 reconstruction pixels.
+  for (uint32_t op : {0x4e20'0000u, 0x4e20'2000u, 0x4e20'4000u, 0x4e20'6000u}) {
+    for (uint32_t rd : {4u, 5u, 6u, 31u}) {
+      for (bool mapping : {false, true}) {
+        const std::array<uint32_t, 1> guest_code = {op | (4 << 16) | (5 << 5) | rd};
+        const GuestAddr pc = ToGuestAddr(guest_code.data());
+        MachineCode code;
+        LiteTranslateParams params;
+        params.end_pc = pc + sizeof(guest_code);
+        params.allow_dispatch = false;
+        params.enable_reg_mapping = mapping;
+        auto [success, stop] = TryLiteTranslateRegion(pc, &code, params);
+        EXPECT_FALSE(success) << std::hex << guest_code[0];
+        EXPECT_EQ(stop, pc);
+      }
+    }
+  }
 }
 
 TEST(LoongArch64RuntimeLibraryTest, LiteIntegerMulMlaMls4SMatchInterpreter) {
@@ -5716,6 +5828,71 @@ TEST(LoongArch64RuntimeLibraryTest, LiteScalarMinMaxFallsBackForNaNPayloadRules)
   }
 }
 
+TEST(LoongArch64RuntimeLibraryTest, LiteScalarMinMaxNaNFallbackMakesDispatchProgress) {
+  // The old isolated fallback test only required returning at the same PC.
+  // In a real dispatcher that re-enters the same cached region forever. Use
+  // actual dispatch and a cached stop target to require interpreted progress.
+  constexpr std::array<uint32_t, 9> kInsns = {
+      0x1e22'4820,
+      0x1e22'5820,
+      0x1e22'6820,
+      0x1e22'7820,
+      0x1e62'4820,
+      0x1e62'5820,
+      0x1e62'6820,
+      0x1e62'7820,
+      0x1e21'4881,  // fmax s1,s4,s1: observed in the stalled Unity worker.
+  };
+  InitHostEntries();
+  auto* cache = TranslationCache::GetInstance();
+  for (uint32_t insn : kInsns) {
+    for (int nan_operands : {1, 2, 3}) {
+      SCOPED_TRACE(testing::Message() << std::hex << insn << " NaNs=" << nan_operands);
+      const bool is_double = (insn & (1u << 22)) != 0;
+      const uint32_t rn = (insn >> 5) & 31;
+      const uint32_t rm = (insn >> 16) & 31;
+      const uint32_t rd = insn & 31;
+      const uint64_t nan = is_double ? 0x7ff8'0000'0001'2345ULL : 0x7fc1'2345ULL;
+      const uint64_t number = is_double ? 0x4000'0000'0000'0000ULL : 0x4000'0000ULL;
+      const std::array<uint32_t, 4> guest_code = {
+          insn, 0x1400'0002, 0xd503'201f, 0xd503'201f};  // op; b stop; nop; stop
+      const GuestAddr pc = ToGuestAddr(guest_code.data());
+      const GuestAddr stop = pc + 3 * sizeof(uint32_t);
+      auto* entry = cache->AddAndLockForTranslation(stop, 0);
+      ASSERT_NE(entry, nullptr);
+      cache->SetTranslatedAndUnlock(stop,
+                                    entry,
+                                    sizeof(uint32_t),
+                                    GuestCodeEntry::Kind::kLiteTranslated,
+                                    {kEntryExitGeneratedCode, 0});
+      ThreadState expected{};
+      expected.cpu.v[rd] = MakeUint128(UINT64_MAX, UINT64_MAX);
+      expected.cpu.v[rn] = MakeUint128((nan_operands & 1) ? nan : number, UINT64_MAX);
+      expected.cpu.v[rm] = MakeUint128((nan_operands & 2) ? nan : number, UINT64_MAX);
+      ThreadState actual{};
+      actual.cpu = expected.cpu;
+      SetInsnAddr(expected.cpu, pc);
+      InterpretInsn(&expected);
+      MachineCode code;
+      LiteTranslateParams params;
+      params.end_pc = stop;
+      params.allow_dispatch = true;
+      auto [success, stop_pc] = TryLiteTranslateRegion(pc, &code, params);
+      EXPECT_TRUE(success);
+      if (success) {
+        ScopedExecRegion exec(&code);
+        SetInsnAddr(actual.cpu, pc);
+        SetResidence(actual, kOutsideGeneratedCode);
+        berberis_RunGeneratedCode(&actual, AsHostCode(exec.GetHostCodeAddr()));
+        EXPECT_EQ(actual.cpu.v[rd], expected.cpu.v[rd]);
+        EXPECT_EQ(GetInsnAddr(actual.cpu), stop);
+        EXPECT_EQ(GetResidence(actual), kOutsideGeneratedCode);
+      }
+      cache->InvalidateGuestRange(stop, stop + sizeof(uint32_t));
+    }
+  }
+}
+
 TEST(LoongArch64RuntimeLibraryTest, LiteHot2SLaneOperationsMatchInterpreter) {
   constexpr std::array<uint32_t, 10> kGuestCode = {
       0x0e0c'0420,  // dup v0.2s,v1.s[1]
@@ -5981,6 +6158,105 @@ TEST(LoongArch64RuntimeLibraryTest, LiteHotMoviConstantsMatchInterpreter) {
     EXPECT_EQ(translated.cpu.v[3], interpreted.cpu.v[3]) << std::hex << insn;
   }
 }
+
+TEST(LoongArch64RuntimeLibraryTest, LiteFmlaFmls2DDoNotAlias4S) {
+  // The checkasm forward transform uses FMLA V0.2D,V4.2D,V5.2D (0x4e65cc80).
+  // Interpreting its double lanes as four floats corrupts test coefficients.
+  // Keep unaudited double arithmetic in the interpreter, with either cache mode.
+  for (uint32_t op : {0x4e60'cc00u, 0x4ee0'cc00u}) {
+    for (uint32_t rd : {0u, 4u, 5u, 31u}) {
+      for (bool mapping : {false, true}) {
+        const std::array<uint32_t, 1> guest_code = {op | (5 << 16) | (4 << 5) | rd};
+        const GuestAddr pc = ToGuestAddr(guest_code.data());
+        MachineCode code;
+        LiteTranslateParams params;
+        params.end_pc = pc + sizeof(guest_code);
+        params.allow_dispatch = false;
+        params.enable_reg_mapping = mapping;
+        auto [success, stop] = TryLiteTranslateRegion(pc, &code, params);
+        EXPECT_FALSE(success) << std::hex << guest_code[0];
+        EXPECT_EQ(stop, pc);
+      }
+    }
+  }
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteInsElementAllWidthsLanesAndAliases) {
+  InitHostEntries();
+  // imm4's low size bits are architecturally ignored. Exercise all 16
+  // encodings as well as every destination lane and same-register copies.
+  for (uint32_t size = 0; size < 4; ++size) {
+    const uint32_t bytes = 1u << size;
+    for (uint32_t dst = 0; dst < 16 / bytes; ++dst) {
+      for (uint32_t imm4 = 0; imm4 < 16; ++imm4) {
+        for (uint32_t rn : {0u, 1u}) {
+          for (bool mapping : {false, true}) {
+            const uint32_t imm5 = (dst << (size + 1)) | bytes;
+            const uint32_t insn = 0x6e00'0400 | (imm5 << 16) | (imm4 << 11) | (rn << 5);
+            const std::array<uint32_t, 5> guest_code = {
+                0x4ea0'1c02,  // mov v2.16b,v0.16b
+                0x4ea1'1c25,  // mov v5.16b,v1.16b
+                insn,
+                0x4ea0'1c03,  // mov v3.16b,v0.16b
+                0x4ea0'1c04,  // mov v4.16b,v0.16b
+            };
+            ThreadState interpreted{};
+            for (uint32_t r = 0; r < 32; ++r) {
+              interpreted.cpu.v[r] =
+                  MakeUint128(0x7766'5544'3322'1100ULL + r, 0xffee'ddcc'bbaa'9988ULL - r);
+            }
+            ThreadState translated{};
+            translated.cpu = interpreted.cpu;
+            __uint128_t expected = interpreted.cpu.v[0];
+            const __uint128_t source = interpreted.cpu.v[rn];
+            memcpy(reinterpret_cast<uint8_t*>(&expected) + dst * bytes,
+                   reinterpret_cast<const uint8_t*>(&source) + (imm4 >> size) * bytes,
+                   bytes);
+            const GuestAddr pc = ToGuestAddr(guest_code.data());
+            SetInsnAddr(interpreted.cpu, pc);
+            for (size_t i = 0; i < guest_code.size(); ++i) InterpretInsn(&interpreted);
+            MachineCode code;
+            LiteTranslateParams params;
+            params.end_pc = pc + sizeof(guest_code);
+            params.allow_dispatch = false;
+            params.enable_reg_mapping = mapping;
+            auto [success, stop] = TryLiteTranslateRegion(pc, &code, params);
+            ASSERT_TRUE(success);
+            ASSERT_EQ(stop, params.end_pc);
+            ScopedExecRegion exec(&code);
+            SetInsnAddr(translated.cpu, pc);
+            SetResidence(translated, kOutsideGeneratedCode);
+            berberis_RunGeneratedCode(&translated, AsHostCode(exec.GetHostCodeAddr()));
+            SCOPED_TRACE(testing::Message()
+                         << "insn=" << std::hex << insn << " mapping=" << mapping);
+            EXPECT_EQ(translated.cpu.v[0], expected);
+            for (size_t r = 0; r < 32; ++r) {
+              ASSERT_EQ(translated.cpu.v[r], interpreted.cpu.v[r]) << "v" << r;
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+TEST(LoongArch64RuntimeLibraryTest, LiteInsElementRejectsReservedWidths) {
+  for (uint32_t imm5 : {0u, 16u}) {
+    for (uint32_t imm4 = 0; imm4 < 16; ++imm4) {
+      const std::array<uint32_t, 1> guest_code = {0x6e00'0420 | (imm5 << 16) | (imm4 << 11)};
+      const GuestAddr pc = ToGuestAddr(guest_code.data());
+      MachineCode code;
+      LiteTranslateParams params;
+      params.end_pc = pc + sizeof(guest_code);
+      params.allow_dispatch = false;
+      auto [success, stop] = TryLiteTranslateRegion(pc, &code, params);
+      EXPECT_FALSE(success);
+      EXPECT_EQ(stop, pc);
+    }
+  }
+}
+
+
 
 }  // namespace
 }  // namespace berberis

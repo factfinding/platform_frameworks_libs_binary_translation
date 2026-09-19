@@ -18,17 +18,14 @@
 
 #include <link.h>
 
-#include <algorithm>
-#include <cstring>
 #include <mutex>
-#include <utility>
-#include <vector>
 
 #include "berberis/base/macros.h"
 #include "berberis/base/tracing.h"
 #if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
 #include "berberis/guest_os_primitives/guest_map_shadow.h"
 #include "berberis/guest_state/guest_addr.h"
+#include "executable_segments.h"
 #endif
 #include "berberis/instrument/loader.h"
 
@@ -39,55 +36,11 @@ namespace berberis {
 namespace {
 
 #if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
-using ExecutableRange = std::pair<GuestAddr, size_t>;
-
 void SyncExecutableSegments(const link_map* link) {
-  std::vector<ExecutableRange> current_ranges;
-  for (; link != nullptr; link = link->l_next) {
-    // The synthetic native-bridge vDSO has a non-zero lowest PT_LOAD virtual
-    // address, so l_addr is a load bias rather than an ELF-header address. It
-    // was already registered by TinyLoader and does not need mirroring here.
-    if (link->l_name != nullptr && strcmp(link->l_name, "[vdso]") == 0) {
-      continue;
-    }
-    auto base = static_cast<uintptr_t>(link->l_addr);
-    auto* ehdr = reinterpret_cast<const Elf64_Ehdr*>(base);
-    if (ehdr->e_ident[EI_MAG0] != ELFMAG0 || ehdr->e_ident[EI_MAG1] != ELFMAG1 ||
-        ehdr->e_ident[EI_MAG2] != ELFMAG2 || ehdr->e_ident[EI_MAG3] != ELFMAG3 ||
-        ehdr->e_machine != EM_AARCH64 || ehdr->e_phentsize != sizeof(Elf64_Phdr) ||
-        ehdr->e_phnum == 0 || ehdr->e_phnum > 128) {
-      continue;
-    }
-
-    auto* phdrs = reinterpret_cast<const Elf64_Phdr*>(base + ehdr->e_phoff);
-    for (size_t i = 0; i < ehdr->e_phnum; ++i) {
-      if (phdrs[i].p_type == PT_LOAD && (phdrs[i].p_flags & PF_X) != 0 &&
-          phdrs[i].p_memsz != 0) {
-        GuestAddr start = static_cast<GuestAddr>(base + phdrs[i].p_vaddr);
-        current_ranges.emplace_back(start, phdrs[i].p_memsz);
-      }
-    }
-  }
-
-  std::sort(current_ranges.begin(), current_ranges.end());
-  current_ranges.erase(std::unique(current_ranges.begin(), current_ranges.end()),
-                       current_ranges.end());
-
   static std::mutex ranges_mutex;
-  static std::vector<ExecutableRange> registered_ranges;
+  static LinkerExecutableSegments segments;
   std::lock_guard<std::mutex> lock(ranges_mutex);
-  GuestMapShadow* shadow = GuestMapShadow::GetInstance();
-  for (const auto& range : registered_ranges) {
-    if (!std::binary_search(current_ranges.begin(), current_ranges.end(), range)) {
-      shadow->ClearExecutable(range.first, range.second);
-    }
-  }
-  for (const auto& range : current_ranges) {
-    if (!std::binary_search(registered_ranges.begin(), registered_ranges.end(), range)) {
-      shadow->SetExecutable(range.first, range.second);
-    }
-  }
-  registered_ranges = std::move(current_ranges);
+  segments.Sync(link, GuestMapShadow::GetInstance());
 }
 #endif
 

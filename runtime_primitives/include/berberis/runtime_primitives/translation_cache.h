@@ -109,6 +109,12 @@ class TranslationCache {
 
   [[nodiscard]] static TranslationCache* GetInstance();
 
+  // Pair around a non-CLONE_VM clone, with signals blocked. The cloning thread
+  // must not itself be translating or wrapping a function. Locking before clone
+  // preserves the maps' invariants; resetting an inherited mutex alone cannot.
+  void PrepareForFork();
+  void FinishFork(bool is_child);
+
   bool SetStop(GuestAddr pc) {
     auto expected = kEntryNotTranslated;  // expect default value.
     auto host_code_ptr = GetHostCodePtrWritable(pc);
